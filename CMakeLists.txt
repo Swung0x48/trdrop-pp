@@ -10,6 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(TRDROP_BUILD_TOOLS "Build the test fixture generator" ON)
+option(USE_VULKAN "Build the Vulkan (GPU) accelerated backend (needs the Vulkan headers and glslc)" OFF)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
 
@@ -26,10 +27,45 @@ add_executable(trdrop-pp
     src/main.cpp
     src/video_sources.cpp
     src/frame_analyzer.cpp
+    src/diff_engine_cpu.cpp
 )
 target_include_directories(trdrop-pp PRIVATE src)
 target_link_libraries(trdrop-pp PRIVATE ${OpenCV_LIBS})
 trdrop_warnings(trdrop-pp)
+
+if(USE_VULKAN)
+    # only the headers and the shader compiler are needed at build time,
+    # the Vulkan loader is loaded at runtime (the program falls back to the CPU without it)
+    find_package(Vulkan REQUIRED)
+    if(NOT Vulkan_GLSLC_EXECUTABLE)
+        find_program(Vulkan_GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    endif()
+    if(NOT Vulkan_GLSLC_EXECUTABLE)
+        message(FATAL_ERROR "USE_VULKAN: glslc not found (install the Vulkan SDK or set Vulkan_GLSLC_EXECUTABLE)")
+    endif()
+
+    set(_shader_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    set(_shader_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/row_diff.comp")
+    set(_shader_inc "${_shader_dir}/row_diff.spv.inc")
+    add_custom_command(
+        OUTPUT "${_shader_inc}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_shader_dir}"
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.0 -mfmt=num -o "${_shader_inc}" "${_shader_src}"
+        DEPENDS "${_shader_src}"
+        COMMENT "Compiling row_diff.comp"
+        VERBATIM)
+
+    target_sources(trdrop-pp PRIVATE src/vulkan/vk_diff_engine.cpp "${_shader_inc}")
+    target_include_directories(trdrop-pp PRIVATE "${_shader_dir}")
+    target_compile_definitions(trdrop-pp PRIVATE USE_VULKAN=1)
+    if(TARGET Vulkan::Headers)
+        target_link_libraries(trdrop-pp PRIVATE Vulkan::Headers)
+    else()
+        target_include_directories(trdrop-pp PRIVATE ${Vulkan_INCLUDE_DIRS})
+    endif()
+    target_link_libraries(trdrop-pp PRIVATE ${CMAKE_DL_LIBS})
+    message(STATUS "trdrop-pp: Vulkan backend enabled (glslc: ${Vulkan_GLSLC_EXECUTABLE})")
+endif()
 
 if(TRDROP_BUILD_TOOLS)
     add_executable(trdrop_make_fixtures tools/make_fixtures.cpp)

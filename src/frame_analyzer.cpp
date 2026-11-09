@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <numeric>
 
-#include <opencv2/imgproc.hpp>
-
 namespace trdrop {
 
 namespace {
@@ -77,15 +75,9 @@ FrameAnalyzer::FrameAnalyzer(const std::vector<int> & recorded_framerates)
     _last_differences.assign(kMaxVideoCount, 0.0);
 }
 
-void FrameAnalyzer::process(const std::vector<cv::Mat> & frames, const std::vector<VideoOptions> & video_options)
+void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std::vector<VideoOptions> & video_options)
 {
-    const size_t video_count = frames.size();
-    std::vector<cv::Mat> gray(video_count);
-    for (size_t i = 0; i < video_count; ++i)
-    {
-        cv::cvtColor(frames[i], gray[i], cv::COLOR_BGR2GRAY);
-    }
-
+    const size_t video_count = row_counts.size();
     _tears.clear();
     _has_difference = false;
 
@@ -93,7 +85,6 @@ void FrameAnalyzer::process(const std::vector<cv::Mat> & frames, const std::vect
     {
         // we can only calculate the difference if we have at least two sets of frames
         _received_first_frames = true;
-        _cached_gray = std::move(gray);
         return;
     }
 
@@ -101,31 +92,26 @@ void FrameAnalyzer::process(const std::vector<cv::Mat> & frames, const std::vect
 
     for (size_t i = 0; i < video_count; ++i)
     {
+        const RowCounts & counts = row_counts[i];
         // a resolution change mid-stream can't be compared row by row, count it as a new frame
-        if (_cached_gray[i].size() != gray[i].size())
+        if (!counts.compared)
         {
             _frame_diff_lists[i][_current_framecount[i]] = 1.0;
             _last_differences[i] = 1.0;
             continue;
         }
-        // a pixel is "different" if the grayscale difference is greater than the pixel difference option
-        cv::Mat absolute_difference;
-        cv::Mat mask;
-        cv::absdiff(_cached_gray[i], gray[i], absolute_difference);
-        cv::threshold(absolute_difference, mask, video_options[i].pixel_difference, 255, cv::THRESH_BINARY);
-
-        // normalized amount of different pixels per row (0.0 - 1.0)
-        cv::Mat row_sums;
-        cv::reduce(mask, row_sums, 1, cv::REDUCE_SUM, CV_32S);
-        std::vector<double> row_differences(static_cast<size_t>(mask.rows), 0.0);
-        const double normalization = 255.0 * static_cast<double>(mask.cols);
-        for (int row = 0; row < mask.rows; ++row)
+        // normalized amount of different pixels per row (0.0 - 1.0),
+        // same arithmetic as summing the 255 / 0 threshold mask of the original
+        const int rows = static_cast<int>(counts.counts.size());
+        _row_differences.assign(counts.counts.size(), 0.0);
+        const double normalization = 255.0 * static_cast<double>(counts.cols);
+        for (size_t row = 0; row < counts.counts.size(); ++row)
         {
-            row_differences[static_cast<size_t>(row)] = static_cast<double>(row_sums.at<int>(row, 0)) / normalization;
+            _row_differences[row] = static_cast<double>(static_cast<long long>(counts.counts[row]) * 255) / normalization;
         }
 
         const double dismiss_tear_percentage = video_options[i].dismiss_tear_percentage / 100.0;
-        const double difference = _frame_difference(row_differences, dismiss_tear_percentage, i, mask.rows, tears_per_video[i]);
+        const double difference = _frame_difference(_row_differences, dismiss_tear_percentage, i, rows, tears_per_video[i]);
         _frame_diff_lists[i][_current_framecount[i]] = difference;
         _last_differences[i] = difference;
     }
@@ -143,7 +129,6 @@ void FrameAnalyzer::process(const std::vector<cv::Mat> & frames, const std::vect
         if (recorded_framerate != 0) _current_framecount[i] %= recorded_framerate;
     }
 
-    _cached_gray = std::move(gray);
     _has_difference = true;
 }
 

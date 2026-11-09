@@ -5,6 +5,7 @@ It estimates the *real* framerate and frametime of an uncompressed capture and d
 using the same algorithms as the original GUI, and writes the raw per frame data as CSV.
 
 No Qt dependency. The only dependency is OpenCV (`core`, `imgproc`, `videoio`).
+Optionally the per pixel work runs on the GPU via Vulkan ([build with `-DUSE_VULKAN=ON`](#vulkan-gpu-acceleration)).
 The overlay rendering / image sequence export of the GUI is intentionally not part of the CLI.
 
 ## Usage
@@ -23,6 +24,9 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--max-frames <n>` | stop after n frames |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
+| `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
+| `--no-vk` | don't use Vulkan, analyze with OpenCV on the CPU (accepted and ignored in builds without Vulkan) |
+| `--list-vkdevices` | list the Vulkan devices with their `--vkdevice` index and exit. Vulkan builds only |
 
 `--pixel-diff`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
 comma separated values per video, e.g. `--pixel-diff 0,5,0`.
@@ -42,8 +46,9 @@ trdrop-pp fixtures/stutter.avi -o stutter.csv --tears stutter_tears.csv
 
 ```
 v1: fixtures/stutter.avi (320x180, 60 fps, 240 frames reported, pixel-diff 0, dismiss-tear-pct 10)
+backend: vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
 frame 240 (100.0%)
-analyzed 240 frames
+analyzed 240 frames in 0.34 s (703.7 fps) | analysis 15.1 ms (0.063 ms/frame) | vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
 v1: effective 29.87 fps | new 119, duplicate 120, torn 0 (0 tears) | fps avg 29.99 min 29.00 max 31.00 | frametime avg 33.52 ms max 50.00 ms
 ```
 
@@ -160,6 +165,43 @@ sudo apt install libopencv-dev   # or: brew install opencv
 cmake -S . -B build
 cmake --build build
 ```
+
+### Vulkan (GPU acceleration)
+
+`-DUSE_VULKAN=ON` adds a Vulkan compute backend (default `OFF`). It needs the Vulkan headers and
+`glslc` at build time, e.g. from the [Vulkan SDK](https://vulkan.lunarg.com/) (`VULKAN_SDK` set) or
+`apt install libvulkan-dev glslc`:
+
+```
+cmake -S . -B build-vk -G Ninja -DUSE_VULKAN=ON -DOpenCV_DIR=<opencv>/build/x64/vc16/lib
+cmake --build build-vk
+```
+
+The Vulkan loader is loaded at runtime, so the binary also starts on systems without a Vulkan
+driver: it prints a warning and uses the CPU (an explicit `--vkdevice` that can't be used is an error).
+`--no-vk` forces the CPU path. `TRDROP_VK_VALIDATION=1` enables the Khronos validation layer for debugging.
+
+What runs on the GPU: grayscale conversion, the difference to the previous frame, the
+`--pixel-diff` threshold and the per row count of different pixels (`src/vulkan/row_diff.comp`).
+The tear / framerate / frametime logic stays on the CPU. The GPU path is bit exact: it uses
+OpenCV's 8-bit fixed point grayscale formula (checked against `cv::cvtColor` at startup for all
+16.7M colors, otherwise the CPU is used), so the CSVs are identical to `--no-vk`.
+Frames are decoded directly into GPU visible memory and the GPU works on one set of frames while
+the next one is decoded.
+
+The summary line shows the wall time and the time the main thread spent in the analysis.
+Example (i7-14700KF, RTX 4070 SUPER, synthetic FFV1 videos, median of 3 runs):
+
+| input | CPU analysis | Vulkan analysis | CPU total | Vulkan total |
+| --- | --- | --- | --- | --- |
+| 1366x767, 240 frames | 0.49 ms/frame | 0.10 ms/frame | 0.69 s | 0.63 s |
+| 1920x1080, 600 frames | 0.77 ms/frame | 0.11 ms/frame | 2.86 s | 2.63 s |
+| 3840x2160, 360 frames | 3.34 ms/frame | 0.15 ms/frame | 6.43 s | 6.43 s |
+| 3x 1920x1080, 600 frames | 3.41 ms/frame | 0.17 ms/frame | 7.84 s | 6.74 s |
+| real 1440x1080 captures, ~1200-1450 frames | 0.52 - 1.11 ms/frame | 0.11 - 0.26 ms/frame | | 4 - 19% less |
+
+The analysis itself gets 4 - 20x faster, but the total is bound by video decoding (FFmpeg, on the CPU),
+so the end to end gain is small: 0 - 20% depending on the resolution and codec.
 
 ## Tests
 

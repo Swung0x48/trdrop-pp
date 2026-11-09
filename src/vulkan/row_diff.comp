@@ -1,0 +1,82 @@
+#version 450
+// Per pixel part of the trdrop analysis, one workgroup per image row:
+//   gray = cv::cvtColor(bgr, COLOR_BGR2GRAY)            (bit exact 8-bit fixed point formula of OpenCV)
+//   row_counts[row] = count(|gray - previous_gray| > threshold)
+//
+// The BGR source rows are padded so that every row starts at a 4 byte boundary and a row holds
+// a whole number of 4 pixel groups (12 bytes = 3 words). The grayscale images are stored with
+// 4 pixels per word, ceil(width / 4) words per row.
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Source       { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer PreviousGray { uint previous_gray[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer CurrentGray  { uint current_gray[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer RowCounts    { uint row_counts[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint src_row_words;   // stride of a source row in words
+    uint threshold;       // pixel_difference: a pixel differs if |a - b| > threshold
+    uint compare;         // 0: only convert (no previous frame), 1: compare with previous_gray
+} params;
+
+shared uint partial_counts[128];
+
+// OpenCV RGB2Gray<uchar>: BY15 = 3735, GY15 = 19235, RY15 = 9798, gray_shift = 15
+uint to_gray(uint b, uint g, uint r)
+{
+    return (b * 3735u + g * 19235u + r * 9798u + 16384u) >> 15;
+}
+
+uint count_different(uint a, uint b, uint valid)
+{
+    uint count = 0u;
+    for (uint k = 0u; k < valid; ++k)
+    {
+        const int pa = int((a >> (8u * k)) & 0xFFu);
+        const int pb = int((b >> (8u * k)) & 0xFFu);
+        if (uint(abs(pa - pb)) > params.threshold) count += 1u;
+    }
+    return count;
+}
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint groups = (params.width + 3u) / 4u;
+
+    uint count = 0u;
+    for (uint q = lane; q < groups; q += gl_WorkGroupSize.x)
+    {
+        const uint base = row * params.src_row_words + q * 3u;
+        // 4 BGR pixels: w0 = b0 g0 r0 b1 | w1 = g1 r1 b2 g2 | w2 = r2 b3 g3 r3
+        const uint w0 = src[base];
+        const uint w1 = src[base + 1u];
+        const uint w2 = src[base + 2u];
+        const uint y0 = to_gray( w0         & 0xFFu, (w0 >>  8u) & 0xFFu, (w0 >> 16u) & 0xFFu);
+        const uint y1 = to_gray( w0 >> 24u,           w1         & 0xFFu, (w1 >>  8u) & 0xFFu);
+        const uint y2 = to_gray((w1 >> 16u) & 0xFFu,  w1 >> 24u,           w2         & 0xFFu);
+        const uint y3 = to_gray((w2 >>  8u) & 0xFFu, (w2 >> 16u) & 0xFFu,  w2 >> 24u);
+        const uint gray = y0 | (y1 << 8u) | (y2 << 16u) | (y3 << 24u);
+
+        const uint index = row * groups + q;
+        if (params.compare != 0u)
+        {
+            const uint valid = min(params.width - q * 4u, 4u);
+            count += count_different(gray, previous_gray[index], valid);
+        }
+        current_gray[index] = gray;
+    }
+
+    partial_counts[lane] = count;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride /= 2u)
+    {
+        if (lane < stride) partial_counts[lane] += partial_counts[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) row_counts[row] = partial_counts[0];
+}

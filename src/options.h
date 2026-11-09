@@ -29,6 +29,10 @@ struct Options {
     long long max_frames = 0;
     bool quiet = false;
     bool print_summary = true;
+    //! use the Vulkan backend (only in builds with USE_VULKAN), false: OpenCV on the CPU
+    bool use_vulkan = true;
+    //! index of the Vulkan device (-1 = automatic: first discrete GPU)
+    int vk_device = -1;
 };
 
 } // namespace trdrop

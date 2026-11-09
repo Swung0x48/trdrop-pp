@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/core/utils/logger.hpp>
 
+#include "diff_engine.h"
 #include "frame_analyzer.h"
 #include "options.h"
 #include "video_sources.h"
@@ -50,6 +52,12 @@ analysis (single value for all videos, or comma separated per video, e.g. 0,5,0)
       --source-fps <fps>       override the recorded framerate of the container
       --max-frames <n>         stop after n frames
 
+backend:
+      --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
+                               discrete GPU, otherwise device 0)
+      --no-vk                  don't use Vulkan, analyze with OpenCV on the CPU
+      --list-vkdevices         list the Vulkan devices and exit
+
   -h, --help                   show this help
   -v, --version                show the version
 
@@ -64,6 +72,9 @@ per frame columns (vN = N-th input video):
 tear columns:
   frame, video, row_a, row_b, video_height   (the tear is between row_a and row_b)
 )";
+#ifndef USE_VULKAN
+    out << "\nthis build has no Vulkan support (configure with -DUSE_VULKAN=ON), --no-vk is accepted and ignored\n";
+#endif
 }
 
 std::vector<std::string> split(const std::string & text, char delimiter)
@@ -150,6 +161,32 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--pixel-diff") { pixel_diff.values = split(next(), ','); }
         else if (arg == "--dismiss-tear-pct") { dismiss.values = split(next(), ','); }
         else if (arg == "--source-fps") { source_fps.values = split(next(), ','); }
+        else if (arg == "--no-vk") { options.use_vulkan = false; }
+        else if (arg == "--vkdevice")
+        {
+            const long long value = parse_integer(next(), arg);
+#ifndef USE_VULKAN
+            (void)value;
+            throw std::invalid_argument("--vkdevice: this build has no Vulkan support (configure with -DUSE_VULKAN=ON)");
+#else
+            if (value < 0 || value > 1000) throw std::invalid_argument("--vkdevice must be >= 0");
+            options.vk_device = static_cast<int>(value);
+#endif
+        }
+        else if (arg == "--list-vkdevices")
+        {
+#ifndef USE_VULKAN
+            throw std::invalid_argument("--list-vkdevices: this build has no Vulkan support (configure with -DUSE_VULKAN=ON)");
+#else
+            const std::vector<VulkanDeviceInfo> devices = list_vulkan_devices();
+            if (devices.empty()) std::cout << "no Vulkan devices found\n";
+            for (size_t d = 0; d < devices.size(); ++d)
+            {
+                std::cout << d << ": " << devices[d].name << " (" << devices[d].type << ")\n";
+            }
+            return false;
+#endif
+        }
         else if (arg == "--max-frames")
         {
             options.max_frames = parse_integer(next(), arg);
@@ -158,6 +195,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else throw std::invalid_argument("unknown option '" + arg + "' (see --help)");
     }
 
+    if (!options.use_vulkan && options.vk_device >= 0) throw std::invalid_argument("--vkdevice and --no-vk can't be combined");
     if (options.inputs.empty()) throw std::invalid_argument("no input video given (see --help)");
     if (options.inputs.size() > static_cast<size_t>(kMaxVideoCount))
     {
@@ -274,6 +312,26 @@ int run(const Options & options)
         }
     }
 
+    std::unique_ptr<DiffEngine> engine_owner;
+#ifdef USE_VULKAN
+    if (options.use_vulkan)
+    {
+        try
+        {
+            engine_owner = make_vulkan_engine(options.vk_device, video_count);
+        }
+        catch (const std::exception & e)
+        {
+            // an explicitly requested device has to work, otherwise fall back to the CPU
+            if (options.vk_device >= 0) throw;
+            std::fprintf(stderr, "trdrop-pp: Vulkan not available (%s), using the CPU\n", e.what());
+        }
+    }
+#endif
+    if (!engine_owner) engine_owner = make_cpu_engine(video_count);
+    DiffEngine & engine = *engine_owner;
+    if (!options.quiet) std::fprintf(stderr, "backend: %s\n", engine.description().c_str());
+
     // outputs
     std::ofstream output_file;
     std::ostream * output = &std::cout;
@@ -303,12 +361,21 @@ int run(const Options & options)
     std::vector<VideoStats> stats(video_count);
     ProgressPrinter progress(!options.quiet);
     std::vector<size_t> tears_per_video(video_count);
+    std::vector<RowCounts> row_counts;
     std::string line;
 
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start_time = Clock::now();
+    Clock::duration analysis_time {};
+
+    // takes the oldest result of the engine and writes its row
     long long frame = 0;
-    while ((options.max_frames == 0 || frame < options.max_frames) && sources.read_next_frames())
-    {
-        analyzer.process(sources.frames(), options.videos);
+    auto emit_frame = [&]() {
+        const Clock::time_point collect_start = Clock::now();
+        engine.collect(row_counts);
+        analyzer.process(row_counts, options.videos);
+        analysis_time += Clock::now() - collect_start;
+
         const std::vector<double> framerates = analyzer.framerates();
         const std::vector<double> frametimes = analyzer.frametimes();
         const std::vector<double> & differences = analyzer.last_differences();
@@ -360,16 +427,34 @@ int run(const Options & options)
         line += '\n';
         *output << line;
         ++frame;
+    };
+
+    // the engine may work on a set of frames while the next one is decoded
+    long long submitted = 0;
+    while ((options.max_frames == 0 || submitted < options.max_frames) && sources.read_next_frames(engine.next_frames()))
+    {
+        const Clock::time_point submit_start = Clock::now();
+        engine.submit(options.videos);
+        analysis_time += Clock::now() - submit_start;
+        ++submitted;
+        if (engine.pending() >= engine.max_pending()) emit_frame();
         progress.update(sources);
     }
+    while (engine.pending() > 0) emit_frame();
     progress.update(sources, true);
     progress.finish();
     output->flush();
     if (!*output) throw std::runtime_error("failed writing the output");
 
+    const double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start_time).count();
+    const double analysis_ms = std::chrono::duration<double, std::milli>(analysis_time).count();
+
     if (options.print_summary)
     {
-        std::fprintf(stderr, "analyzed %lld frames\n", frame);
+        std::fprintf(stderr, "analyzed %lld frames in %.2f s (%.1f fps) | analysis %.1f ms (%.3f ms/frame) | %s\n"
+                   , frame, total_ms / 1000.0, total_ms > 0.0 ? static_cast<double>(frame) / (total_ms / 1000.0) : 0.0
+                   , analysis_ms, frame > 0 ? analysis_ms / static_cast<double>(frame) : 0.0
+                   , engine.description().c_str());
         for (size_t i = 0; i < video_count; ++i)
         {
             const VideoStats & s = stats[i];

@@ -2,8 +2,7 @@
 
 #include <vector>
 
-#include <opencv2/core.hpp>
-
+#include "diff_engine.h"
 #include "options.h"
 
 namespace trdrop {
@@ -18,17 +17,17 @@ struct Tear {
     int original_video_height = 1;
 };
 
-//! Holds two consecutive frames per video, calculates the difference frame and applies
-//! the framerate, tear and frametime detection algorithms (FrameProcessing in the original)
+//! Applies the framerate, tear and frametime detection algorithms to the per row differences
+//! of two consecutive frames (FrameProcessing in the original). The per pixel part is done by a DiffEngine
 class FrameAnalyzer {
 public:
     //! the framerate is counted within a window of `recorded framerate` frames,
     //! as we can't detect a higher framerate than the one the video was recorded with
     explicit FrameAnalyzer(const std::vector<int> & recorded_framerates);
 
-    //! compares the frames to the previous ones and updates framerate / frametime / tears.
-    //! the first call only caches the frames
-    void process(const std::vector<cv::Mat> & frames, const std::vector<VideoOptions> & video_options);
+    //! updates framerate / frametime / tears with the row differences of the next set of frames.
+    //! the first call only marks the first frames as received
+    void process(const std::vector<RowCounts> & row_counts, const std::vector<VideoOptions> & video_options);
 
     //! true if the last call to process() compared frames
     bool has_difference() const { return _has_difference; }
@@ -55,8 +54,7 @@ private:
     std::vector<std::vector<double>> _frame_diff_lists;
     //! per video: current write position in _frame_diff_lists
     std::vector<size_t> _current_framecount;
-    //! the frames of t-1 as grayscale
-    std::vector<cv::Mat> _cached_gray;
+    std::vector<double> _row_differences;
     std::vector<Tear> _tears;
     std::vector<double> _last_differences;
     bool _received_first_frames = false;
