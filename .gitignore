@@ -1,0 +1,16 @@
+# build output
+build*/
+out/
+
+# local toolchain downloads (e.g. prebuilt OpenCV)
+.deps/
+
+# IDE
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+CMakeUserPresets.json
+
+# test output
+test-out/
