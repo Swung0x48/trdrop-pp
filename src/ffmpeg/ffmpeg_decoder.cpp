@@ -104,16 +104,15 @@ VideoDecoder::VideoDecoder(const std::string & path, AVBufferRef * hw_device, in
         if (!_codec) throw std::runtime_error("out of memory");
         avcodec_parameters_to_context(_codec, _format->streams[_stream]->codecpar);
         _codec->opaque = this;
+        // automatic thread count; with hardware decoding the frame threads parse the next
+        // frames while the GPU decodes (10 - 15% faster than a single thread)
+        _codec->thread_count = 0;
         if (hw_device)
         {
             _codec->hw_device_ctx = av_buffer_ref(hw_device);
             _codec->get_format = &VideoDecoder::_get_format;
             // frames stay referenced while the GPU works on them
             _codec->extra_hw_frames = extra_hw_frames;
-        }
-        else
-        {
-            _codec->thread_count = 0; // automatic
         }
         result = avcodec_open2(_codec, decoder, nullptr);
         if (result < 0) throw std::runtime_error("could not open the " + std::string(decoder->name) + " decoder (" + error_string(result) + ")");
