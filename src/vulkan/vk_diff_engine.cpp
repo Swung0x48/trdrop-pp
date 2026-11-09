@@ -291,6 +291,28 @@ void verify_gray_formula()
     verified = true;
 }
 
+//! index of the device for --vkdevice (device_index < 0: the first discrete GPU, otherwise device 0)
+int pick_device(const Instance & instance, const std::vector<VkPhysicalDevice> & devices, int device_index)
+{
+    if (devices.empty()) throw std::runtime_error("no Vulkan device found");
+    if (device_index >= 0)
+    {
+        if (static_cast<size_t>(device_index) >= devices.size())
+        {
+            throw std::runtime_error("Vulkan device " + std::to_string(device_index) + " does not exist ("
+                                   + std::to_string(devices.size()) + " available, see --list-vkdevices)");
+        }
+        return device_index;
+    }
+    for (size_t i = 0; i < devices.size(); ++i)
+    {
+        VkPhysicalDeviceProperties properties;
+        instance.fn.vkGetPhysicalDeviceProperties(devices[i], &properties);
+        if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return static_cast<int>(i);
+    }
+    return 0;
+}
+
 size_t align_up(size_t value, size_t alignment)
 {
     return (value + alignment - 1) / alignment * alignment;
@@ -605,31 +627,7 @@ private:
     void _select_device(int device_index)
     {
         const std::vector<VkPhysicalDevice> devices = _instance->physical_devices();
-        if (devices.empty()) throw std::runtime_error("no Vulkan device found");
-        if (device_index >= 0)
-        {
-            if (static_cast<size_t>(device_index) >= devices.size())
-            {
-                throw std::runtime_error("Vulkan device " + std::to_string(device_index) + " does not exist ("
-                                       + std::to_string(devices.size()) + " available, see --list-vkdevices)");
-            }
-            _device_index = device_index;
-        }
-        else
-        {
-            // automatic: the first discrete GPU, otherwise the first device
-            _device_index = 0;
-            for (size_t i = 0; i < devices.size(); ++i)
-            {
-                VkPhysicalDeviceProperties properties;
-                _instance->fn.vkGetPhysicalDeviceProperties(devices[i], &properties);
-                if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                {
-                    _device_index = static_cast<int>(i);
-                    break;
-                }
-            }
-        }
+        _device_index = pick_device(*_instance, devices, device_index);
         _physical_device = devices[static_cast<size_t>(_device_index)];
         VkPhysicalDeviceProperties properties;
         _instance->fn.vkGetPhysicalDeviceProperties(_physical_device, &properties);
@@ -880,6 +878,17 @@ std::vector<VulkanDeviceInfo> list_vulkan_devices()
         result.push_back({ properties.deviceName, device_type_name(properties.deviceType) });
     }
     return result;
+}
+
+int resolve_vulkan_device(int device_index, std::string & name)
+{
+    Instance instance;
+    const std::vector<VkPhysicalDevice> devices = instance.physical_devices();
+    const int index = pick_device(instance, devices, device_index);
+    VkPhysicalDeviceProperties properties;
+    instance.fn.vkGetPhysicalDeviceProperties(devices[static_cast<size_t>(index)], &properties);
+    name = properties.deviceName;
+    return index;
 }
 
 std::unique_ptr<DiffEngine> make_vulkan_engine(int device_index, size_t video_count)

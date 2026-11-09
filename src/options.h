@@ -33,6 +33,8 @@ struct Options {
     bool use_vulkan = true;
     //! index of the Vulkan device (-1 = automatic: first discrete GPU)
     int vk_device = -1;
+    //! decoder: auto, vulkan (FFmpeg Vulkan Video, luma on the GPU), ffmpeg (FFmpeg on the CPU, luma), opencv
+    std::string decode = "auto";
 };
 
 } // namespace trdrop

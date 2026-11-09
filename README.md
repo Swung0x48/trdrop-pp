@@ -5,7 +5,8 @@ It estimates the *real* framerate and frametime of an uncompressed capture and d
 using the same algorithms as the original GUI, and writes the raw per frame data as CSV.
 
 No Qt dependency. The only dependency is OpenCV (`core`, `imgproc`, `videoio`).
-Optionally the per pixel work runs on the GPU via Vulkan ([build with `-DUSE_VULKAN=ON`](#vulkan-gpu-acceleration)).
+Optionally the per pixel work runs on the GPU via Vulkan ([build with `-DUSE_VULKAN=ON`](#vulkan-gpu-acceleration)),
+and HEVC / H.264 captures (e.g. OBS / NVENC recordings) are decoded on the GPU as well ([`-DUSE_FFMPEG=ON`](#ffmpeg--vulkan-video-gpu-decoding)).
 The overlay rendering / image sequence export of the GUI is intentionally not part of the CLI.
 
 ## Usage
@@ -27,6 +28,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
 | `--no-vk` | don't use Vulkan, analyze with OpenCV on the CPU (accepted and ignored in builds without Vulkan) |
 | `--list-vkdevices` | list the Vulkan devices with their `--vkdevice` index and exit. Vulkan builds only |
+| `--decode <mode>` | `auto` (default), `vulkan`, `ffmpeg` or `opencv`, see [GPU decoding](#ffmpeg--vulkan-video-gpu-decoding). FFmpeg builds only |
 
 `--pixel-diff`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
 comma separated values per video, e.g. `--pixel-diff 0,5,0`.
@@ -202,6 +204,58 @@ Example (i7-14700KF, RTX 4070 SUPER, synthetic FFV1 videos, median of 3 runs):
 
 The analysis itself gets 4 - 20x faster, but the total is bound by video decoding (FFmpeg, on the CPU),
 so the end to end gain is small: 0 - 20% depending on the resolution and codec.
+For HEVC / H.264 captures that limit is removed by decoding on the GPU, see below.
+
+### FFmpeg / Vulkan Video (GPU decoding)
+
+`-DUSE_FFMPEG=ON` (default `OFF`, together with `-DUSE_VULKAN=ON`) decodes with FFmpeg directly. Videos
+that FFmpeg can decode with Vulkan Video (HEVC, H.264 from OBS / NVENC / capture cards, ...) are
+decoded on the GPU, the luma (Y) plane of every frame is copied on the GPU and compared there
+(`src/vulkan/vk_video_pipeline.cpp`, `src/vulkan/luma_diff.comp`). Only the per row counts are read
+back, the frames never leave the GPU.
+
+It needs the FFmpeg >= 8.0 development files (`libavformat`, `libavcodec`, `libavutil`), linked
+dynamically, so an LGPL build is sufficient and the license of trdrop-pp is not affected. On Windows
+e.g. the `ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip` of [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases),
+the DLLs are copied next to `trdrop-pp.exe` (ship them together with FFmpeg's license).
+On Linux pkg-config is used when `FFMPEG_DIR` isn't set.
+
+```
+cmake -S . -B build-gpu -G Ninja -DUSE_VULKAN=ON -DUSE_FFMPEG=ON -DFFMPEG_DIR=<ffmpeg dev package> -DOpenCV_DIR=<opencv>/build/x64/vc16/lib
+cmake --build build-gpu
+```
+
+`--decode` selects the path:
+
+| mode | decoding | comparison | |
+| --- | --- | --- | --- |
+| `auto` (default) | `vulkan` if every video can be decoded that way, otherwise `opencv` | | the reason for the fallback is printed |
+| `vulkan` | GPU (Vulkan Video) | luma (Y) plane, GPU | |
+| `ffmpeg` | FFmpeg on the CPU | luma (Y) plane, CPU | same results as `vulkan`, fallback / reference |
+| `opencv` | OpenCV | BGR -> grayscale, GPU or CPU (`--no-vk`) | the original behaviour |
+
+Luma vs grayscale: `vulkan` / `ffmpeg` compare the decoded luma plane directly instead of converting
+to BGR first (which dominated the time for 4K 4:2:0 sources). Luma is limited range (16 - 235), so
+`--pixel-diff` has a slightly different scale and the CSVs differ slightly from `opencv`. Grayscale
+is a weighted sum of the colors, so pixels with a different color but the same brightness were
+already treated as equal before. On 4 real 1440p HEVC captures (5261 frame pairs) the
+duplicate frame detection of both was identical on every frame.
+Supported are 8-bit YUV formats (4:2:0 / 4:2:2 / 4:4:4, NV12, ...). 10-bit (HDR) and RGB sources
+(e.g. FFV1 bgra) use the `opencv` path. Rotation metadata is ignored by `vulkan` / `ffmpeg`.
+
+Speed compared to the original CPU only version (wall time incl. startup, i7-14700KF, RTX 4070 SUPER,
+median of 3 runs):
+
+| input | original | `--no-vk` | `--decode ffmpeg` | default (`vulkan`) |
+| --- | --- | --- | --- | --- |
+| 1440p HEVC capture, 1247 frames | 271 fps | 1.17x | 1.32x | **2.27x** (616 fps) |
+| 1440p HEVC capture, 1454 frames | 225 fps | 1.15x | 1.43x | **2.78x** (625 fps) |
+| 4K HEVC 100 Mbit/s, 900 frames | 55 fps | 1.14x | 2.63x | **5.94x** (324 fps) |
+| 4K H.264 (synthetic, low bitrate), 360 frames | 56 fps | 1.20x | 3.24x | **3.14x** (175 fps) |
+| 3 videos (2x 1440p + 4K HEVC), 900 frames | 37 fps | 1.11x | 2.24x | **5.15x** (191 fps) |
+| 1080p FFV1 bgra (falls back to `opencv`), 600 frames | 148 fps | 1.13x | - | **1.13x** (167 fps) |
+
+For very easy to decode videos (the low bitrate H.264) CPU decoding can be as fast as the GPU.
 
 ## Tests
 

@@ -61,6 +61,10 @@ struct VulkanDeviceInfo {
 //! all Vulkan devices in the order used by --vkdevice, throws if Vulkan is not available
 std::vector<VulkanDeviceInfo> list_vulkan_devices();
 
+//! the device index --vkdevice resolves to (device_index < 0: automatic) and its name,
+//! throws std::runtime_error if Vulkan or the device is not available
+int resolve_vulkan_device(int device_index, std::string & name);
+
 //! device_index < 0: pick automatically (first discrete GPU, otherwise device 0).
 //! throws std::runtime_error if Vulkan or the device is not available
 std::unique_ptr<DiffEngine> make_vulkan_engine(int device_index, size_t video_count);

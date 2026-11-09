@@ -28,8 +28,6 @@ public:
     int frame_height(size_t index) const;
     //! frames read so far (same for every video)
     long long frames_read() const { return _frames_read; }
-    //! progress of the shortest video, 0 .. 1 (or < 0 if unknown)
-    double progress() const;
 
 private:
     std::vector<cv::VideoCapture> _captures;

@@ -1,6 +1,5 @@
 #include "video_sources.h"
 
-#include <algorithm>
 #include <stdexcept>
 
 #include <opencv2/imgproc.hpp>
@@ -57,19 +56,6 @@ int VideoSources::frame_width(size_t index) const
 int VideoSources::frame_height(size_t index) const
 {
     return static_cast<int>(_captures.at(index).get(cv::CAP_PROP_FRAME_HEIGHT));
-}
-
-double VideoSources::progress() const
-{
-    double progress = -1.0;
-    for (size_t i = 0; i < _captures.size(); ++i)
-    {
-        const long long total = reported_frame_count(i);
-        if (total <= 0) continue;
-        const double p = static_cast<double>(_frames_read) / static_cast<double>(total);
-        progress = std::max(progress, p);
-    }
-    return std::min(progress, 1.0);
 }
 
 } // namespace trdrop

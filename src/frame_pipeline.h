@@ -1,0 +1,64 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "diff_engine.h"
+#include "options.h"
+
+namespace trdrop {
+
+//! Reads the input videos in lockstep and computes the per row differences of consecutive frames.
+//!
+//! Per set of frames: submit_next() decodes the next frame of every video and starts the comparison.
+//! Up to max_pending() submissions may be in flight, collect() returns them in submission order.
+class FramePipeline {
+public:
+    virtual ~FramePipeline() = default;
+
+    //! human readable decoder / backend name for the input info
+    virtual std::string description() const = 0;
+
+    //! false as soon as one video ends
+    virtual bool submit_next(const std::vector<VideoOptions> & video_options) = 0;
+    virtual size_t pending() const = 0;
+    virtual size_t max_pending() const = 0;
+    //! waits for the oldest submission, one entry per video
+    virtual void collect(std::vector<RowCounts> & out) = 0;
+
+    //! main thread time spent in the comparison (without decoding), < 0 if decoding and
+    //! comparison can't be separated (both run on the GPU)
+    virtual double analysis_seconds() const = 0;
+
+    // video information
+    virtual size_t count() const = 0;
+    //! raw framerate the video was recorded with
+    virtual double recorded_framerate(size_t index) const = 0;
+    //! frames reported by the container, may be 0 / inaccurate for some formats
+    virtual long long reported_frame_count(size_t index) const = 0;
+    virtual int frame_width(size_t index) const = 0;
+    virtual int frame_height(size_t index) const = 0;
+    //! sets of frames submitted so far
+    virtual long long frames_read() const = 0;
+
+    //! progress of the shortest video, 0 .. 1 (or < 0 if unknown)
+    double progress() const;
+};
+
+//! OpenCV decoding (BGR frames, grayscale via cv::cvtColor) with the given engine
+std::unique_ptr<FramePipeline> make_opencv_pipeline(const std::vector<std::string> & paths, std::unique_ptr<DiffEngine> engine);
+
+#ifdef USE_FFMPEG
+//! FFmpeg decoding on the CPU, compares the luma (Y) plane on the CPU.
+//! throws std::runtime_error if an input has no 8-bit YUV format
+std::unique_ptr<FramePipeline> make_ffmpeg_cpu_pipeline(const std::vector<std::string> & paths);
+#endif
+
+#if defined(USE_FFMPEG) && defined(USE_VULKAN)
+//! FFmpeg Vulkan Video decoding, the luma (Y) plane stays on the GPU and is compared there.
+//! throws std::runtime_error if Vulkan decoding isn't available for an input
+std::unique_ptr<FramePipeline> make_vulkan_video_pipeline(const std::vector<std::string> & paths, int device_index);
+#endif
+
+} // namespace trdrop

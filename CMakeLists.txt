@@ -11,6 +11,8 @@ endif()
 
 option(TRDROP_BUILD_TOOLS "Build the test fixture generator" ON)
 option(USE_VULKAN "Build the Vulkan (GPU) accelerated backend (needs the Vulkan headers and glslc)" OFF)
+option(USE_FFMPEG "Decode with FFmpeg directly, with USE_VULKAN on the GPU via Vulkan Video (needs FFmpeg >= 8.0)" OFF)
+set(FFMPEG_DIR "" CACHE PATH "FFmpeg development files (include/, lib/, bin/), otherwise pkg-config is used")
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
 
@@ -28,6 +30,7 @@ add_executable(trdrop-pp
     src/video_sources.cpp
     src/frame_analyzer.cpp
     src/diff_engine_cpu.cpp
+    src/opencv_pipeline.cpp
 )
 target_include_directories(trdrop-pp PRIVATE src)
 target_link_libraries(trdrop-pp PRIVATE ${OpenCV_LIBS})
@@ -44,16 +47,21 @@ if(USE_VULKAN)
         message(FATAL_ERROR "USE_VULKAN: glslc not found (install the Vulkan SDK or set Vulkan_GLSLC_EXECUTABLE)")
     endif()
 
+    # compute shaders are embedded as SPIR-V (<name>.spv.inc)
     set(_shader_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
-    set(_shader_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/row_diff.comp")
-    set(_shader_inc "${_shader_dir}/row_diff.spv.inc")
-    add_custom_command(
-        OUTPUT "${_shader_inc}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_shader_dir}"
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.0 -mfmt=num -o "${_shader_inc}" "${_shader_src}"
-        DEPENDS "${_shader_src}"
-        COMMENT "Compiling row_diff.comp"
-        VERBATIM)
+    function(trdrop_shader name out_var)
+        set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/${name}.comp")
+        set(_inc "${_shader_dir}/${name}.spv.inc")
+        add_custom_command(
+            OUTPUT "${_inc}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_shader_dir}"
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.0 -mfmt=num -o "${_inc}" "${_src}"
+            DEPENDS "${_src}"
+            COMMENT "Compiling ${name}.comp"
+            VERBATIM)
+        set(${out_var} "${_inc}" PARENT_SCOPE)
+    endfunction()
+    trdrop_shader(row_diff _shader_inc)
 
     target_sources(trdrop-pp PRIVATE src/vulkan/vk_diff_engine.cpp "${_shader_inc}")
     target_include_directories(trdrop-pp PRIVATE "${_shader_dir}")
@@ -65,6 +73,53 @@ if(USE_VULKAN)
     endif()
     target_link_libraries(trdrop-pp PRIVATE ${CMAKE_DL_LIBS})
     message(STATUS "trdrop-pp: Vulkan backend enabled (glslc: ${Vulkan_GLSLC_EXECUTABLE})")
+endif()
+
+if(USE_FFMPEG)
+    # libavformat / libavcodec / libavutil, linked dynamically (an LGPL build is sufficient)
+    set(_ffmpeg_libs avformat avcodec avutil)
+    if(FFMPEG_DIR)
+        find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS "${FFMPEG_DIR}/include" NO_DEFAULT_PATH)
+        set(FFMPEG_LIBRARIES "")
+        foreach(_lib IN LISTS _ffmpeg_libs)
+            find_library(FFMPEG_${_lib}_LIBRARY NAMES ${_lib} HINTS "${FFMPEG_DIR}/lib" NO_DEFAULT_PATH)
+            if(NOT FFMPEG_${_lib}_LIBRARY)
+                message(FATAL_ERROR "USE_FFMPEG: lib${_lib} not found in ${FFMPEG_DIR}/lib")
+            endif()
+            list(APPEND FFMPEG_LIBRARIES "${FFMPEG_${_lib}_LIBRARY}")
+        endforeach()
+        if(NOT FFMPEG_INCLUDE_DIR)
+            message(FATAL_ERROR "USE_FFMPEG: FFmpeg headers not found in ${FFMPEG_DIR}/include")
+        endif()
+        target_include_directories(trdrop-pp SYSTEM PRIVATE "${FFMPEG_INCLUDE_DIR}")
+        target_link_libraries(trdrop-pp PRIVATE ${FFMPEG_LIBRARIES})
+    else()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat>=62 libavcodec>=62 libavutil>=60)
+        target_link_libraries(trdrop-pp PRIVATE PkgConfig::FFMPEG)
+    endif()
+
+    target_sources(trdrop-pp PRIVATE src/ffmpeg/ffmpeg_decoder.cpp src/ffmpeg/ffmpeg_cpu_pipeline.cpp)
+    target_compile_definitions(trdrop-pp PRIVATE USE_FFMPEG=1)
+    if(USE_VULKAN)
+        trdrop_shader(luma_diff _luma_shader_inc)
+        target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_luma_shader_inc}")
+        message(STATUS "trdrop-pp: FFmpeg decoding enabled (with Vulkan Video)")
+    else()
+        message(STATUS "trdrop-pp: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")
+    endif()
+
+    # Windows: copy the FFmpeg DLLs next to the executable
+    if(WIN32 AND FFMPEG_DIR)
+        # avformat -> avcodec -> avutil, swresample
+        file(GLOB _ffmpeg_dlls "${FFMPEG_DIR}/bin/avformat*.dll" "${FFMPEG_DIR}/bin/avcodec*.dll"
+                               "${FFMPEG_DIR}/bin/avutil*.dll" "${FFMPEG_DIR}/bin/swresample*.dll")
+        if(_ffmpeg_dlls)
+            add_custom_command(TARGET trdrop-pp POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ffmpeg_dlls} "$<TARGET_FILE_DIR:trdrop-pp>"
+                COMMENT "Copying FFmpeg runtime DLLs")
+        endif()
+    endif()
 endif()
 
 if(TRDROP_BUILD_TOOLS)

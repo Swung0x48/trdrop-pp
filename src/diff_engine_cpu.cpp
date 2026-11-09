@@ -22,7 +22,9 @@ public:
     {
         for (size_t i = 0; i < _frames.size(); ++i)
         {
-            cv::cvtColor(_frames[i], _gray[i], cv::COLOR_BGR2GRAY);
+            // single channel frames already are the luma plane (FFmpeg decoding)
+            if (_frames[i].channels() == 1) _frames[i].copyTo(_gray[i]);
+            else cv::cvtColor(_frames[i], _gray[i], cv::COLOR_BGR2GRAY);
             RowCounts & result = _result[i];
             result.compared = !_previous_gray[i].empty() && _previous_gray[i].size() == _gray[i].size();
             result.cols = _gray[i].cols;

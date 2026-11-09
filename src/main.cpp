@@ -21,8 +21,8 @@
 
 #include "diff_engine.h"
 #include "frame_analyzer.h"
+#include "frame_pipeline.h"
 #include "options.h"
-#include "video_sources.h"
 
 namespace trdrop {
 namespace {
@@ -57,6 +57,15 @@ backend:
                                discrete GPU, otherwise device 0)
       --no-vk                  don't use Vulkan, analyze with OpenCV on the CPU
       --list-vkdevices         list the Vulkan devices and exit
+      --decode <mode>          auto (default): vulkan if every video can be decoded that way,
+                               otherwise opencv
+                               vulkan: decode on the GPU (FFmpeg Vulkan Video), compare the
+                                 luma (Y) plane on the GPU, frames never leave the GPU
+                               ffmpeg: decode with FFmpeg on the CPU, compare the luma plane
+                                 on the CPU (same results as vulkan)
+                               opencv: decode with OpenCV, compare BGR -> grayscale
+                               luma and grayscale differ slightly, so the results of
+                               vulkan / ffmpeg differ slightly from opencv
 
   -h, --help                   show this help
   -v, --version                show the version
@@ -74,6 +83,9 @@ tear columns:
 )";
 #ifndef USE_VULKAN
     out << "\nthis build has no Vulkan support (configure with -DUSE_VULKAN=ON), --no-vk is accepted and ignored\n";
+#endif
+#ifndef USE_FFMPEG
+    out << "\nthis build has no FFmpeg support (configure with -DUSE_FFMPEG=ON), only --decode opencv is available\n";
 #endif
 }
 
@@ -162,6 +174,23 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--dismiss-tear-pct") { dismiss.values = split(next(), ','); }
         else if (arg == "--source-fps") { source_fps.values = split(next(), ','); }
         else if (arg == "--no-vk") { options.use_vulkan = false; }
+        else if (arg == "--decode")
+        {
+            options.decode = next();
+            if (options.decode != "auto" && options.decode != "vulkan" && options.decode != "ffmpeg" && options.decode != "opencv")
+            {
+                throw std::invalid_argument("--decode expects auto, vulkan, ffmpeg or opencv");
+            }
+#ifndef USE_FFMPEG
+            if (options.decode == "vulkan" || options.decode == "ffmpeg")
+            {
+                throw std::invalid_argument("--decode " + options.decode + ": this build has no FFmpeg support (configure with -DUSE_FFMPEG=ON)");
+            }
+#endif
+#ifndef USE_VULKAN
+            if (options.decode == "vulkan") throw std::invalid_argument("--decode vulkan: this build has no Vulkan support (configure with -DUSE_VULKAN=ON)");
+#endif
+        }
         else if (arg == "--vkdevice")
         {
             const long long value = parse_integer(next(), arg);
@@ -196,6 +225,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
     }
 
     if (!options.use_vulkan && options.vk_device >= 0) throw std::invalid_argument("--vkdevice and --no-vk can't be combined");
+    if (!options.use_vulkan && options.decode == "vulkan") throw std::invalid_argument("--decode vulkan and --no-vk can't be combined");
     if (options.inputs.empty()) throw std::invalid_argument("no input video given (see --help)");
     if (options.inputs.size() > static_cast<size_t>(kMaxVideoCount))
     {
@@ -249,7 +279,7 @@ struct VideoStats {
 class ProgressPrinter {
 public:
     explicit ProgressPrinter(bool enabled) : _enabled(enabled), _last(std::chrono::steady_clock::now()) { }
-    void update(const VideoSources & sources, bool force = false)
+    void update(const FramePipeline & sources, bool force = false)
     {
         if (!_enabled) return;
         const auto now = std::chrono::steady_clock::now();
@@ -278,9 +308,56 @@ private:
     std::chrono::steady_clock::time_point _last;
 };
 
+//! OpenCV decoding with the Vulkan engine (if enabled and available) or the CPU engine
+std::unique_ptr<FramePipeline> make_opencv_decode_pipeline(const Options & options)
+{
+    std::unique_ptr<DiffEngine> engine;
+#ifdef USE_VULKAN
+    if (options.use_vulkan)
+    {
+        try
+        {
+            engine = make_vulkan_engine(options.vk_device, options.inputs.size());
+        }
+        catch (const std::exception & e)
+        {
+            // an explicitly requested device has to work, otherwise fall back to the CPU
+            if (options.vk_device >= 0) throw;
+            std::fprintf(stderr, "trdrop-pp: Vulkan not available (%s), using the CPU\n", e.what());
+        }
+    }
+#endif
+    if (!engine) engine = make_cpu_engine(options.inputs.size());
+    return make_opencv_pipeline(options.inputs, std::move(engine));
+}
+
+std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
+{
+#if defined(USE_FFMPEG) && defined(USE_VULKAN)
+    if (options.decode == "vulkan") return make_vulkan_video_pipeline(options.inputs, options.vk_device);
+    if (options.decode == "auto" && options.use_vulkan)
+    {
+        try
+        {
+            return make_vulkan_video_pipeline(options.inputs, options.vk_device);
+        }
+        catch (const std::exception & e)
+        {
+            if (!options.quiet) std::fprintf(stderr, "trdrop-pp: no Vulkan Video decoding (%s), decoding with OpenCV\n", e.what());
+        }
+    }
+#endif
+#ifdef USE_FFMPEG
+    if (options.decode == "ffmpeg") return make_ffmpeg_cpu_pipeline(options.inputs);
+#endif
+    return make_opencv_decode_pipeline(options);
+}
+
 int run(const Options & options)
 {
-    VideoSources sources(options.inputs);
+    std::unique_ptr<FramePipeline> pipeline_owner = make_pipeline(options);
+    FramePipeline & pipeline = *pipeline_owner;
+    const FramePipeline & sources = pipeline;
     const size_t video_count = sources.count();
 
     // the framerate window has the size of the recorded framerate, as we can't detect a higher framerate
@@ -312,25 +389,7 @@ int run(const Options & options)
         }
     }
 
-    std::unique_ptr<DiffEngine> engine_owner;
-#ifdef USE_VULKAN
-    if (options.use_vulkan)
-    {
-        try
-        {
-            engine_owner = make_vulkan_engine(options.vk_device, video_count);
-        }
-        catch (const std::exception & e)
-        {
-            // an explicitly requested device has to work, otherwise fall back to the CPU
-            if (options.vk_device >= 0) throw;
-            std::fprintf(stderr, "trdrop-pp: Vulkan not available (%s), using the CPU\n", e.what());
-        }
-    }
-#endif
-    if (!engine_owner) engine_owner = make_cpu_engine(video_count);
-    DiffEngine & engine = *engine_owner;
-    if (!options.quiet) std::fprintf(stderr, "backend: %s\n", engine.description().c_str());
+    if (!options.quiet) std::fprintf(stderr, "backend: %s\n", pipeline.description().c_str());
 
     // outputs
     std::ofstream output_file;
@@ -368,13 +427,13 @@ int run(const Options & options)
     const Clock::time_point start_time = Clock::now();
     Clock::duration analysis_time {};
 
-    // takes the oldest result of the engine and writes its row
+    // takes the oldest result of the pipeline and writes its row
     long long frame = 0;
     auto emit_frame = [&]() {
-        const Clock::time_point collect_start = Clock::now();
-        engine.collect(row_counts);
+        pipeline.collect(row_counts);
+        const Clock::time_point analyzer_start = Clock::now();
         analyzer.process(row_counts, options.videos);
-        analysis_time += Clock::now() - collect_start;
+        analysis_time += Clock::now() - analyzer_start;
 
         const std::vector<double> framerates = analyzer.framerates();
         const std::vector<double> frametimes = analyzer.frametimes();
@@ -429,32 +488,34 @@ int run(const Options & options)
         ++frame;
     };
 
-    // the engine may work on a set of frames while the next one is decoded
+    // the pipeline may work on a set of frames while the next one is decoded
     long long submitted = 0;
-    while ((options.max_frames == 0 || submitted < options.max_frames) && sources.read_next_frames(engine.next_frames()))
+    while ((options.max_frames == 0 || submitted < options.max_frames) && pipeline.submit_next(options.videos))
     {
-        const Clock::time_point submit_start = Clock::now();
-        engine.submit(options.videos);
-        analysis_time += Clock::now() - submit_start;
         ++submitted;
-        if (engine.pending() >= engine.max_pending()) emit_frame();
+        if (pipeline.pending() >= pipeline.max_pending()) emit_frame();
         progress.update(sources);
     }
-    while (engine.pending() > 0) emit_frame();
+    while (pipeline.pending() > 0) emit_frame();
     progress.update(sources, true);
     progress.finish();
     output->flush();
     if (!*output) throw std::runtime_error("failed writing the output");
 
     const double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start_time).count();
-    const double analysis_ms = std::chrono::duration<double, std::milli>(analysis_time).count();
+    // decoding and comparison may run fused on the GPU, then only the total is meaningful
+    const double pipeline_analysis_s = pipeline.analysis_seconds();
+    const double analysis_ms = std::chrono::duration<double, std::milli>(analysis_time).count() + pipeline_analysis_s * 1000.0;
 
     if (options.print_summary)
     {
-        std::fprintf(stderr, "analyzed %lld frames in %.2f s (%.1f fps) | analysis %.1f ms (%.3f ms/frame) | %s\n"
-                   , frame, total_ms / 1000.0, total_ms > 0.0 ? static_cast<double>(frame) / (total_ms / 1000.0) : 0.0
-                   , analysis_ms, frame > 0 ? analysis_ms / static_cast<double>(frame) : 0.0
-                   , engine.description().c_str());
+        std::fprintf(stderr, "analyzed %lld frames in %.2f s (%.1f fps)"
+                   , frame, total_ms / 1000.0, total_ms > 0.0 ? static_cast<double>(frame) / (total_ms / 1000.0) : 0.0);
+        if (pipeline_analysis_s >= 0.0)
+        {
+            std::fprintf(stderr, " | analysis %.1f ms (%.3f ms/frame)", analysis_ms, frame > 0 ? analysis_ms / static_cast<double>(frame) : 0.0);
+        }
+        std::fprintf(stderr, " | %s\n", pipeline.description().c_str());
         for (size_t i = 0; i < video_count; ++i)
         {
             const VideoStats & s = stats[i];
