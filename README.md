@@ -15,7 +15,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 
 | option | description |
 | --- | --- |
-| `-o, --output <file>` | per frame CSV (default: stdout) |
+| `-o, --output <file>` | per frame CSV (default / `-`: stdout) |
 | `--tears <file>` | additional CSV with one row per detected tear |
 | `--pixel-diff <0-255>` | grayscale difference a pixel may have without counting as different (default `0`) |
 | `--dismiss-tear-pct <%>` | tears smaller than this percentage of the frame height are dismissed (default `10`) |
@@ -26,6 +26,9 @@ trdrop-pp [options] <video> [<video> [<video>]]
 
 `--pixel-diff`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
 comma separated values per video, e.g. `--pixel-diff 0,5,0`.
+
+Only the CSV is written to stdout, progress / input info / summary go to stderr, so the output
+can be piped directly into the [plot scripts](#plotting).
 
 Up to 3 videos are read in lockstep; the analysis stops when the shortest video ends.
 Use lossless captures: with lossy codecs (h264, mjpeg, ...) compression noise makes nearly every
@@ -78,6 +81,34 @@ A tear lies between the pixel rows `row_a` and `row_b` of video number `video`.
 Per video: effective framerate over the whole clip (`sum(diff) / compared frames * recorded fps`),
 counts of new / duplicate / torn frames and the min / avg / max of the rolling framerate and frametime
 after the first full one second window.
+
+## Plotting
+
+`scripts/` contains two matplotlib scripts that read the per frame CSV, either from a file or
+piped from trdrop-pp via stdin:
+
+```
+pip install -r scripts/requirements.txt
+
+python scripts/framerate.py capture.csv
+trdrop-pp capture.avi | python scripts/framerate.py --fps 60
+trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX --percent -o frametimes.png
+```
+
+| script | plot |
+| --- | --- |
+| `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
+| `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
+
+The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).
+Frametimes are multiples of `1000 / recorded fps`, so by default every distinct value gets its own bar;
+`--bins N` switches to N equal width bins.
+
+Common options: `--labels a,b,c` legend names per video, `--title`, `-o file.png` saves the
+plot instead of opening a window (no display needed), `--dpi`.
+`framerate.py`: `--fps` shows the x axis in seconds (and hides the first second, where the framerate
+window is still filling up), `--skip N` hides the first N frames, `--max-fps` fixes the y axis.
+`frametime_histogram.py`: `--percent` share of frames instead of counts, `--bins N`, `--log`.
 
 ## Algorithm
 
