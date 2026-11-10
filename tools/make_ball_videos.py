@@ -7,12 +7,19 @@ static background, shown with different frame pacing. H.264 in mkv, like a recor
 1280x720, 60 fps, 4 seconds. The animation time of a frame is the position of the ball: at time t (in
 display intervals) it is at start + t * velocity.
 
+Constant pacing, the framerate and the perceived smoothness are flat lines:
+
   motion_ball_60       every frame advances by one interval                    60 fps, perceived 60
   motion_ball_30       a new frame every 2nd frame, advancing by 2             30 fps, perceived 30
   motion_ball_15       a new frame every 4th frame, advancing by 4             15 fps, perceived 15
   motion_ball_uneven   every frame is new, advancing by 0.5 / 1.5              60 fps, perceived 48
   motion_ball_stutter  a new frame every 2nd frame, advancing by 1 / 3         30 fps, perceived 24
   motion_ball_hitch    every second 6 frames freeze, the next one catches up   54 fps, perceived 35.3
+
+The pacing changes every 2 seconds (8 seconds, the ball moves half as fast), the values follow within a second:
+
+  motion_ball_change   like motion_ball_60, then _uneven, then _stutter,       60 / 60 / 30 / 60 fps,
+                       then _60 again                                          perceived 60 / 48 / 24 / 60
 
 Needs numpy, opencv-python and an ffmpeg with the chosen encoder.
 """
@@ -31,21 +38,26 @@ VELOCITY = (4.0, 1.2)  # pixels per display interval
 BACKGROUND = (52, 44, 40)  # BGR
 
 
-def animation_times():
-    """name -> animation time (in display intervals) of every frame"""
+def videos():
+    """name -> (animation time of every frame in display intervals, speed of the ball relative to VELOCITY)"""
     frames = np.arange(FRAMES)
     hitch = frames.astype(float)
     for second in range(FRAMES // 60):
         # frames 30 - 35 of every second show frame 29, frame 36 is on time again
         hitch[second * 60 + 30:second * 60 + 36] = second * 60 + 29
+    # how far every frame advances: 2 seconds each of even steps, 0.5 / 1.5, a new frame every 2nd frame
+    # advancing by 1 / 3, even steps
+    steps = np.concatenate([np.ones(120), np.tile([0.5, 1.5], 60), np.tile([0.0, 1.0, 0.0, 3.0], 30), np.ones(120)])
+    steps[0] = 0.0
     return {
-        "60": frames.astype(float),
-        "30": (frames // 2 * 2).astype(float),
-        "15": (frames // 4 * 4).astype(float),
-        "uneven": np.where(frames % 2 == 0, frames, frames - 0.5).astype(float),
+        "60": (frames.astype(float), 1.0),
+        "30": ((frames // 2 * 2).astype(float), 1.0),
+        "15": ((frames // 4 * 4).astype(float), 1.0),
+        "uneven": (np.where(frames % 2 == 0, frames, frames - 0.5).astype(float), 1.0),
         # new frames at 0, 2, 4, ...: the animation is at 0, 1, 4, 5, 8, ...
-        "stutter": (frames // 4 * 4 + (frames // 2 % 2)).astype(float),
-        "hitch": hitch,
+        "stutter": ((frames // 4 * 4 + (frames // 2 % 2)).astype(float), 1.0),
+        "hitch": (hitch, 1.0),
+        "change": (np.cumsum(steps), 0.5),
     }
 
 
@@ -73,10 +85,10 @@ def ball_sprite():
     return sprite, coverage
 
 
-def render(sprite, coverage, time):
+def render(sprite, coverage, time, speed):
     """the frame at animation time `time`, the ball placed with sub pixel accuracy"""
-    x = START[0] + VELOCITY[0] * time - sprite.shape[1] / 2.0
-    y = START[1] + VELOCITY[1] * time - sprite.shape[0] / 2.0
+    x = START[0] + VELOCITY[0] * speed * time - sprite.shape[1] / 2.0
+    y = START[1] + VELOCITY[1] * speed * time - sprite.shape[0] / 2.0
     matrix = np.float64([[1, 0, x], [0, 1, y]])
     ball = cv2.warpAffine(sprite, matrix, (WIDTH, HEIGHT), flags=cv2.INTER_CUBIC)
     alpha = np.clip(cv2.warpAffine(coverage, matrix, (WIDTH, HEIGHT), flags=cv2.INTER_CUBIC), 0, 1)[..., None]
@@ -93,7 +105,7 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
     sprite, coverage = ball_sprite()
-    for name, times in animation_times().items():
+    for name, (times, speed) in videos().items():
         path = os.path.join(args.output, f"motion_ball_{name}.mkv")
         encoder = subprocess.Popen([args.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                                     "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", "-", "-c:v", args.encoder, "-b:v", args.bitrate,
@@ -101,7 +113,7 @@ def main():
         cache = {}
         for time in times:
             if time not in cache:
-                cache = {time: render(sprite, coverage, time).tobytes()}  # duplicates are the identical picture
+                cache = {time: render(sprite, coverage, time, speed).tobytes()}  # duplicates are the identical picture
             encoder.stdin.write(cache[time])
         encoder.stdin.close()
         if encoder.wait() != 0:

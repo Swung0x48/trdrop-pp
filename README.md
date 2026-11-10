@@ -240,6 +240,7 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
 | `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram |
+| `motion_vectors.py` | writes a copy of a video with its motion vectors drawn on top (measured like the CPU path of `--motion`; with `--csv` also the values of every frame). Needs numpy, opencv-python and ffmpeg |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).
 Frametimes are multiples of `1000 / recorded fps`, so by default every distinct value gets its own bar;
