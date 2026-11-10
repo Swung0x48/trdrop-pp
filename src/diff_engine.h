@@ -21,6 +21,8 @@ struct RowCounts {
     std::vector<uint32_t> counts;
     //! motion from the previous frame, only if the pipeline measures it (FramePipeline::enable_motion)
     MotionField motion;
+    //! the picture and the tracked points for the motion video (FramePipeline::enable_motion_detail)
+    std::shared_ptr<MotionDetail> detail;
 };
 
 //! Computes the per pixel part of the analysis: grayscale conversion, the difference to the

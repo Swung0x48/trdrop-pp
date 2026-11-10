@@ -23,6 +23,7 @@
 #include "diff_engine.h"
 #include "frame_analyzer.h"
 #include "frame_pipeline.h"
+#include "motion_video.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -74,6 +75,15 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
       --motion-window <ms>     the motion of a frame is compared to the average motion in
                                this window around it (default: 400, growing up to 1000 until
                                it holds 10 new frames)
+      --motion-video <file>    --motion, and write a copy of the video with the motion drawn
+                               on it: an arrow per tracked point (colored by its length; they
+                               stay, dimmed, on duplicate frames), a red x where a match was
+                               rejected, and the values of the frame. At the resolution the
+                               motion is measured at (up to 1920x1080), H.264 in the container
+                               the name asks for (.mp4, .mkv, .mov). One file per input video,
+                               comma separated
+      --arrow-scale <x>        draw the arrows of the motion video x times longer (default: 1,
+                               the real motion; e.g. 8 for slow motion)
       --async-capture          --motion for a capture that didn't run in step with the game's
                                output (variable refresh rate, or a capture program with its
                                own clock): a picture may be recorded an interval late, which
@@ -229,6 +239,12 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--no-vk") { options.use_vulkan = false; }
         else if (arg == "--motion") { options.motion = true; }
         else if (arg == "--async-capture") { options.motion = true; options.async_capture = true; }
+        else if (arg == "--motion-video") { options.motion = true; options.motion_videos = split(next(), ','); }
+        else if (arg == "--arrow-scale")
+        {
+            options.arrow_scale = parse_double(next(), arg);
+            if (options.arrow_scale < 0.1 || options.arrow_scale > 100.0) throw std::invalid_argument("--arrow-scale must be between 0.1 and 100");
+        }
         else if (arg == "--motion-window")
         {
             options.motion_window_ms = parse_double(next(), arg);
@@ -296,6 +312,10 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         throw std::invalid_argument("at most " + std::to_string(kMaxVideoCount) + " videos can be compared");
     }
     options.videos.assign(options.inputs.size(), VideoOptions());
+    if (options.motion_videos.size() > options.inputs.size())
+    {
+        throw std::invalid_argument("--motion-video: more files than videos");
+    }
 
     apply_per_video(pixel_diff, options.videos, [](VideoOptions & v, const std::string & text) {
         const long long value = parse_integer(text, "--pixel-diff");
@@ -460,6 +480,7 @@ int run(const Options & options)
     std::unique_ptr<FramePipeline> pipeline_owner = make_pipeline(options);
     FramePipeline & pipeline = *pipeline_owner;
     if (options.motion) pipeline.enable_motion();
+    if (!options.motion_videos.empty()) pipeline.enable_motion_detail();
     const FramePipeline & sources = pipeline;
     const size_t video_count = sources.count();
 
@@ -517,6 +538,20 @@ int run(const Options & options)
 
     if (!options.quiet) std::fprintf(stderr, "backend: %s\n", pipeline.description().c_str());
 
+    // --motion-video: one writer per video that has a file
+    std::vector<std::unique_ptr<MotionVideo>> motion_videos(video_count);
+    for (size_t i = 0; i < options.motion_videos.size(); ++i)
+    {
+        if (options.motion_videos[i].empty()) continue;
+        motion_videos[i] = std::make_unique<MotionVideo>(options.motion_videos[i], sources.frame_width(i), sources.frame_height(i)
+                                                       , recorded_framerates[i], options.arrow_scale);
+        if (!options.quiet)
+        {
+            std::fprintf(stderr, "v%zu motion video: %s (%dx%d, %s)\n", i + 1, motion_videos[i]->path().c_str()
+                       , motion_videos[i]->size().width, motion_videos[i]->size().height, motion_videos[i]->description().c_str());
+        }
+    }
+
     // outputs
     std::ofstream output_file;
     std::ostream * output = &std::cout;
@@ -559,6 +594,9 @@ int run(const Options & options)
     struct PendingRow {
         long long frame = 0;
         std::vector<std::string> columns; // per video, each starts with a comma
+        // for the motion videos, per video
+        std::vector<MotionVideoFrame> values;
+        std::vector<std::shared_ptr<MotionDetail>> details;
     };
     std::deque<PendingRow> pending_rows;
     std::vector<MotionAnalyzer> motion_analyzers;
@@ -595,6 +633,11 @@ int run(const Options & options)
                 {
                     line += ',';
                     if (sample.has_error) line += std::to_string(sample.lost);
+                }
+                if (motion_videos[i] && row.details[i])
+                {
+                    row.values[i].sample = sample;
+                    motion_videos[i]->write(row.values[i], *row.details[i]);
                 }
             }
             line += '\n';
@@ -633,8 +676,20 @@ int run(const Options & options)
         PendingRow row;
         row.frame = frame;
         row.columns.resize(video_count);
+        row.values.resize(video_count);
+        row.details.resize(video_count);
         for (size_t i = 0; i < video_count; ++i)
         {
+            if (motion_videos[i])
+            {
+                MotionVideoFrame & values = row.values[i];
+                values.frame = frame;
+                values.compared = analyzer.has_difference();
+                values.duplicate = values.compared && differences[i] == 0.0;
+                values.torn = values.compared && differences[i] > 0.0 && differences[i] < 1.0;
+                values.framerate = framerates[i];
+                row.details[i] = std::move(row_counts[i].detail);
+            }
             std::string & column = row.columns[i];
             column = ',';
             if (analyzer.has_difference()) column += format_number(differences[i]);
@@ -697,6 +752,10 @@ int run(const Options & options)
     while (pipeline.pending() > 0) emit_frame();
     for (MotionAnalyzer & motion : motion_analyzers) motion.finish();
     write_ready_rows();
+    for (const std::unique_ptr<MotionVideo> & video : motion_videos)
+    {
+        if (video) video->finish();
+    }
     progress.update(sources, true);
     progress.finish();
     output->flush();

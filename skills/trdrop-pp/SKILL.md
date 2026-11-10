@@ -105,10 +105,21 @@ python <scripts>/frametime_histogram.py <name>.csv --percent -o <name>_frametime
   every new frame over time, and its histogram.
 - Look at the image before describing it.
 
-`python <scripts>/motion_vectors.py <video> --csv <name>.csv -o <name>_vectors.mp4` writes a copy of the
-video with the motion vectors drawn on it (needs numpy, opencv-python and ffmpeg). Use it when the user wants
-to see what was measured, or to understand why a stretch could not be measured. `--arrow-scale 8` for slow
+## Show what was measured
+
+```
+trdrop-pp <video> --motion-video <name>_motion.mp4 -o <name>.csv 2> <name>.log
+```
+
+`--motion-video` (implies `--motion`) also writes a copy of the video with the motion drawn on it: an arrow
+per tracked point, a red x where a match was rejected, and the values of every frame as text (new /
+duplicate, animation step, animation error, framerate, perceived smoothness). Use it when the user wants to
+see what was measured, or to understand why a stretch could not be measured. `--arrow-scale 8` for slow
 motion, where the arrows would only be a pixel or two long.
+
+It needs nothing but trdrop++ itself and doesn't change the numbers, but drawing and encoding make the run
+about three times as long - leave the option off when only the numbers are wanted. With several input
+videos give one file per video, comma separated.
 
 ## Report
 

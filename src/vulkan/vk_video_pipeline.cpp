@@ -1,6 +1,7 @@
 // Vulkan Video pipeline: FFmpeg decodes on the GPU (Vulkan hwaccel), the Y, U and V planes of every
 // decoded image are copied into buffers on the GPU and compared with the previous ones by
-// yuv_diff.comp. Only the per row counts are read back, the frames never leave the GPU.
+// yuv_diff.comp. Only the per row counts are read back, the frames never leave the GPU - unless the motion
+// video is written, then the planes are also copied into host memory for the picture.
 //
 // The Vulkan objects live on FFmpeg's VkDevice. Every decoded image is synchronized through its
 // timeline semaphore (AVVkFrame::sem / sem_value), as required by FFmpeg.
@@ -26,6 +27,7 @@ extern "C" {
 #include <vector>
 
 #include "ffmpeg/ffmpeg_decoder.h"
+#include "ffmpeg/yuv_picture.h"
 
 #if LIBAVUTIL_VERSION_MAJOR < 60
 #error "the Vulkan Video pipeline needs FFmpeg 8.0 or newer"
@@ -226,6 +228,8 @@ public:
         _motion = true;
     }
 
+    void enable_motion_detail() override { _motion_detail = true; }
+
     bool submit_next(const std::vector<VideoOptions> & video_options) override
     {
         Slot & slot = _slots[_submitted % kSlots];
@@ -297,6 +301,26 @@ public:
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 });
+            }
+            if (_motion_detail)
+            {
+                // the planes once more, in host memory: nothing else uses the buffers of a slot that isn't in flight
+                const std::initializer_list<VkMemoryPropertyFlags> readable = {
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                };
+                if (slot_video.picture_luma.size < plan.luma_bytes)
+                {
+                    _destroy_buffer(slot_video.picture_luma);
+                    slot_video.picture_luma = _create_buffer(plan.luma_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readable);
+                }
+                if (slot_video.picture_chroma.size < plan.chroma_bytes)
+                {
+                    _destroy_buffer(slot_video.picture_chroma);
+                    slot_video.picture_chroma = _create_buffer(plan.chroma_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readable);
+                }
             }
             video.width = frame->width;
             video.height = frame->height;
@@ -432,7 +456,12 @@ public:
         dependency.pImageMemoryBarriers = image_barriers.data();
         _fn.vkCmdPipelineBarrier2(slot.command_buffer, &dependency);
 
-        for (size_t i = 0; i < _videos.size(); ++i) _record_copies(slot.command_buffer, slot.videos[i]);
+        for (size_t i = 0; i < _videos.size(); ++i)
+        {
+            const SlotVideo & slot_video = slot.videos[i];
+            _record_copies(slot.command_buffer, slot_video, slot_video.luma->buffer, slot_video.chroma->buffer);
+            if (_motion_detail) _record_copies(slot.command_buffer, slot_video, slot_video.picture_luma.buffer, slot_video.picture_chroma.buffer);
+        }
 
         VkMemoryBarrier2 copied { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         copied.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -457,8 +486,8 @@ public:
         if (_motion) _record_motion(slot);
 
         VkMemoryBarrier2 host { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        host.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        host.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        host.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | (_motion_detail ? VK_PIPELINE_STAGE_2_COPY_BIT : 0);
+        host.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | (_motion_detail ? VK_ACCESS_2_TRANSFER_WRITE_BIT : 0);
         host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
         host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
         VkDependencyInfo host_dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -541,7 +570,13 @@ public:
                 const uint32_t * counts = static_cast<const uint32_t *>(slot_video.row_counts.mapped);
                 result.counts.assign(counts, counts + slot_video.height);
             }
-            if (_motion) _read_motion(slot_video, result.motion);
+            result.detail.reset();
+            if (_motion_detail)
+            {
+                result.detail = std::make_shared<MotionDetail>();
+                _read_picture(slot_video, result.detail->picture);
+            }
+            if (_motion) _read_motion(slot_video, result.motion, _motion_detail ? &result.detail->points : nullptr);
             // the decoded image can be reused by the decoder
             av_frame_unref(slot_video.frame);
         }
@@ -605,6 +640,9 @@ private:
         Plan plan;
         const Buffer * luma = nullptr;
         const Buffer * chroma = nullptr;
+        //! motion video: the planes in host memory, with the same layout
+        Buffer picture_luma;
+        Buffer picture_chroma;
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         // motion: tracked points (vec4 per point) are read back
         Buffer motion_points;
@@ -651,8 +689,8 @@ private:
         return plan;
     }
 
-    //! copies the planes of the decoded image into the luma / chroma buffers of the slot
-    void _record_copies(VkCommandBuffer command_buffer, const SlotVideo & slot_video)
+    //! copies the planes of the decoded image of the slot into a luma and a chroma buffer
+    void _record_copies(VkCommandBuffer command_buffer, const SlotVideo & slot_video, VkBuffer luma, VkBuffer chroma)
     {
         const AVFrame * frame = slot_video.frame;
         const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(frame->data[0]);
@@ -676,18 +714,18 @@ private:
             region.imageExtent = { width, height, 1 };
             _fn.vkCmdCopyImageToBuffer(command_buffer, vkf->img[multiplane ? 0 : plane], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
         };
-        copy(0, slot_video.luma->buffer, 0, plan.luma_row_words * 4, static_cast<uint32_t>(frame->width), static_cast<uint32_t>(frame->height), 0, 0);
+        copy(0, luma, 0, plan.luma_row_words * 4, static_cast<uint32_t>(frame->width), static_cast<uint32_t>(frame->height), 0, 0);
         const int sx = plan.layout.shift_x;
         const int sy = plan.layout.shift_y;
         if (plan.layout.chroma == ffmpeg::YuvLayout::Interleaved)
         {
             // UV pairs, row length in (2 byte) texels
-            copy(1, slot_video.chroma->buffer, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+            copy(1, chroma, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
         }
         else if (plan.layout.chroma == ffmpeg::YuvLayout::Planar)
         {
-            copy(1, slot_video.chroma->buffer, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
-            copy(2, slot_video.chroma->buffer, plan.v_offset, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+            copy(1, chroma, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+            copy(2, chroma, plan.v_offset, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
         }
     }
 
@@ -763,11 +801,38 @@ private:
         }
     }
 
-    //! the tracked points of a frame as the median motion per grid cell
-    void _read_motion(const SlotVideo & slot_video, MotionField & field)
+    //! the frame of a slot as the picture of the motion video, from the planes in host memory
+    void _read_picture(const SlotVideo & slot_video, cv::Mat & picture)
+    {
+        for (const Buffer * buffer : { &slot_video.picture_luma, &slot_video.picture_chroma })
+        {
+            if (buffer->coherent) continue;
+            VkMappedMemoryRange range { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            range.memory = buffer->memory;
+            range.size = VK_WHOLE_SIZE;
+            check(_fn.vkInvalidateMappedMemoryRanges(_device, 1, &range), "vkInvalidateMappedMemoryRanges");
+        }
+        const Plan & plan = slot_video.plan;
+        ffmpeg::YuvPlanes planes;
+        planes.width = slot_video.width;
+        planes.height = slot_video.height;
+        planes.layout = plan.layout;
+        planes.v_first = plan.format == AV_PIX_FMT_NV21 || plan.format == AV_PIX_FMT_NV42;
+        planes.data[0] = static_cast<const uint8_t *>(slot_video.picture_luma.mapped);
+        planes.stride[0] = static_cast<size_t>(plan.luma_row_words) * 4;
+        planes.data[1] = static_cast<const uint8_t *>(slot_video.picture_chroma.mapped);
+        planes.stride[1] = plan.chroma_row_bytes;
+        planes.data[2] = planes.data[1] + plan.v_offset;
+        planes.stride[2] = plan.chroma_row_bytes;
+        ffmpeg::motion_picture(planes, picture, _scratch);
+    }
+
+    //! the tracked points of a frame as the median motion per grid cell, and one by one if `detail` is given
+    void _read_motion(const SlotVideo & slot_video, MotionField & field, std::vector<MotionPoint> * detail)
     {
         field = MotionField();
         field.pixel_scale = static_cast<float>(slot_video.motion.scale);
+        if (detail) detail->clear();
         if (!slot_video.motion_estimated) return;
         field.estimated = true;
         if (!slot_video.motion_points.coherent)
@@ -785,7 +850,23 @@ private:
             {
                 const float * point = points + 4 * (y * kMotionPointsX + x);
                 // (dx, dy, texture, distance by which the way back misses the point)
-                if (!(point[2] >= kMotionMinTexture) || !(point[3] <= kMotionMaxBackError) || !std::isfinite(point[0]) || !std::isfinite(point[1])) continue;
+                const bool texture = point[2] >= kMotionMinTexture && std::isfinite(point[0]) && std::isfinite(point[1]);
+                const bool returns = texture && point[3] <= kMotionMaxBackError;
+                if (detail)
+                {
+                    // the same grid as motion_lk.comp, in pixels of the first level of the pyramid
+                    MotionPoint tracked;
+                    tracked.x = (static_cast<float>(x) + 0.5f) * static_cast<float>(slot_video.motion.width[0]) / kMotionPointsX - 0.5f;
+                    tracked.y = (static_cast<float>(y) + 0.5f) * static_cast<float>(slot_video.motion.height[0]) / kMotionPointsY - 0.5f;
+                    tracked.state = returns ? MotionPoint::Used : texture ? MotionPoint::Rejected : MotionPoint::NoTexture;
+                    if (texture)
+                    {
+                        tracked.dx = point[0];
+                        tracked.dy = point[1];
+                    }
+                    detail->push_back(tracked);
+                }
+                if (!returns) continue;
                 _binner.add((static_cast<float>(x) + 0.5f) / kMotionPointsX, (static_cast<float>(y) + 0.5f) / kMotionPointsY, point[0], point[1]);
             }
         }
@@ -1099,6 +1180,8 @@ private:
                 {
                     _destroy_buffer(video.row_counts);
                     _destroy_buffer(video.motion_points);
+                    _destroy_buffer(video.picture_luma);
+                    _destroy_buffer(video.picture_chroma);
                 }
                 if (slot.fence) _fn.vkDestroyFence(_device, slot.fence, nullptr);
                 slot.fence = VK_NULL_HANDLE;
@@ -1155,6 +1238,9 @@ private:
 
     // motion: pyramid and tracking pipelines
     bool _motion = false;
+    //! motion video: the picture and the points of every frame are kept
+    bool _motion_detail = false;
+    cv::Mat _scratch;
     Compute _pyramid;
     Compute _lk;
     MotionCellBinner _binner;

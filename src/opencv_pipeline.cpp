@@ -28,6 +28,11 @@ void FramePipeline::enable_motion()
     throw std::runtime_error("the motion analysis is not available with " + description());
 }
 
+void FramePipeline::enable_motion_detail()
+{
+    throw std::runtime_error("the motion video is not available with " + description());
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -48,12 +53,24 @@ public:
         if (!_motion.empty())
         {
             std::vector<MotionField> fields(frames.size());
+            std::vector<std::shared_ptr<MotionDetail>> details(frames.size());
             for (size_t i = 0; i < frames.size(); ++i)
             {
                 cv::cvtColor(frames[i], _gray, cv::COLOR_BGR2GRAY);
-                fields[i] = _motion[i].estimate(_gray);
+                if (_motion_detail)
+                {
+                    details[i] = std::make_shared<MotionDetail>();
+                    // the picture at the resolution of the motion, cut to an even size
+                    const int scale = motion_scale(frames[i].cols, frames[i].rows);
+                    const cv::Size size = motion_picture_size(frames[i].cols, frames[i].rows);
+                    if (scale > 1) cv::resize(frames[i], _small, cv::Size(frames[i].cols / scale, frames[i].rows / scale), 0, 0, cv::INTER_AREA);
+                    const cv::Mat & source = scale > 1 ? _small : frames[i];
+                    cv::cvtColor(source(cv::Rect(0, 0, size.width, size.height)), details[i]->picture, cv::COLOR_BGR2YUV_I420);
+                }
+                fields[i] = _motion[i].estimate(_gray, _motion_detail ? &details[i]->points : nullptr);
             }
             _motion_queue.push_back(std::move(fields));
+            _detail_queue.push_back(std::move(details));
         }
         _engine->submit(video_options);
         _analysis += Clock::now() - start;
@@ -69,13 +86,19 @@ public:
         _engine->collect(out);
         if (!_motion.empty())
         {
-            for (size_t i = 0; i < out.size(); ++i) out[i].motion = _motion_queue.front()[i];
+            for (size_t i = 0; i < out.size(); ++i)
+            {
+                out[i].motion = _motion_queue.front()[i];
+                out[i].detail = std::move(_detail_queue.front()[i]);
+            }
             _motion_queue.pop_front();
+            _detail_queue.pop_front();
         }
         _analysis += Clock::now() - start;
     }
 
     void enable_motion() override { _motion.resize(_sources.count()); }
+    void enable_motion_detail() override { _motion_detail = true; }
 
     double analysis_seconds() const override { return std::chrono::duration<double>(_analysis).count(); }
 
@@ -94,7 +117,10 @@ private:
     //! motion estimation on the CPU, the fields wait for collect() in submission order
     std::vector<MotionEstimator> _motion;
     std::deque<std::vector<MotionField>> _motion_queue;
+    bool _motion_detail = false;
+    std::deque<std::vector<std::shared_ptr<MotionDetail>>> _detail_queue;
     cv::Mat _gray;
+    cv::Mat _small;
     Clock::duration _analysis {};
 };
 

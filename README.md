@@ -26,6 +26,8 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--max-frames <n>` | stop after n frames |
 | `--motion` | [motion analysis](#motion-analysis---motion): animation step, animation error and perceived smoothness |
 | `--motion-window <ms>` | fixed length of the window the motion of a frame is compared to (default: 400, longer for low framerates) |
+| `--motion-video <file>` | `--motion`, and write a [copy of the video with the motion drawn on it](#motion-video---motion-video) (`.mp4`, `.mkv`, `.mov`; one file per input video, comma separated) |
+| `--arrow-scale <x>` | draw the arrows of the motion video x times longer (default `1`) |
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
@@ -225,6 +227,40 @@ Limits:
   other sources (e.g. lossless RGB) are measured on the CPU.
 * The rows of the CSV are written with a delay of up to half a second (the look ahead of the window).
 
+### Motion video (`--motion-video`)
+
+```
+trdrop-pp capture.mkv --motion-video capture_motion.mp4 -o capture.csv
+```
+
+writes a copy of the video that shows what the motion analysis saw, frame by frame:
+
+| | |
+| --- | --- |
+| arrow | a point of the grid that was tracked: from where it was in the previous frame to where it is now, colored by its length (blue: short, red: 45 pixels and more). On a duplicate frame the arrows of the last new frame stay, dimmed |
+| dot | a tracked point that didn't move |
+| red x | a point whose match doesn't come back, it is not used |
+| nothing | no texture at the point |
+| text | the row of the frame: new / duplicate / torn, points used and rejected, animation step and the spread of its votes, animation error, framerate and perceived smoothness. With `--async-capture` also where a picture was lost |
+
+The video has the resolution the motion is measured at (the source divided by a whole number, 1920x1080 at
+most: 4K becomes 1080p) and the framerate of the source; the picture is darkened so the arrows stand out.
+`--arrow-scale 8` draws the arrows 8 times longer, for slow motion where they would be a pixel or two.
+With several input videos give one file each, comma separated; an empty name skips a video
+(`--motion-video ,b.mp4`).
+
+Builds with FFmpeg encode H.264 with the first encoder that works on the machine - the GPU's (NVENC, AMF,
+Quick Sync, VideoToolbox), x264 if the FFmpeg build has it, the one of Windows (Media Foundation), OpenH264 -
+and MPEG-4 if none does; the container follows from the name. Builds without FFmpeg write what OpenCV
+can: MPEG-4 (`.mp4`, `.mkv`, `.mov`) or Motion JPEG (`.avi`). The `vN motion video:` line says which it is.
+
+The analysis is the same with and without the option (the CSV is identical), on every decoder: the arrows
+are the points this run measured, on the GPU or on the CPU. With Vulkan Video decoding the planes of every
+frame are copied into host memory for the picture; drawing and encoding run on the CPU. A 4K 120 fps HEVC
+recording is analyzed at about 200 frames per second with the video instead of 600 without (`--decode
+ffmpeg`: 93 instead of 156). The frames wait for their values (the look ahead of the window), at 4K 120 fps
+that takes up to 200 MB of memory.
+
 ### Captures that are not in step (`--async-capture`)
 
 A capture card that records a console at a fixed 60 Hz in step with its output sees every picture exactly as
@@ -297,7 +333,6 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
 | `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram. With `--fps` and an `--async-capture` CSV the framerate includes the pictures the capture lost |
-| `motion_vectors.py` | writes a copy of a video with its motion vectors drawn on top (measured like the CPU path of `--motion`; with `--csv` also the values of every frame). Needs numpy, opencv-python and ffmpeg |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).
 Frametimes are multiples of `1000 / recorded fps`, so by default every distinct value gets its own bar;
@@ -368,7 +403,7 @@ On Windows this gives a folder that can be copied to another PC and used as it i
 | | |
 | --- | --- |
 | `bin/` | `trdrop-pp.exe` and the DLLs it needs: OpenCV (with its FFmpeg plugin), with `-DUSE_FFMPEG=ON` and `FFMPEG_DIR` the FFmpeg DLLs, and the MSVC runtime. `-DTRDROP_INSTALL_RUNTIME=OFF` installs the program alone |
-| `scripts/` | the [plot scripts](#plotting), `motion_vectors.py`, `make_ball_videos.py` and `requirements.txt` (they need Python, see there) |
+| `scripts/` | the [plot scripts](#plotting), `make_ball_videos.py` and `requirements.txt` (they need Python, see there) |
 | `skills/` | the [agent skill](#agent-skill) |
 | `licenses/` | the license of trdrop++ and those of the DLLs in `bin/` |
 | `README.md` | this file |

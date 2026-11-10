@@ -57,12 +57,40 @@ private:
     std::vector<float> _values;
 };
 
+//! a point of the grid as it was tracked, in pixels of the resolution the motion is measured at
+struct MotionPoint {
+    enum State : uint8_t {
+        NoTexture = 0, //!< nothing to track at the point
+        Rejected = 1,  //!< tracked, but tracking it back doesn't end at the point
+        Used = 2,
+    };
+    float x = 0.0f;
+    float y = 0.0f;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    State state = NoTexture;
+};
+
+//! what the motion video shows of a frame
+struct MotionDetail {
+    //! the frame at the resolution the motion is measured at (see motion_picture_size), as I420: the Y plane
+    //! followed by the U and V planes of half the size, rows * 3 / 2 rows of 8-bit values
+    cv::Mat picture;
+    //! the points of the grid, empty if there was no previous frame of the same size
+    std::vector<MotionPoint> points;
+};
+
+//! the motion of a frame is measured at 1 / this of its resolution (at up to 1920x1080)
+int motion_scale(int width, int height);
+//! size of MotionDetail::picture for a frame: the resolution the motion is measured at, made even
+cv::Size motion_picture_size(int width, int height);
+
 //! Measures the motion between consecutive frames on the CPU: the points of the grid are tracked from the
 //! previous frame into the current one and back (pyramidal Lucas-Kanade, sub pixel accurate) at up to 1920x1080.
 class MotionEstimator {
 public:
-    //! luma: 8-bit single channel frame in full resolution
-    MotionField estimate(const cv::Mat & luma);
+    //! luma: 8-bit single channel frame in full resolution, points: if given, receives every point of the grid
+    MotionField estimate(const cv::Mat & luma, std::vector<MotionPoint> * points = nullptr);
 
 private:
     cv::Mat _current;

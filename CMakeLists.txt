@@ -51,6 +51,8 @@ add_executable(trdrop-pp
     src/diff_engine_cpu.cpp
     src/opencv_pipeline.cpp
     src/motion.cpp
+    src/motion_video.cpp
+    src/video_writer.cpp
 )
 target_include_directories(trdrop-pp PRIVATE src)
 target_link_libraries(trdrop-pp PRIVATE ${OpenCV_LIBS})
@@ -123,7 +125,8 @@ if(USE_FFMPEG)
         target_link_libraries(trdrop-pp PRIVATE PkgConfig::FFMPEG)
     endif()
 
-    target_sources(trdrop-pp PRIVATE src/ffmpeg/ffmpeg_decoder.cpp src/ffmpeg/ffmpeg_cpu_pipeline.cpp)
+    target_sources(trdrop-pp PRIVATE src/ffmpeg/ffmpeg_decoder.cpp src/ffmpeg/ffmpeg_cpu_pipeline.cpp src/ffmpeg/ffmpeg_writer.cpp
+                                     src/ffmpeg/yuv_picture.cpp)
     target_compile_definitions(trdrop-pp PRIVATE USE_FFMPEG=1)
     if(USE_VULKAN)
         trdrop_shader(yuv_diff _yuv_shader_inc)
@@ -231,7 +234,6 @@ install(FILES
         scripts/framerate.py
         scripts/frametime_histogram.py
         scripts/smoothness.py
-        scripts/motion_vectors.py
         scripts/trdrop_csv.py
         scripts/requirements.txt
         tools/make_ball_videos.py

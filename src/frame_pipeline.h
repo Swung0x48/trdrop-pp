@@ -30,6 +30,9 @@ public:
     //! also measure the motion between the frames (RowCounts::motion), has to be called before the first
     //! submit_next(). throws std::runtime_error if the pipeline can't do it
     virtual void enable_motion();
+    //! also keep the picture and the tracked points of every frame (RowCounts::detail), after enable_motion().
+    //! throws std::runtime_error if the pipeline can't do it
+    virtual void enable_motion_detail();
 
     //! main thread time spent in the comparison (without decoding), < 0 if decoding and
     //! comparison can't be separated (both run on the GPU)

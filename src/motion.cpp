@@ -124,10 +124,22 @@ void MotionCellBinner::finish(MotionField & field, size_t min_points, float scal
     }
 }
 
-MotionField MotionEstimator::estimate(const cv::Mat & luma)
+int motion_scale(int width, int height)
+{
+    return std::max(1, static_cast<int>(std::ceil(std::max(width / kMaxWidth, height / kMaxHeight) - 1e-9)));
+}
+
+cv::Size motion_picture_size(int width, int height)
+{
+    const int scale = motion_scale(width, height);
+    return cv::Size(width / scale / 2 * 2, height / scale / 2 * 2);
+}
+
+MotionField MotionEstimator::estimate(const cv::Mat & luma, std::vector<MotionPoint> * points)
 {
     MotionField field;
-    const int scale = std::max(1, static_cast<int>(std::ceil(std::max(luma.cols / kMaxWidth, luma.rows / kMaxHeight) - 1e-9)));
+    if (points) points->clear();
+    const int scale = motion_scale(luma.cols, luma.rows);
     field.pixel_scale = static_cast<float>(scale);
     if (scale > 1) cv::resize(luma, _current, cv::Size(luma.cols / scale, luma.rows / scale), 0, 0, cv::INTER_AREA);
     else luma.copyTo(_current);
@@ -158,11 +170,18 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma)
         // ... and back: a correct match returns to its point
         cv::calcOpticalFlowPyrLK(_current_pyramid, _previous_pyramid, _tracked, _back, _back_status, _error, window, levels, criteria, 0, min_eigenvalue);
         _binner.clear();
+        if (points) points->resize(_points.size());
         for (size_t p = 0; p < _points.size(); ++p)
         {
-            if (!_status[p] || !_back_status[p]) continue;
             const cv::Point2f back = _back[p] - _points[p];
-            if (back.x * back.x + back.y * back.y > kMotionMaxBackError * kMotionMaxBackError) continue;
+            const bool returns = _status[p] && _back_status[p]
+                              && back.x * back.x + back.y * back.y <= kMotionMaxBackError * kMotionMaxBackError;
+            if (points)
+            {
+                (*points)[p] = { _points[p].x, _points[p].y, _tracked[p].x - _points[p].x, _tracked[p].y - _points[p].y,
+                                 returns ? MotionPoint::Used : _status[p] ? MotionPoint::Rejected : MotionPoint::NoTexture };
+            }
+            if (!returns) continue;
             _binner.add((_points[p].x + 0.5f) / static_cast<float>(_current.cols), (_points[p].y + 0.5f) / static_cast<float>(_current.rows),
                         _tracked[p].x - _points[p].x, _tracked[p].y - _points[p].y);
         }
