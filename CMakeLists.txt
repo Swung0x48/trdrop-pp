@@ -11,11 +11,27 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(TRDROP_BUILD_TOOLS "Build the test fixture generator" ON)
+option(TRDROP_INSTALL_RUNTIME "Windows: install the DLLs the program needs (OpenCV, FFmpeg, MSVC runtime) next to it" ON)
 option(USE_VULKAN "Build the Vulkan (GPU) accelerated backend (needs the Vulkan headers and glslc)" OFF)
 option(USE_FFMPEG "Decode with FFmpeg directly, with USE_VULKAN on the GPU via Vulkan Video (needs FFmpeg >= 8.0)" OFF)
 set(FFMPEG_DIR "" CACHE PATH "FFmpeg development files (include/, lib/, bin/), otherwise pkg-config is used")
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio video)
+
+# Where `cmake --install` puts things. Windows: a folder that can be zipped and used anywhere
+# (bin/, scripts/, licenses/, README.md); elsewhere the usual prefix layout.
+include(GNUInstallDirs)
+if(WIN32)
+    set(TRDROP_INSTALL_BINDIR bin)
+    set(TRDROP_INSTALL_SCRIPTDIR scripts)
+    set(TRDROP_INSTALL_DOCDIR .)
+    set(TRDROP_INSTALL_LICENSEDIR licenses)
+else()
+    set(TRDROP_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
+    set(TRDROP_INSTALL_SCRIPTDIR "${CMAKE_INSTALL_DATADIR}/trdrop-pp/scripts")
+    set(TRDROP_INSTALL_DOCDIR "${CMAKE_INSTALL_DOCDIR}")
+    set(TRDROP_INSTALL_LICENSEDIR "${CMAKE_INSTALL_DOCDIR}/licenses")
+endif()
 
 function(trdrop_warnings target)
     if(MSVC)
@@ -126,6 +142,13 @@ if(USE_FFMPEG)
             add_custom_command(TARGET trdrop-pp POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ffmpeg_dlls} "$<TARGET_FILE_DIR:trdrop-pp>"
                 COMMENT "Copying FFmpeg runtime DLLs")
+            if(TRDROP_INSTALL_RUNTIME)
+                install(FILES ${_ffmpeg_dlls} DESTINATION "${TRDROP_INSTALL_BINDIR}")
+                # the DLLs are LGPL: their license goes with them
+                if(EXISTS "${FFMPEG_DIR}/LICENSE.txt")
+                    install(FILES "${FFMPEG_DIR}/LICENSE.txt" DESTINATION "${TRDROP_INSTALL_LICENSEDIR}" RENAME FFmpeg-LICENSE.txt)
+                endif()
+            endif()
         endif()
     endif()
 endif()
@@ -162,7 +185,67 @@ if(WIN32)
         add_custom_command(TARGET trdrop-pp POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ocv_dlls} "$<TARGET_FILE_DIR:trdrop-pp>"
             COMMENT "Copying OpenCV runtime DLLs")
+        if(TRDROP_INSTALL_RUNTIME)
+            install(FILES ${_ocv_dlls} DESTINATION "${TRDROP_INSTALL_BINDIR}")
+            # the prebuilt Windows pack: OpenCV's license and the one of its FFmpeg plugin (opencv_videoio_ffmpeg*.dll)
+            foreach(_license IN ITEMS "LICENSE|OpenCV-LICENSE.txt" "../LICENSE_FFMPEG.txt|OpenCV-FFmpeg-plugin-LICENSE.txt")
+                string(REPLACE "|" ";" _license "${_license}")
+                list(GET _license 0 _from)
+                list(GET _license 1 _to)
+                if(OpenCV_INSTALL_PATH AND EXISTS "${OpenCV_INSTALL_PATH}/${_from}")
+                    install(FILES "${OpenCV_INSTALL_PATH}/${_from}" DESTINATION "${TRDROP_INSTALL_LICENSEDIR}" RENAME "${_to}")
+                endif()
+            endforeach()
+        endif()
     endif()
 endif()
 
-install(TARGETS trdrop-pp RUNTIME DESTINATION bin)
+# ---- install: the program with what it needs to run, the Python scripts, README and licenses
+#   cmake --install <build dir> --prefix <folder>
+install(TARGETS trdrop-pp RUNTIME DESTINATION "${TRDROP_INSTALL_BINDIR}")
+if(WIN32 AND TRDROP_INSTALL_RUNTIME)
+    # the MSVC runtime, so the program also starts without the Visual C++ redistributable
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${TRDROP_INSTALL_BINDIR}")
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_NO_WARNINGS ON)
+    include(InstallRequiredSystemLibraries)
+    if(MSVC AND NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+        # a toolset this CMake version doesn't know yet: take the DLLs from the redist folder of the toolset in use
+        set(_msvc_runtime "")
+        if(DEFINED ENV{VCToolsRedistDir})
+            file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" _redist)
+            string(TOLOWER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" _arch)
+            file(GLOB _msvc_runtime "${_redist}/${_arch}/Microsoft.VC*.CRT/msvcp140*.dll"
+                                    "${_redist}/${_arch}/Microsoft.VC*.CRT/vcruntime140*.dll"
+                                    "${_redist}/${_arch}/Microsoft.VC*.CRT/concrt140.dll")
+        endif()
+        if(_msvc_runtime)
+            install(FILES ${_msvc_runtime} DESTINATION "${TRDROP_INSTALL_BINDIR}")
+        else()
+            message(STATUS "trdrop++: MSVC runtime DLLs not found, the installed program needs the Visual C++ redistributable")
+        endif()
+    endif()
+endif()
+install(FILES
+        scripts/framerate.py
+        scripts/frametime_histogram.py
+        scripts/smoothness.py
+        scripts/motion_vectors.py
+        scripts/trdrop_csv.py
+        scripts/requirements.txt
+        tools/make_ball_videos.py
+    DESTINATION "${TRDROP_INSTALL_SCRIPTDIR}")
+install(FILES README.md DESTINATION "${TRDROP_INSTALL_DOCDIR}")
+install(FILES LICENSE DESTINATION "${TRDROP_INSTALL_LICENSEDIR}" RENAME trdrop++-LICENSE.txt)
+
+# ---- package: the installed folder as an archive
+#   cmake --build <build dir> --target package
+set(CPACK_PACKAGE_NAME "trdrop-pp")
+set(CPACK_PACKAGE_VENDOR "trdrop++")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+if(WIN32)
+    set(CPACK_GENERATOR ZIP)
+else()
+    set(CPACK_GENERATOR TGZ)
+endif()
+include(CPack)

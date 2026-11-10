@@ -299,6 +299,29 @@ cmake -S . -B build
 cmake --build build
 ```
 
+### Installing / packaging
+
+```
+cmake --install build --prefix dist
+cmake --build build --target package      # the same as dist/, as build/trdrop-pp-<version>-<system>.zip
+```
+
+On Windows this gives a folder that can be copied to another PC and used as it is:
+
+| | |
+| --- | --- |
+| `bin/` | `trdrop-pp.exe` and the DLLs it needs: OpenCV (with its FFmpeg plugin), with `-DUSE_FFMPEG=ON` and `FFMPEG_DIR` the FFmpeg DLLs, and the MSVC runtime. `-DTRDROP_INSTALL_RUNTIME=OFF` installs the program alone |
+| `scripts/` | the [plot scripts](#plotting), `motion_vectors.py`, `make_ball_videos.py` and `requirements.txt` (they need Python, see there) |
+| `licenses/` | the license of trdrop++ and those of the DLLs in `bin/` |
+| `README.md` | this file |
+
+The Vulkan loader is not included, it comes with the graphics driver. This was tested with the OpenCV
+Windows pack; a vcpkg OpenCV has further DLLs of its own which these rules don't collect, use vcpkg's
+deployment (`X_VCPKG_APPLOCAL_DEPS_INSTALL`) there.
+
+On Linux / macOS the program goes to `<prefix>/bin`, the scripts to `<prefix>/share/trdrop-pp/scripts` and
+README / licenses to `<prefix>/share/doc/trdrop-pp`; the libraries are those of the system.
+
 ### Vulkan (GPU acceleration)
 
 `-DUSE_VULKAN=ON` adds a Vulkan compute backend (default `OFF`). It needs the Vulkan headers and
