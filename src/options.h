@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,9 @@ struct Options {
     std::vector<std::string> motion_videos;
     //! the arrows of the motion video are drawn this many times longer than the motion
     double arrow_scale = 1.0;
+    //! called while the videos are analyzed (frames read, progress 0 - 1 or < 0 if unknown), the analysis
+    //! stops with an error if it returns false. For programs that embed the analysis (trdrop_library.h)
+    std::function<bool(long long, double)> progress;
 };
 
 } // namespace trdrop

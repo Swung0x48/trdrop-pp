@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">trdrop++</string>
+
+    <string name="new_analysis">New analysis</string>
+    <string name="pick_video">Choose a video</string>
+    <string name="no_video">No video chosen</string>
+    <string name="option_async">Capture out of step with the game</string>
+    <string name="option_async_detail">For recordings made with a capture program or of a variable refresh rate output: pictures recorded an interval late don\'t count as animation error, lost pictures are counted in</string>
+    <string name="option_motion_video">Write the motion video</string>
+    <string name="option_motion_video_detail">A copy of the video with the measured motion drawn on it</string>
+    <string name="option_arrows">Draw the arrows 8 times longer</string>
+    <string name="processor">Analyze on</string>
+    <string name="processor_auto">Automatic</string>
+    <string name="processor_gpu" translatable="false">GPU</string>
+    <string name="processor_cpu" translatable="false">CPU</string>
+    <string name="start">Analyze</string>
+    <string name="cancel">Cancel</string>
+    <string name="analyzing">Analyzing %s</string>
+    <string name="progress_frames">frame %1$d (%2$.1f%%)</string>
+    <string name="progress_frames_unknown">frame %1$d</string>
+    <string name="history">Earlier analyses</string>
+    <string name="history_empty">Nothing analyzed yet</string>
+    <string name="failed">The analysis failed: %s</string>
+    <string name="cancelled">Cancelled</string>
+    <string name="delete">Delete</string>
+    <string name="delete_question">Delete this analysis?</string>
+
+    <string name="summary">Summary</string>
+    <string name="stat_framerate">Framerate</string>
+    <string name="stat_framerate_detail">min %1$.0f, max %2$.0f fps</string>
+    <string name="stat_framerate_recorded">%1$.1f fps as recorded</string>
+    <string name="stat_perceived">Perceived smoothness</string>
+    <string name="stat_perceived_detail">10%% low %1$.1f fps</string>
+    <string name="stat_frametime">Frametime</string>
+    <string name="stat_frametime_detail">max %1$.1f ms</string>
+    <string name="stat_error">Animation error</string>
+    <string name="stat_error_detail">median %1$.1f, 95%% %2$.1f, max %3$.1f ms</string>
+    <string name="stat_frames">New frames</string>
+    <string name="stat_frames_detail">%1$d duplicates, %2$d torn</string>
+    <string name="stat_lost">Lost by the capture</string>
+    <string name="stat_lost_detail">pictures counted in</string>
+    <string name="value_fps">%1$.1f fps</string>
+    <string name="value_ms">%1$.1f ms</string>
+    <string name="note_async">Many animation errors are about one whole interval, early and late alike. A capture that doesn\'t run in step with the game\'s output (a capture program, variable refresh rate) does that: if this is one, analyze again with \"Capture out of step with the game\"</string>
+    <string name="not_measurable">The motion could not be measured: the video needs a moving camera or moving objects</string>
+
+    <string name="chart_framerate">Framerate and perceived smoothness</string>
+    <string name="chart_framerate_plain">Framerate</string>
+    <string name="chart_frametimes">Frametimes</string>
+    <string name="chart_error">Animation error over time</string>
+    <string name="chart_error_histogram">Animation error distribution</string>
+    <string name="chart_hint">Touch a chart for its values, zoom with two fingers, double tap to reset</string>
+    <string name="motion_video">Motion video</string>
+    <string name="share_video">Share</string>
+    <string name="save_video">Save to gallery</string>
+    <string name="saved_video">Saved to Movies/trdrop</string>
+    <string name="share_csv">Share the CSV</string>
+    <string name="details">Details</string>
+
+    <string name="axis_time">time (s)</string>
+    <string name="axis_fps">fps</string>
+    <string name="axis_frametime">frametime (ms)</string>
+    <string name="axis_share">share of the new frames (%)</string>
+    <string name="axis_error">animation error (ms)</string>
+    <string name="axis_frames">new frames</string>
+    <string name="unit_frames">frames</string>
+    <string name="series_framerate">framerate</string>
+    <string name="series_framerate_lost">framerate with %1$d pictures the capture lost</string>
+    <string name="series_perceived">perceived smoothness</string>
+    <string name="series_error">animation error</string>
+    <string name="series_spread">spread of the votes on a step</string>
+</resources>

@@ -33,6 +33,7 @@ extern "C" {
 
 #include "ffmpeg/ffmpeg_decoder.h"
 #include "ffmpeg/ffmpeg_encoder.h"
+#include "vulkan/vk_motion_shared.h"
 #include "ffmpeg/yuv_picture.h"
 
 #if LIBAVUTIL_VERSION_MAJOR < 60
@@ -63,120 +64,11 @@ const uint32_t kOverlayDrawSpirv[] = {
 #include "overlay_draw.spv.inc"
 };
 
-//! must match overlay_base.comp
-struct OverlayBasePush {
-    uint32_t width;
-    uint32_t height;
-    uint32_t row_words;
-    uint32_t scale;
-    uint32_t luma_row_words;
-    uint32_t chroma_mode;
-    uint32_t chroma_row_bytes;
-    uint32_t v_offset;
-    uint32_t chroma_step_x;
-    uint32_t chroma_step_y;
-};
-
-//! must match overlay_draw.comp
-struct OverlayDrawPush {
-    uint32_t width;
-    uint32_t height;
-    uint32_t row_words;
-    uint32_t tile_size;
-    uint32_t tiles_x;
-    uint32_t tiles_y;
-    uint32_t box_x;
-    uint32_t box_y;
-    uint32_t box_width;
-    uint32_t box_height;
-    uint32_t text_row_words;
-    float dim;
-    float box_dim;
-};
-
-//! the segments of a motion video frame are sorted into tiles of this size (a multiple of 4)
-constexpr uint32_t kOverlayTile = 32;
 //! motion video frames being drawn at the same time
 constexpr size_t kDrawSlots = 3;
 
 //! sets of frames in flight
 constexpr size_t kSlots = 3;
-
-//! must match motion_pyramid.comp
-struct PyramidPush {
-    uint32_t mode;
-    uint32_t factor;
-    uint32_t src_width;
-    uint32_t src_height;
-    uint32_t src_base;
-    uint32_t dst_width;
-    uint32_t dst_height;
-    uint32_t dst_offset;
-};
-
-constexpr uint32_t kMaxMotionLevels = 4;
-
-//! must match motion_lk.comp
-struct LkPush {
-    uint32_t level_width[kMaxMotionLevels];
-    uint32_t level_height[kMaxMotionLevels];
-    uint32_t level_offset[kMaxMotionLevels];
-    uint32_t levels;
-    uint32_t grid_x;
-    uint32_t grid_y;
-    uint32_t iterations;
-    float max_residual;
-};
-
-//! the motion is measured at the grid of points of motion.h, at up to 1920x1080
-constexpr uint32_t kMotionPoints = kMotionPointsX * kMotionPointsY;
-constexpr uint32_t kMotionIterations = 20; // at most, per level
-constexpr uint32_t kMotionGroupSize = 256; // local_size_x of motion_lk.comp
-//! the frames have to match at a point after the tracking (mean absolute difference)
-constexpr float kMaxResidual = 12.0f;
-
-//! pyramid of the luma plane a frame's motion is measured on
-struct MotionLayout {
-    uint32_t scale = 1;
-    uint32_t levels = 0;
-    uint32_t width[kMaxMotionLevels] = {};
-    uint32_t height[kMaxMotionLevels] = {};
-    uint32_t offset[kMaxMotionLevels] = {};
-    VkDeviceSize bytes = 0;
-};
-
-MotionLayout motion_layout(int width, int height)
-{
-    MotionLayout layout;
-    layout.scale = static_cast<uint32_t>(std::max(1.0, std::ceil(std::max(width / 1920.0, height / 1080.0) - 1e-9)));
-    uint32_t w = static_cast<uint32_t>(width) / layout.scale;
-    uint32_t h = static_cast<uint32_t>(height) / layout.scale;
-    uint32_t offset = 0;
-    while (layout.levels < kMaxMotionLevels && (layout.levels == 0 || std::min(w, h) >= 32))
-    {
-        layout.width[layout.levels] = w;
-        layout.height[layout.levels] = h;
-        layout.offset[layout.levels] = offset;
-        offset += w * h;
-        w = (w + 1) / 2;
-        h = (h + 1) / 2;
-        ++layout.levels;
-    }
-    layout.bytes = static_cast<VkDeviceSize>(offset) * sizeof(float);
-    return layout;
-}
-
-//! must match yuv_diff.comp
-struct PushConstants {
-    uint32_t width;
-    uint32_t luma_row_words;
-    uint32_t threshold;
-    uint32_t chroma_mode;
-    uint32_t shift_x;
-    uint32_t shift_y;
-    uint32_t chroma_row_bytes;
-    uint32_t v_offset;
-};
 
 constexpr uint32_t kBindings = 5;
 
@@ -1097,93 +989,12 @@ private:
             slot.busy = false;
         }
 
-        // the segments, and which of them reach into which tile: offsets per tile, then the indices
-        const int tiles_x = static_cast<int>((gpu.width + kOverlayTile - 1) / kOverlayTile);
-        const int tiles_y = static_cast<int>((gpu.height + kOverlayTile - 1) / kOverlayTile);
-        const size_t tile_count = static_cast<size_t>(tiles_x) * static_cast<size_t>(tiles_y);
-        auto tiles_of = [&](const MotionVideoSegment & segment, int & x0, int & x1, int & y0, int & y1) {
-            const float reach = segment.radius + 1.5f; // overlay_draw.comp fades a segment out a pixel beyond its radius
-            const float tile = static_cast<float>(kOverlayTile);
-            x0 = static_cast<int>(std::floor((std::min(segment.x0, segment.x1) - reach) / tile));
-            x1 = static_cast<int>(std::floor((std::max(segment.x0, segment.x1) + reach) / tile));
-            y0 = static_cast<int>(std::floor((std::min(segment.y0, segment.y1) - reach) / tile));
-            y1 = static_cast<int>(std::floor((std::max(segment.y0, segment.y1) + reach) / tile));
-            if (x1 < 0 || y1 < 0 || x0 >= tiles_x || y0 >= tiles_y) return false;
-            x0 = std::max(x0, 0);
-            y0 = std::max(y0, 0);
-            x1 = std::min(x1, tiles_x - 1);
-            y1 = std::min(y1, tiles_y - 1);
-            return true;
-        };
-        _tile_offsets.assign(tile_count + 1, 0);
-        int x0, x1, y0, y1;
-        for (const MotionVideoSegment & segment : scene.segments)
-        {
-            if (!tiles_of(segment, x0, x1, y0, y1)) continue;
-            for (int y = y0; y <= y1; ++y)
-            {
-                for (int x = x0; x <= x1; ++x) _tile_offsets[static_cast<size_t>(y * tiles_x + x) + 1] += 1;
-            }
-        }
-        for (size_t t = 0; t < tile_count; ++t) _tile_offsets[t + 1] += _tile_offsets[t];
-        _tile_data.assign(tile_count + 1 + _tile_offsets[tile_count], 0);
-        std::copy(_tile_offsets.begin(), _tile_offsets.end(), _tile_data.begin());
-        _segment_data.resize(scene.segments.size() * 8);
-        for (size_t s = 0; s < scene.segments.size(); ++s)
-        {
-            const MotionVideoSegment & segment = scene.segments[s];
-            // BGR -> YUV as OpenCV converts it (BT.601, limited range)
-            const float r = segment.red, g = segment.green, b = segment.blue;
-            float * data = _segment_data.data() + 8 * s;
-            data[0] = segment.x0;
-            data[1] = segment.y0;
-            data[2] = segment.x1;
-            data[3] = segment.y1;
-            data[4] = segment.radius;
-            data[5] = 16.0f + (65.481f * r + 128.553f * g + 24.966f * b) / 255.0f;
-            data[6] = 128.0f + (-37.797f * r - 74.203f * g + 112.0f * b) / 255.0f;
-            data[7] = 128.0f + (112.0f * r - 93.786f * g - 18.214f * b) / 255.0f;
-            if (!tiles_of(segment, x0, x1, y0, y1)) continue;
-            for (int y = y0; y <= y1; ++y)
-            {
-                for (int x = x0; x <= x1; ++x)
-                {
-                    const size_t tile = static_cast<size_t>(y * tiles_x + x);
-                    _tile_data[tile_count + 1 + _tile_offsets[tile]++] = static_cast<uint32_t>(s);
-                }
-            }
-        }
-        _upload(slot.segments, _segment_data.data(), _segment_data.size() * sizeof(float));
-        _upload(slot.tiles, _tile_data.data(), _tile_data.size() * sizeof(uint32_t));
-
-        OverlayDrawPush push {};
-        push.width = gpu.width;
-        push.height = gpu.height;
-        push.row_words = gpu.row_words;
-        push.tile_size = kOverlayTile;
-        push.tiles_x = static_cast<uint32_t>(tiles_x);
-        push.tiles_y = static_cast<uint32_t>(tiles_y);
-        push.dim = scene.dim;
-        push.box_dim = scene.box_dim;
-        const cv::Rect picture_rect(0, 0, static_cast<int>(gpu.width), static_cast<int>(gpu.height));
-        if (!scene.box.empty() && (scene.box & picture_rect) == scene.box && scene.text.size() == scene.box.size() && scene.text.type() == CV_8UC1)
-        {
-            push.box_x = static_cast<uint32_t>(scene.box.x);
-            push.box_y = static_cast<uint32_t>(scene.box.y);
-            push.box_width = static_cast<uint32_t>(scene.box.width);
-            push.box_height = static_cast<uint32_t>(scene.box.height);
-            push.text_row_words = (push.box_width + 3) / 4;
-            _text_data.assign(static_cast<size_t>(push.text_row_words) * 4 * push.box_height, 0);
-            for (int y = 0; y < scene.box.height; ++y)
-            {
-                std::memcpy(_text_data.data() + static_cast<size_t>(y) * push.text_row_words * 4, scene.text.ptr(y), static_cast<size_t>(scene.box.width));
-            }
-            _upload(slot.text, _text_data.data(), _text_data.size());
-        }
-        else
-        {
-            _upload(slot.text, nullptr, 0);
-        }
+        // the scene as the buffers and the constants of overlay_draw.comp
+        build_overlay_upload(scene, gpu.width, gpu.height, gpu.row_words, false, _overlay_upload);
+        const OverlayDrawPush & push = _overlay_upload.push;
+        _upload(slot.segments, _overlay_upload.segments.data(), _overlay_upload.segments.size() * sizeof(float));
+        _upload(slot.tiles, _overlay_upload.tiles.data(), _overlay_upload.tiles.size() * sizeof(uint32_t));
+        _upload(slot.text, _overlay_upload.text.data(), _overlay_upload.text.size());
         _ensure_buffer(slot.output, gpu.picture_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                        { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
 
@@ -1763,10 +1574,7 @@ private:
     size_t _draws = 0;
     Compute _overlay_base;
     Compute _overlay_draw;
-    std::vector<uint32_t> _tile_offsets;
-    std::vector<uint32_t> _tile_data;
-    std::vector<float> _segment_data;
-    std::vector<uint8_t> _text_data;
+    OverlayUpload _overlay_upload;
     Compute _pyramid;
     Compute _lk;
     MotionCellBinner _binner;

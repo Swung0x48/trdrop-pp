@@ -521,6 +521,15 @@ i7-14700KF (28 threads), RTX 4070 SUPER, no other GPU load):
 `--decode vulkan` on the H.264 recordings: 3.0 - 3.6x. Comparing U and V as well costs no measurable
 time on the GPU.
 
+## Android app
+
+`android/` is an app that runs the analysis on a phone: choose a video, get the summary, the charts (drawn
+by the app, the same as the Python scripts draw) and the motion video. It uses the sources of this program
+as a native library. Everything runs on the GPU if the phone allows it - MediaCodec decodes into a hardware
+buffer, the compute shaders of the Vulkan Video pipeline analyze and draw, MediaCodec encodes -, otherwise
+MediaCodec decodes and the CPU analyzes. See [android/README.md](android/README.md) for what it does, how
+fast it is and how to build it.
+
 ## Agent skill
 
 `skills/trdrop-pp/` is a skill for AI coding agents (Claude Code and others that read `SKILL.md`): how to

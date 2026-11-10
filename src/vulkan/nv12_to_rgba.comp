@@ -1,0 +1,35 @@
+#version 450
+// Android: a drawn motion video picture (NV12, see overlay_base.comp) as RGBA for the input surface of the
+// video encoder, which converts it back to YUV. BT.709, limited range - what the encoder is asked to use.
+// The result has one uint per pixel: red in the lowest byte.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer Picture { uint picture[]; };
+layout(set = 0, binding = 1) writeonly buffer Result { uint result[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint row_words;
+} params;
+
+uint byte_of(uint word, uint k)
+{
+    return (word >> (8u * k)) & 255u;
+}
+
+void main()
+{
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    if (x >= params.width || y >= params.height) return;
+
+    const float luma = float(byte_of(picture[y * params.row_words + (x >> 2)], x & 3u));
+    const uint pair = picture[(params.height + (y >> 1)) * params.row_words + (x >> 2)];
+    const float u = float(byte_of(pair, ((x >> 1) & 1u) * 2u)) - 128.0;
+    const float v = float(byte_of(pair, ((x >> 1) & 1u) * 2u + 1u)) - 128.0;
+    const float scaled = 1.164384 * (luma - 16.0);
+    const vec3 rgb = clamp(vec3(scaled + 1.792741 * v, scaled - 0.213249 * u - 0.532909 * v, scaled + 2.112402 * u) + 0.5, 0.0, 255.0);
+    result[y * params.width + x] = uint(rgb.r) | (uint(rgb.g) << 8) | (uint(rgb.b) << 16) | 0xFF000000u;
+}

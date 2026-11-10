@@ -27,6 +27,10 @@ namespace {
 //! operating system's, and MPEG-4 as the one every build has. Which exist depends on the FFmpeg build,
 //! which work on the machine.
 const char * const kEncoders[] = {
+#ifdef __ANDROID__
+    // the hardware encoder of the device
+    "h264_mediacodec",
+#endif
     "h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox", "libx264", "h264_mf", "libopenh264", "mpeg4",
 };
 

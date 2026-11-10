@@ -80,6 +80,12 @@ struct DecoderChoice {
 DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available, bool prefer_gpu);
 #endif
 
+#ifdef TRDROP_MEDIACODEC_VULKAN
+//! Android: MediaCodec decoding into hardware buffers, analysis and motion video on the GPU with Vulkan.
+//! throws std::runtime_error if the device or an input can't do that
+std::unique_ptr<FramePipeline> make_mediacodec_vulkan_pipeline(const std::vector<std::string> & paths);
+#endif
+
 #if defined(USE_FFMPEG) && defined(USE_VULKAN)
 //! FFmpeg Vulkan Video decoding, the Y, U and V planes stay on the GPU and are compared there.
 //! throws std::runtime_error if Vulkan decoding isn't available for an input

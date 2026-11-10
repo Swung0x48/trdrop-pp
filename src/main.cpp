@@ -24,6 +24,7 @@
 #include "frame_analyzer.h"
 #include "frame_pipeline.h"
 #include "motion_video.h"
+#include "trdrop_library.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -268,7 +269,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
                 throw std::invalid_argument("--decode " + options.decode + ": this build has no FFmpeg support (configure with -DUSE_FFMPEG=ON)");
             }
 #endif
-#ifndef USE_VULKAN
+#if !defined(USE_VULKAN) && !defined(TRDROP_MEDIACODEC_VULKAN)
             if (options.decode == "vulkan") throw std::invalid_argument("--decode vulkan: this build has no Vulkan support (configure with -DUSE_VULKAN=ON)");
 #endif
         }
@@ -424,6 +425,21 @@ std::unique_ptr<FramePipeline> make_opencv_decode_pipeline(const Options & optio
 
 std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
 {
+#ifdef TRDROP_MEDIACODEC_VULKAN
+    // Android: hardware decoding and analysis on the GPU if the device and the videos allow it
+    if (options.decode == "vulkan") return make_mediacodec_vulkan_pipeline(options.inputs);
+    if (options.decode == "auto" && options.use_vulkan)
+    {
+        try
+        {
+            return make_mediacodec_vulkan_pipeline(options.inputs);
+        }
+        catch (const std::exception & e)
+        {
+            if (!options.quiet) std::fprintf(stderr, "trdrop-pp: analyzing on the CPU (%s)\n", e.what());
+        }
+    }
+#endif
 #if defined(USE_FFMPEG) && defined(USE_VULKAN)
     if (options.decode == "vulkan") return make_vulkan_video_pipeline(options.inputs, options.vk_device);
 #endif
@@ -433,7 +449,13 @@ std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
     if (options.decode == "auto" && options.use_vulkan)
     {
         auto note = [&](const std::string & what, const std::string & why) {
+#ifdef TRDROP_MEDIACODEC_VULKAN
+            // said above
+            (void)what;
+            (void)why;
+#else
             if (!options.quiet) std::fprintf(stderr, "trdrop-pp: decoding with %s (%s)\n", what.c_str(), why.c_str());
+#endif
         };
 #ifdef USE_VULKAN
         const bool vulkan_available = true;
@@ -756,6 +778,7 @@ int run(const Options & options)
         ++submitted;
         if (pipeline.pending() >= pipeline.max_pending()) emit_frame();
         progress.update(sources);
+        if (options.progress && !options.progress(sources.frames_read(), sources.progress())) throw std::runtime_error("cancelled");
     }
     while (pipeline.pending() > 0) emit_frame();
     for (MotionAnalyzer & motion : motion_analyzers) motion.finish();
@@ -847,7 +870,11 @@ int run(const Options & options)
 } // namespace
 } // namespace trdrop
 
+#ifdef TRDROP_LIBRARY
+int trdrop_run(int argc, char ** argv, const std::function<bool(long long, double)> & progress)
+#else
 int main(int argc, char ** argv)
+#endif
 {
 #ifdef _WIN32
     // the manifest makes UTF-8 the process code page, the console has to print it as UTF-8 too
@@ -858,6 +885,9 @@ int main(int argc, char ** argv)
     {
         trdrop::Options options;
         if (!trdrop::parse_arguments(argc, argv, options)) return 0;
+#ifdef TRDROP_LIBRARY
+        options.progress = progress;
+#endif
         return trdrop::run(options);
     }
     catch (const std::invalid_argument & e)

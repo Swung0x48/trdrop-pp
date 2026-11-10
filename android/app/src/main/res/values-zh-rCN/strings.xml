@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="new_analysis">新分析</string>
+    <string name="pick_video">选择视频</string>
+    <string name="no_video">未选择视频</string>
+    <string name="option_async">采集与游戏输出不同步</string>
+    <string name="option_async_detail">用于采集软件录制的视频或可变刷新率输出：晚一个间隔录到的画面不算动画误差，采集丢掉的画面会补回来</string>
+    <string name="option_motion_video">生成运动矢量视频</string>
+    <string name="option_motion_video_detail">在原视频上画出测到的运动</string>
+    <string name="option_arrows">箭头放大 8 倍</string>
+    <string name="processor">分析使用</string>
+    <string name="processor_auto">自动</string>
+    <string name="start">开始分析</string>
+    <string name="cancel">取消</string>
+    <string name="analyzing">正在分析 %s</string>
+    <string name="progress_frames">第 %1$d 帧（%2$.1f%%）</string>
+    <string name="progress_frames_unknown">第 %1$d 帧</string>
+    <string name="history">历史记录</string>
+    <string name="history_empty">还没有分析过视频</string>
+    <string name="failed">分析失败：%s</string>
+    <string name="cancelled">已取消</string>
+    <string name="delete">删除</string>
+    <string name="delete_question">删除这次分析？</string>
+
+    <string name="summary">概要</string>
+    <string name="stat_framerate">帧率</string>
+    <string name="stat_framerate_detail">最低 %1$.0f，最高 %2$.0f fps</string>
+    <string name="stat_framerate_recorded">录像里实际为 %1$.1f fps</string>
+    <string name="stat_perceived">感知流畅度</string>
+    <string name="stat_perceived_detail">最差 10%% 为 %1$.1f fps</string>
+    <string name="stat_frametime">帧时间</string>
+    <string name="stat_frametime_detail">最长 %1$.1f ms</string>
+    <string name="stat_error">动画误差</string>
+    <string name="stat_error_detail">中位 %1$.1f，95%% %2$.1f，最大 %3$.1f ms</string>
+    <string name="stat_frames">新帧</string>
+    <string name="stat_frames_detail">重复 %1$d，撕裂 %2$d</string>
+    <string name="stat_lost">采集丢失</string>
+    <string name="stat_lost_detail">张画面已补回</string>
+    <string name="note_async">有很多动画误差正好是一个间隔，偏早和偏晚的都有。采集和游戏输出不同步（用采集软件录制、可变刷新率）时会这样：如果是这种情况，请打开“采集与游戏输出不同步”再分析一次</string>
+    <string name="not_measurable">无法测量运动：视频里需要有移动的镜头或物体</string>
+
+    <string name="chart_framerate">帧率与感知流畅度</string>
+    <string name="chart_framerate_plain">帧率</string>
+    <string name="chart_frametimes">帧时间分布</string>
+    <string name="chart_error">动画误差随时间变化</string>
+    <string name="chart_error_histogram">动画误差分布</string>
+    <string name="chart_hint">触摸图表查看数值，双指缩放，双击还原</string>
+    <string name="motion_video">运动矢量视频</string>
+    <string name="share_video">分享</string>
+    <string name="save_video">保存到相册</string>
+    <string name="saved_video">已保存到 Movies/trdrop</string>
+    <string name="share_csv">分享 CSV</string>
+    <string name="details">详细信息</string>
+
+    <string name="axis_time">时间（秒）</string>
+    <string name="axis_frametime">帧时间（ms）</string>
+    <string name="axis_share">占新帧的比例（%）</string>
+    <string name="axis_error">动画误差（ms）</string>
+    <string name="axis_frames">新帧数</string>
+    <string name="unit_frames">帧</string>
+    <string name="series_framerate">帧率</string>
+    <string name="series_framerate_lost">帧率（含采集丢失的 %1$d 张）</string>
+    <string name="series_perceived">感知流畅度</string>
+    <string name="series_error">动画误差</string>
+    <string name="series_spread">各部分对步长的分歧</string>
+</resources>

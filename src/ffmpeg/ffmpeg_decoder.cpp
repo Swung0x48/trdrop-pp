@@ -1,9 +1,16 @@
 #include "ffmpeg/ffmpeg_decoder.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 extern "C" {
+#include <libavutil/dict.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -19,6 +26,24 @@ double to_double(AVRational value)
 }
 
 } // namespace
+
+int open_input(AVFormatContext ** format, const std::string & path)
+{
+#ifndef _WIN32
+    if (path.size() > 3 && path.compare(0, 3, "fd:") == 0 && path.find_first_not_of("0123456789", 3) == std::string::npos)
+    {
+        // FFmpeg's fd protocol takes the descriptor as an option and reads from where it stands
+        const int descriptor = std::atoi(path.c_str() + 3);
+        lseek(descriptor, 0, SEEK_SET);
+        AVDictionary * options = nullptr;
+        av_dict_set_int(&options, "fd", descriptor, 0);
+        const int result = avformat_open_input(format, "fd:", nullptr, &options);
+        av_dict_free(&options);
+        return result;
+    }
+#endif
+    return avformat_open_input(format, path.c_str(), nullptr, nullptr);
+}
 
 std::string error_string(int error)
 {
@@ -67,7 +92,7 @@ Probe probe(const std::string & path)
 {
     Probe result;
     AVFormatContext * format = nullptr;
-    if (avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0)
+    if (open_input(&format, path) < 0)
     {
         result.error = "could not open '" + path + "'";
         return result;
@@ -118,7 +143,7 @@ VideoDecoder::VideoDecoder(const std::string & path, AVBufferRef * hw_device, in
 {
     try
     {
-        int result = avformat_open_input(&_format, path.c_str(), nullptr, nullptr);
+        int result = open_input(&_format, path);
         if (result < 0) throw std::runtime_error("could not open video '" + path + "' (" + error_string(result) + ")");
         result = avformat_find_stream_info(_format, nullptr);
         if (result < 0) throw std::runtime_error("could not read '" + path + "' (" + error_string(result) + ")");
@@ -126,22 +151,64 @@ VideoDecoder::VideoDecoder(const std::string & path, AVBufferRef * hw_device, in
         _stream = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
         if (_stream < 0 || !decoder) throw std::runtime_error("no decodable video stream in '" + path + "'");
 
-        _codec = avcodec_alloc_context3(decoder);
-        if (!_codec) throw std::runtime_error("out of memory");
-        avcodec_parameters_to_context(_codec, _format->streams[_stream]->codecpar);
-        _codec->opaque = this;
-        // automatic thread count; with hardware decoding the frame threads parse the next
-        // frames while the GPU decodes (10 - 15% faster than a single thread)
-        _codec->thread_count = 0;
         if (hw_device)
         {
-            _codec->hw_device_ctx = av_buffer_ref(hw_device);
-            _codec->get_format = &VideoDecoder::_get_format;
-            // frames stay referenced while the GPU works on them
-            _codec->extra_hw_frames = extra_hw_frames;
+            const AVHWDeviceType type = reinterpret_cast<const AVHWDeviceContext *>(hw_device->data)->type;
+            _hw_format = type == AV_HWDEVICE_TYPE_MEDIACODEC ? AV_PIX_FMT_MEDIACODEC : AV_PIX_FMT_VULKAN;
         }
-        result = avcodec_open2(_codec, decoder, nullptr);
-        if (result < 0) throw std::runtime_error("could not open the " + std::string(decoder->name) + " decoder (" + error_string(result) + ")");
+        auto open = [&](const AVCodec * codec, AVDictionary ** codec_options) {
+            _codec = avcodec_alloc_context3(codec);
+            if (!_codec) throw std::runtime_error("out of memory");
+            avcodec_parameters_to_context(_codec, _format->streams[_stream]->codecpar);
+            _codec->opaque = this;
+            // automatic thread count; with hardware decoding the frame threads parse the next
+            // frames while the GPU decodes (10 - 15% faster than a single thread)
+            _codec->thread_count = 0;
+            if (hw_device)
+            {
+                _codec->hw_device_ctx = av_buffer_ref(hw_device);
+                _codec->get_format = &VideoDecoder::_get_format;
+                // frames stay referenced while the GPU works on them
+                _codec->extra_hw_frames = extra_hw_frames;
+            }
+            const int opened = avcodec_open2(_codec, codec, codec_options);
+            if (opened < 0) avcodec_free_context(&_codec);
+            return opened;
+        };
+#ifdef __ANDROID__
+        // The hardware decoder of the device (MediaCodec) if FFmpeg has one for the codec: into frames in
+        // memory, or with a MediaCodec device into the window of the device (the frames are then rendered
+        // to it, see libavcodec/mediacodec.h)
+        {
+            const AVCodec * hardware = avcodec_find_decoder_by_name((std::string(decoder->name) + "_mediacodec").c_str());
+            int opened = AVERROR_DECODER_NOT_FOUND;
+            // Hardware decoders pace themselves for playback unless they are told to run as fast as they can
+            // (the highest operating rate); a decoder that refuses the request is opened without it
+            for (const char * operating_rate : { "32767", "" })
+            {
+                if (!hardware || opened >= 0) break;
+                AVDictionary * codec_options = nullptr;
+                // a native window needs the codec of the NDK
+                if (_hw_format == AV_PIX_FMT_MEDIACODEC) av_dict_set(&codec_options, "ndk_codec", "1", 0);
+                if (*operating_rate) av_dict_set(&codec_options, "operating_rate", operating_rate, 0);
+                opened = open(hardware, &codec_options);
+                av_dict_free(&codec_options);
+            }
+            if (opened < 0)
+            {
+                _codec = nullptr;
+                if (_hw_format == AV_PIX_FMT_MEDIACODEC)
+                {
+                    throw std::runtime_error("no MediaCodec decoder for " + std::string(decoder->name) + " (" + error_string(opened) + ")");
+                }
+            }
+        }
+#endif
+        if (!_codec)
+        {
+            result = open(decoder, nullptr);
+            if (result < 0) throw std::runtime_error("could not open the " + std::string(decoder->name) + " decoder (" + error_string(result) + ")");
+        }
 
         _packet = av_packet_alloc();
         if (!_packet) throw std::runtime_error("out of memory");
@@ -165,9 +232,9 @@ AVPixelFormat VideoDecoder::_get_format(AVCodecContext * context, const AVPixelF
 {
     for (const AVPixelFormat * format = formats; *format != AV_PIX_FMT_NONE; ++format)
     {
-        if (*format == AV_PIX_FMT_VULKAN) return *format;
+        if (*format == static_cast<VideoDecoder *>(context->opaque)->_hw_format) return *format;
     }
-    // no Vulkan decoding for this stream: fail instead of silently decoding on the CPU
+    // no hardware decoding for this stream: fail instead of silently decoding on the CPU
     static_cast<VideoDecoder *>(context->opaque)->_hardware_refused = true;
     return AV_PIX_FMT_NONE;
 }
@@ -182,27 +249,37 @@ bool VideoDecoder::next(AVFrame * frame)
         if (result == AVERROR_EOF) return false;
         if (result != AVERROR(EAGAIN))
         {
-            if (_hardware_refused) throw std::runtime_error("no Vulkan decoding for " + codec_name());
+            if (_hardware_refused) throw std::runtime_error("no hardware decoding for " + codec_name());
             throw std::runtime_error("decoding failed (" + error_string(result) + ")");
         }
         if (_flushing) return false;
 
-        result = av_read_frame(_format, _packet);
-        if (result < 0)
+        if (!_packet_pending)
         {
-            // end of the file: drain the frames buffered in the decoder
-            _flushing = true;
-            avcodec_send_packet(_codec, nullptr);
-            continue;
+            result = av_read_frame(_format, _packet);
+            if (result < 0)
+            {
+                // end of the file: drain the frames buffered in the decoder
+                _flushing = true;
+                avcodec_send_packet(_codec, nullptr);
+                continue;
+            }
         }
+        _packet_pending = false;
         if (_packet->stream_index == _stream)
         {
             result = avcodec_send_packet(_codec, _packet);
+            if (result == AVERROR(EAGAIN))
+            {
+                // the decoder wants its frames to be taken first (hardware decoders), the packet is sent again
+                _packet_pending = true;
+                continue;
+            }
             // a broken packet is skipped, like the OpenCV backend does
             if (result < 0 && result != AVERROR_INVALIDDATA)
             {
                 av_packet_unref(_packet);
-                if (_hardware_refused) throw std::runtime_error("no Vulkan decoding for " + codec_name());
+                if (_hardware_refused) throw std::runtime_error("no hardware decoding for " + codec_name());
                 throw std::runtime_error("decoding failed (" + error_string(result) + ")");
             }
         }

@@ -13,6 +13,11 @@ namespace trdrop::ffmpeg {
 //! FFmpeg error code as text
 std::string error_string(int error);
 
+//! avformat_open_input for a path, or for "fd:<number>": an open file descriptor of the process (how the
+//! Android app passes a document it may read but not open by name). The descriptor stays open and is read
+//! from its start. Returns the FFmpeg error code
+int open_input(AVFormatContext ** format, const std::string & path);
+
 //! true for the 8-bit YUV formats whose first plane is the full resolution luma (Y) plane
 bool is_luma_format(AVPixelFormat format);
 
@@ -49,7 +54,8 @@ std::string vulkan_decode_blocker(const std::string & path);
 //! demuxes and decodes the video stream of one file
 class VideoDecoder {
 public:
-    //! hw_device: decode with this hardware device (AV_PIX_FMT_VULKAN frames), nullptr = software decoding.
+    //! hw_device: decode with this hardware device - a Vulkan device (AV_PIX_FMT_VULKAN frames) or, on Android,
+    //! a MediaCodec device with a native window (AV_PIX_FMT_MEDIACODEC frames) -, nullptr = frames in memory.
     //! throws std::runtime_error if the file can't be opened
     VideoDecoder(const std::string & path, AVBufferRef * hw_device, int extra_hw_frames = 0);
     ~VideoDecoder();
@@ -80,7 +86,11 @@ private:
     AVPacket * _packet = nullptr;
     int _stream = -1;
     bool _flushing = false;
+    //! _packet was read but the decoder didn't take it yet
+    bool _packet_pending = false;
     bool _hardware_refused = false;
+    //! the format of the frames of the hardware device
+    AVPixelFormat _hw_format = AV_PIX_FMT_NONE;
 };
 
 } // namespace trdrop::ffmpeg

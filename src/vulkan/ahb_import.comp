@@ -1,0 +1,65 @@
+#version 450
+// Android: the planes of a frame the hardware decoder left in a hardware buffer, read through a sampler with
+// a YCbCr conversion that leaves the values as they are (identity model, full range, nearest filters).
+//
+// Result: the luma and chroma buffers the other shaders work on - bytes packed into uints, the chroma as UV
+// pairs of a 4:2:0 frame. An invocation writes a block of 4x2 pixels: two words of luma and one of chroma.
+// The width of the frame has to be a multiple of 4, its height even.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D frame;
+layout(set = 0, binding = 1) writeonly buffer Luma { uint luma[]; };
+layout(set = 0, binding = 2) writeonly buffer Chroma { uint chroma[]; };
+
+layout(push_constant) uniform Params {
+    uint width;          // of the frame
+    uint height;
+    uint row_words;      // uints per row of the luma buffer: width / 4
+    uint crop_left;      // where the frame starts in the hardware buffer
+    uint crop_top;
+    uint buffer_width;   // size of the hardware buffer
+    uint buffer_height;
+} params;
+
+// Y, Cb, Cr of the pixel: the identity conversion returns Cr, Y, Cb as red, green, blue
+vec3 yuv_at(uint x, uint y)
+{
+    const vec2 position = vec2(float(x + params.crop_left) + 0.5, float(y + params.crop_top) + 0.5)
+                        / vec2(float(params.buffer_width), float(params.buffer_height));
+    return textureLod(frame, position, 0.0).gbr;
+}
+
+uint byte_of(float value)
+{
+    return uint(clamp(value * 255.0 + 0.5, 0.0, 255.0));
+}
+
+// the range expansion of the conversion centers the chroma on zero (it subtracts 128 / 255), also in full range
+uint chroma_byte_of(float value)
+{
+    return uint(clamp(value * 255.0 + 128.5, 0.0, 255.0));
+}
+
+void main()
+{
+    const uint block_x = gl_GlobalInvocationID.x;
+    const uint block_y = gl_GlobalInvocationID.y;
+    if (block_x >= params.row_words || block_y >= params.height / 2u) return;
+
+    for (uint row = 0u; row < 2u; ++row)
+    {
+        const uint y = block_y * 2u + row;
+        uint word = 0u;
+        for (uint k = 0u; k < 4u; ++k) word |= byte_of(yuv_at(block_x * 4u + k, y).x) << (8u * k);
+        luma[y * params.row_words + block_x] = word;
+    }
+    // the chroma sample of a 2x2 block is the one of its upper left pixel, whichever way it is sited
+    uint word = 0u;
+    for (uint k = 0u; k < 2u; ++k)
+    {
+        const vec3 yuv = yuv_at(block_x * 4u + 2u * k, block_y * 2u);
+        word |= (chroma_byte_of(yuv.y) << (16u * k)) | (chroma_byte_of(yuv.z) << (16u * k + 8u));
+    }
+    chroma[block_y * params.row_words + block_x] = word;
+}

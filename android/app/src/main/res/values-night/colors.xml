@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="chart_surface">#1A1A19</color>
+    <color name="chart_text_primary">#F0EFEC</color>
+    <color name="chart_text_secondary">#C3C2B7</color>
+    <color name="chart_grid">#33332F</color>
+    <color name="chart_axis">#7A7972</color>
+    <color name="chart_series_1">#3987E5</color>
+    <color name="chart_series_2">#D95926</color>
+    <color name="page_background">#101010</color>
+</resources>

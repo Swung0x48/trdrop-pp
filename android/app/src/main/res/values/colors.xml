@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- charts: surface, text and the categorical slots of the palette, light -->
+    <color name="chart_surface">#FCFCFB</color>
+    <color name="chart_text_primary">#0B0B0B</color>
+    <color name="chart_text_secondary">#52514E</color>
+    <color name="chart_grid">#E4E3DF</color>
+    <color name="chart_axis">#8A8982</color>
+    <color name="chart_series_1">#2A78D6</color>
+    <color name="chart_series_2">#EB6834</color>
+    <color name="page_background">#F3F2EE</color>
+</resources>
