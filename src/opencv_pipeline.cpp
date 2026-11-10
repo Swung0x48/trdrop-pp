@@ -28,6 +28,12 @@ void FramePipeline::enable_motion()
     throw std::runtime_error("the motion analysis is not available with " + description());
 }
 
+std::unique_ptr<MotionVideoTarget> FramePipeline::start_motion_video(size_t, const std::string &, double, std::string & reason)
+{
+    reason.clear();
+    return nullptr;
+}
+
 void FramePipeline::enable_motion_detail()
 {
     throw std::runtime_error("the motion video is not available with " + description());

@@ -7,7 +7,7 @@
 #include <opencv2/core.hpp>
 
 #include "motion.h"
-#include "video_writer.h"
+#include "motion_video_target.h"
 
 namespace trdrop {
 
@@ -31,35 +31,39 @@ struct MotionVideoFrame {
 //!   red x    a point whose match doesn't come back, it is not used
 //!   nothing  no texture at the point
 //! and the values of the frame in the upper left corner. The numbers have fixed places, so the text stands still.
+//!
+//! This class decides what is drawn (MotionVideoScene), a MotionVideoTarget puts it on the picture and
+//! encodes it: the one of the pipeline if it draws on the GPU, otherwise the one for the CPU.
 class MotionVideo {
 public:
     //! frame_width, frame_height: size of the frames of the video, fps: its recorded framerate,
-    //! arrow_scale: the arrows are drawn this many times longer than the motion.
+    //! arrow_scale: the arrows are drawn this many times longer than the motion,
+    //! target: where the frames go, nullptr: drawn on the CPU and written to `path`.
     //! throws std::runtime_error if the file can't be written
-    MotionVideo(const std::string & path, int frame_width, int frame_height, double fps, double arrow_scale);
+    MotionVideo(const std::string & path, int frame_width, int frame_height, double fps, double arrow_scale,
+                std::unique_ptr<MotionVideoTarget> target);
 
     const std::string & path() const { return _path; }
     cv::Size size() const { return _size; }
-    //! the encoder
-    std::string description() const { return _writer->description(); }
+    std::string description() const { return _target->description(); }
     long long frames() const { return _frames; }
 
     void write(const MotionVideoFrame & values, const MotionDetail & detail);
-    void finish() { _writer->finish(); }
+    void finish() { _target->finish(); }
 
 private:
     //! cursor of a line of text: draws into `target` if given and returns the x position after the text
     int _label(cv::Mat * target, int x, int line, const std::string & text) const;
     //! a number in a field of `cells` digits, right aligned, every character in a cell of its own
     int _number(cv::Mat * target, int x, int line, int cells, const std::string & text) const;
-    //! the four lines of values, returns the x position where the longest line ends
+    //! the four lines of values in the text box, returns the x position where the longest line ends
     int _text(cv::Mat * target, const MotionVideoFrame & values, int used, int rejected, bool counted) const;
-    void _draw_points(cv::Mat & picture, const std::vector<MotionPoint> & points, bool dimmed) const;
+    void _add_points(const std::vector<MotionPoint> & points, bool dimmed);
 
     std::string _path;
     cv::Size _size;
     double _arrow_scale;
-    std::unique_ptr<VideoWriter> _writer;
+    std::unique_ptr<MotionVideoTarget> _target;
     long long _frames = 0;
 
     // text layout
@@ -68,13 +72,15 @@ private:
     int _space = 0;
     int _line_height = 0;
     int _state_width = 0;
-    int _box_width = 0;
 
     //! colors of the arrows by length (BGR)
-    std::vector<cv::Scalar> _colors;
+    std::vector<cv::Vec3b> _colors;
     //! the points of the last new frame
     std::vector<MotionPoint> _held;
-    cv::Mat _picture;
+    MotionVideoScene _scene;
 };
+
+//! the target that draws on MotionDetail::picture on the CPU and writes the file with make_video_writer
+std::unique_ptr<MotionVideoTarget> make_cpu_motion_video_target(const std::string & path, cv::Size size, double fps);
 
 } // namespace trdrop

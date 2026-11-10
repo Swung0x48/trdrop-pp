@@ -1,7 +1,11 @@
 // Vulkan Video pipeline: FFmpeg decodes on the GPU (Vulkan hwaccel), the Y, U and V planes of every
 // decoded image are copied into buffers on the GPU and compared with the previous ones by
 // yuv_diff.comp. Only the per row counts are read back, the frames never leave the GPU - unless the motion
-// video is written, then the planes are also copied into host memory for the picture.
+// video is written and can't be drawn on the GPU, then the planes are also copied into host memory.
+//
+// Motion video on the GPU: overlay_base.comp scales every frame down into a picture that stays on the GPU
+// until the analysis has its values (it looks ahead), overlay_draw.comp then draws the scene on it, the
+// result is copied into a frame of FFmpeg's Vulkan H.264 encoder. Only the encoded packets come back.
 //
 // The Vulkan objects live on FFmpeg's VkDevice. Every decoded image is synchronized through its
 // timeline semaphore (AVVkFrame::sem / sem_value), as required by FFmpeg.
@@ -22,11 +26,13 @@ extern "C" {
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "ffmpeg/ffmpeg_decoder.h"
+#include "ffmpeg/ffmpeg_encoder.h"
 #include "ffmpeg/yuv_picture.h"
 
 #if LIBAVUTIL_VERSION_MAJOR < 60
@@ -48,6 +54,50 @@ const uint32_t kMotionPyramidSpirv[] = {
 const uint32_t kMotionLkSpirv[] = {
 #include "motion_lk.spv.inc"
 };
+
+const uint32_t kOverlayBaseSpirv[] = {
+#include "overlay_base.spv.inc"
+};
+
+const uint32_t kOverlayDrawSpirv[] = {
+#include "overlay_draw.spv.inc"
+};
+
+//! must match overlay_base.comp
+struct OverlayBasePush {
+    uint32_t width;
+    uint32_t height;
+    uint32_t row_words;
+    uint32_t scale;
+    uint32_t luma_row_words;
+    uint32_t chroma_mode;
+    uint32_t chroma_row_bytes;
+    uint32_t v_offset;
+    uint32_t chroma_step_x;
+    uint32_t chroma_step_y;
+};
+
+//! must match overlay_draw.comp
+struct OverlayDrawPush {
+    uint32_t width;
+    uint32_t height;
+    uint32_t row_words;
+    uint32_t tile_size;
+    uint32_t tiles_x;
+    uint32_t tiles_y;
+    uint32_t box_x;
+    uint32_t box_y;
+    uint32_t box_width;
+    uint32_t box_height;
+    uint32_t text_row_words;
+    float dim;
+    float box_dim;
+};
+
+//! the segments of a motion video frame are sorted into tiles of this size (a multiple of 4)
+constexpr uint32_t kOverlayTile = 32;
+//! motion video frames being drawn at the same time
+constexpr size_t kDrawSlots = 3;
 
 //! sets of frames in flight
 constexpr size_t kSlots = 3;
@@ -144,12 +194,12 @@ int image_count(const AVVkFrame * vkf)
     X(vkGetDeviceQueue) X(vkGetDeviceQueue2) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
-    X(vkCmdPipelineBarrier2) X(vkCmdCopyImageToBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
+    X(vkCmdPipelineBarrier2) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
     X(vkCmdPushConstants) X(vkCmdDispatch) X(vkQueueSubmit2) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
-    X(vkInvalidateMappedMemoryRanges) \
+    X(vkInvalidateMappedMemoryRanges) X(vkFlushMappedMemoryRanges) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
@@ -185,6 +235,9 @@ public:
             _create_pipeline();
             _pyramid = _create_compute(kMotionPyramidSpirv, sizeof(kMotionPyramidSpirv), 2, sizeof(PyramidPush));
             _lk = _create_compute(kMotionLkSpirv, sizeof(kMotionLkSpirv), 3, sizeof(LkPush));
+            _overlay_base = _create_compute(kOverlayBaseSpirv, sizeof(kOverlayBaseSpirv), 3, sizeof(OverlayBasePush));
+            _overlay_draw = _create_compute(kOverlayDrawSpirv, sizeof(kOverlayDrawSpirv), 5, sizeof(OverlayDrawPush));
+            _gpu_videos.resize(paths.size());
             _create_slots();
             for (size_t i = 0; i < paths.size(); ++i)
             {
@@ -229,6 +282,41 @@ public:
     }
 
     void enable_motion_detail() override { _motion_detail = true; }
+
+    std::unique_ptr<MotionVideoTarget> start_motion_video(size_t index, const std::string & path, double fps, std::string & reason) override
+    {
+        GpuVideo & gpu = _gpu_videos.at(index);
+        try
+        {
+            const AVFrame * frame = _videos.at(index).first_frame;
+            if (!frame) throw std::logic_error("the motion video has to be started before the first frame");            const cv::Size size = motion_picture_size(frame->width, frame->height);
+            // frames for the encoder on the device the frames are decoded on
+            gpu.frames = av_hwframe_ctx_alloc(_hw_device);
+            if (!gpu.frames) throw std::runtime_error("out of memory");
+            AVHWFramesContext * frames = reinterpret_cast<AVHWFramesContext *>(gpu.frames->data);
+            frames->format = AV_PIX_FMT_VULKAN;
+            frames->sw_format = AV_PIX_FMT_NV12;
+            frames->width = size.width;
+            frames->height = size.height;
+            const int result = av_hwframe_ctx_init(gpu.frames);
+            if (result < 0) throw std::runtime_error("no Vulkan frames for the video encoder: " + ffmpeg::error_string(result));
+            gpu.encoder = std::make_unique<ffmpeg::EncodedVideo>(path, size.width, size.height, fps, "h264_vulkan", gpu.frames);
+            gpu.width = static_cast<uint32_t>(size.width);
+            gpu.height = static_cast<uint32_t>(size.height);
+            gpu.row_words = (gpu.width + 3) / 4;
+            gpu.picture_bytes = static_cast<VkDeviceSize>(gpu.row_words) * 4 * (gpu.height + gpu.height / 2);
+            gpu.active = true;
+            return std::make_unique<GpuTarget>(*this, index);
+        }
+        catch (const std::exception & e)
+        {
+            // e.g. the GPU can't encode H.264 with Vulkan Video
+            gpu.encoder.reset();
+            av_buffer_unref(&gpu.frames);
+            reason = e.what();
+            return nullptr;
+        }
+    }
 
     bool submit_next(const std::vector<VideoOptions> & video_options) override
     {
@@ -302,7 +390,40 @@ public:
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 });
             }
-            if (_motion_detail)
+            GpuVideo & gpu = _gpu_videos[i];
+            slot_video.picture = -1;
+            if (gpu.active)
+            {
+                if (motion_picture_size(frame->width, frame->height) != cv::Size(static_cast<int>(gpu.width), static_cast<int>(gpu.height)))
+                {
+                    throw std::runtime_error("the size of the frames changed, the motion video can't be drawn on the GPU");
+                }
+                // a picture on the GPU for the frame, until it is drawn
+                if (gpu.free_pictures.empty())
+                {
+                    gpu.pictures.push_back(_create_buffer(gpu.picture_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 }));
+                    gpu.free_pictures.push_back(static_cast<int>(gpu.pictures.size()) - 1);
+                }
+                slot_video.picture = gpu.free_pictures.back();
+                gpu.free_pictures.pop_back();
+                const VkDescriptorBufferInfo base_buffers[3] = {
+                    { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                    { video.chroma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                    { gpu.pictures[static_cast<size_t>(slot_video.picture)].buffer, 0, VK_WHOLE_SIZE },
+                };
+                std::array<VkWriteDescriptorSet, 3> base_writes {};
+                for (uint32_t b = 0; b < 3; ++b)
+                {
+                    base_writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    base_writes[b].dstSet = slot_video.base_set;
+                    base_writes[b].dstBinding = b;
+                    base_writes[b].descriptorCount = 1;
+                    base_writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    base_writes[b].pBufferInfo = &base_buffers[b];
+                }
+                _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(base_writes.size()), base_writes.data(), 0, nullptr);
+            }
+            else if (_motion_detail)
             {
                 // the planes once more, in host memory: nothing else uses the buffers of a slot that isn't in flight
                 const std::initializer_list<VkMemoryPropertyFlags> readable = {
@@ -460,7 +581,10 @@ public:
         {
             const SlotVideo & slot_video = slot.videos[i];
             _record_copies(slot.command_buffer, slot_video, slot_video.luma->buffer, slot_video.chroma->buffer);
-            if (_motion_detail) _record_copies(slot.command_buffer, slot_video, slot_video.picture_luma.buffer, slot_video.picture_chroma.buffer);
+            if (_motion_detail && !_gpu_videos[i].active)
+            {
+                _record_copies(slot.command_buffer, slot_video, slot_video.picture_luma.buffer, slot_video.picture_chroma.buffer);
+            }
         }
 
         VkMemoryBarrier2 copied { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -481,6 +605,33 @@ public:
                                         0, 1, &slot.videos[i].descriptor_set, 0, nullptr);
             _fn.vkCmdPushConstants(slot.command_buffer, _pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &parameters[i]);
             _fn.vkCmdDispatch(slot.command_buffer, static_cast<uint32_t>(slot.videos[i].height), 1, 1);
+        }
+
+        // motion video on the GPU: the pictures of the frames
+        bool base_bound = false;
+        for (size_t i = 0; i < _videos.size(); ++i)
+        {
+            const SlotVideo & slot_video = slot.videos[i];
+            if (slot_video.picture < 0) continue;
+            const GpuVideo & gpu = _gpu_videos[i];
+            const Plan & plan = slot_video.plan;
+            OverlayBasePush push {};
+            push.width = gpu.width;
+            push.height = gpu.height;
+            push.row_words = gpu.row_words;
+            push.scale = static_cast<uint32_t>(motion_scale(slot_video.width, slot_video.height));
+            push.luma_row_words = plan.luma_row_words;
+            push.chroma_mode = static_cast<uint32_t>(plan.layout.chroma);
+            push.chroma_row_bytes = plan.chroma_row_bytes;
+            push.v_offset = plan.v_offset;
+            // a chroma sample of the picture covers 2 x 2 of its pixels
+            push.chroma_step_x = std::max(1u, (2 * push.scale) >> plan.layout.shift_x);
+            push.chroma_step_y = std::max(1u, (2 * push.scale) >> plan.layout.shift_y);
+            if (!base_bound) _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _overlay_base.pipeline);
+            base_bound = true;
+            _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _overlay_base.layout, 0, 1, &slot_video.base_set, 0, nullptr);
+            _fn.vkCmdPushConstants(slot.command_buffer, _overlay_base.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, (gpu.row_words + 7) / 8, (gpu.height / 2 + 7) / 8, 1);
         }
 
         if (_motion) _record_motion(slot);
@@ -574,7 +725,9 @@ public:
             if (_motion_detail)
             {
                 result.detail = std::make_shared<MotionDetail>();
-                _read_picture(slot_video, result.detail->picture);
+                // the picture stays on the GPU if the motion video is drawn there
+                if (_gpu_videos[i].active) result.detail->gpu_picture = slot_video.picture;
+                else _read_picture(slot_video, result.detail->picture);
             }
             if (_motion) _read_motion(slot_video, result.motion, _motion_detail ? &result.detail->points : nullptr);
             // the decoded image can be reused by the decoder
@@ -643,6 +796,9 @@ private:
         //! motion video: the planes in host memory, with the same layout
         Buffer picture_luma;
         Buffer picture_chroma;
+        //! motion video on the GPU: the picture of the frame (index into GpuVideo::pictures, -1: none)
+        int picture = -1;
+        VkDescriptorSet base_set = VK_NULL_HANDLE;
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         // motion: tracked points (vec4 per point) are read back
         Buffer motion_points;
@@ -653,6 +809,37 @@ private:
         bool compared = false;
         int width = 0;
         int height = 0;
+    };
+
+    //! motion video of a video, drawn and encoded on the GPU
+    struct GpuVideo {
+        bool active = false;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        //! uints per row of a picture, and its size: NV12
+        uint32_t row_words = 0;
+        VkDeviceSize picture_bytes = 0;
+        std::unique_ptr<ffmpeg::EncodedVideo> encoder;
+        //! the frames the encoder is fed with
+        AVBufferRef * frames = nullptr;
+        //! pictures of the frames which wait for their values, and the ones not in use
+        std::vector<Buffer> pictures;
+        std::vector<int> free_pictures;
+    };
+
+    //! a motion video frame being drawn
+    struct DrawSlot {
+        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool busy = false;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        // the scene, uploaded
+        Buffer segments;
+        Buffer tiles;
+        Buffer text;
+        //! the drawn picture, copied into the frame of the encoder
+        Buffer output;
+        AVFrame * frame = nullptr;
     };
 
     struct Slot {
@@ -873,6 +1060,295 @@ private:
         _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);
     }
 
+    //! a buffer of at least `bytes`, its contents are lost if it has to grow
+    void _ensure_buffer(Buffer & buffer, VkDeviceSize bytes, VkBufferUsageFlags usage, std::initializer_list<VkMemoryPropertyFlags> preferred)
+    {
+        if (buffer.size >= bytes) return;
+        _destroy_buffer(buffer);
+        buffer = _create_buffer(std::max(bytes, buffer.size * 2), usage, preferred);
+    }
+
+    void _upload(Buffer & buffer, const void * data, size_t bytes)
+    {
+        _ensure_buffer(buffer, std::max<VkDeviceSize>(bytes, 32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, {
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        });
+        if (bytes > 0) std::memcpy(buffer.mapped, data, bytes);
+        if (!buffer.coherent)
+        {
+            VkMappedMemoryRange range { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            range.memory = buffer.memory;
+            range.size = VK_WHOLE_SIZE;
+            check(_fn.vkFlushMappedMemoryRanges(_device, 1, &range), "vkFlushMappedMemoryRanges");
+        }
+    }
+
+    //! Motion video on the GPU: draws the scene on the picture a frame left on the GPU, into a frame of the
+    //! encoder, and hands it to the encoder. Nothing but the scene is uploaded, nothing is read back.
+    void _draw(size_t index, int picture, const MotionVideoScene & scene)
+    {
+        GpuVideo & gpu = _gpu_videos.at(index);
+        if (picture < 0 || picture >= static_cast<int>(gpu.pictures.size())) throw std::logic_error("motion video: the frame has no picture on the GPU");
+        DrawSlot & slot = _draw_slots[_draws % kDrawSlots];
+        if (slot.busy)
+        {
+            check(_fn.vkWaitForFences(_device, 1, &slot.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+            slot.busy = false;
+        }
+
+        // the segments, and which of them reach into which tile: offsets per tile, then the indices
+        const int tiles_x = static_cast<int>((gpu.width + kOverlayTile - 1) / kOverlayTile);
+        const int tiles_y = static_cast<int>((gpu.height + kOverlayTile - 1) / kOverlayTile);
+        const size_t tile_count = static_cast<size_t>(tiles_x) * static_cast<size_t>(tiles_y);
+        auto tiles_of = [&](const MotionVideoSegment & segment, int & x0, int & x1, int & y0, int & y1) {
+            const float reach = segment.radius + 1.5f; // overlay_draw.comp fades a segment out a pixel beyond its radius
+            const float tile = static_cast<float>(kOverlayTile);
+            x0 = static_cast<int>(std::floor((std::min(segment.x0, segment.x1) - reach) / tile));
+            x1 = static_cast<int>(std::floor((std::max(segment.x0, segment.x1) + reach) / tile));
+            y0 = static_cast<int>(std::floor((std::min(segment.y0, segment.y1) - reach) / tile));
+            y1 = static_cast<int>(std::floor((std::max(segment.y0, segment.y1) + reach) / tile));
+            if (x1 < 0 || y1 < 0 || x0 >= tiles_x || y0 >= tiles_y) return false;
+            x0 = std::max(x0, 0);
+            y0 = std::max(y0, 0);
+            x1 = std::min(x1, tiles_x - 1);
+            y1 = std::min(y1, tiles_y - 1);
+            return true;
+        };
+        _tile_offsets.assign(tile_count + 1, 0);
+        int x0, x1, y0, y1;
+        for (const MotionVideoSegment & segment : scene.segments)
+        {
+            if (!tiles_of(segment, x0, x1, y0, y1)) continue;
+            for (int y = y0; y <= y1; ++y)
+            {
+                for (int x = x0; x <= x1; ++x) _tile_offsets[static_cast<size_t>(y * tiles_x + x) + 1] += 1;
+            }
+        }
+        for (size_t t = 0; t < tile_count; ++t) _tile_offsets[t + 1] += _tile_offsets[t];
+        _tile_data.assign(tile_count + 1 + _tile_offsets[tile_count], 0);
+        std::copy(_tile_offsets.begin(), _tile_offsets.end(), _tile_data.begin());
+        _segment_data.resize(scene.segments.size() * 8);
+        for (size_t s = 0; s < scene.segments.size(); ++s)
+        {
+            const MotionVideoSegment & segment = scene.segments[s];
+            // BGR -> YUV as OpenCV converts it (BT.601, limited range)
+            const float r = segment.red, g = segment.green, b = segment.blue;
+            float * data = _segment_data.data() + 8 * s;
+            data[0] = segment.x0;
+            data[1] = segment.y0;
+            data[2] = segment.x1;
+            data[3] = segment.y1;
+            data[4] = segment.radius;
+            data[5] = 16.0f + (65.481f * r + 128.553f * g + 24.966f * b) / 255.0f;
+            data[6] = 128.0f + (-37.797f * r - 74.203f * g + 112.0f * b) / 255.0f;
+            data[7] = 128.0f + (112.0f * r - 93.786f * g - 18.214f * b) / 255.0f;
+            if (!tiles_of(segment, x0, x1, y0, y1)) continue;
+            for (int y = y0; y <= y1; ++y)
+            {
+                for (int x = x0; x <= x1; ++x)
+                {
+                    const size_t tile = static_cast<size_t>(y * tiles_x + x);
+                    _tile_data[tile_count + 1 + _tile_offsets[tile]++] = static_cast<uint32_t>(s);
+                }
+            }
+        }
+        _upload(slot.segments, _segment_data.data(), _segment_data.size() * sizeof(float));
+        _upload(slot.tiles, _tile_data.data(), _tile_data.size() * sizeof(uint32_t));
+
+        OverlayDrawPush push {};
+        push.width = gpu.width;
+        push.height = gpu.height;
+        push.row_words = gpu.row_words;
+        push.tile_size = kOverlayTile;
+        push.tiles_x = static_cast<uint32_t>(tiles_x);
+        push.tiles_y = static_cast<uint32_t>(tiles_y);
+        push.dim = scene.dim;
+        push.box_dim = scene.box_dim;
+        const cv::Rect picture_rect(0, 0, static_cast<int>(gpu.width), static_cast<int>(gpu.height));
+        if (!scene.box.empty() && (scene.box & picture_rect) == scene.box && scene.text.size() == scene.box.size() && scene.text.type() == CV_8UC1)
+        {
+            push.box_x = static_cast<uint32_t>(scene.box.x);
+            push.box_y = static_cast<uint32_t>(scene.box.y);
+            push.box_width = static_cast<uint32_t>(scene.box.width);
+            push.box_height = static_cast<uint32_t>(scene.box.height);
+            push.text_row_words = (push.box_width + 3) / 4;
+            _text_data.assign(static_cast<size_t>(push.text_row_words) * 4 * push.box_height, 0);
+            for (int y = 0; y < scene.box.height; ++y)
+            {
+                std::memcpy(_text_data.data() + static_cast<size_t>(y) * push.text_row_words * 4, scene.text.ptr(y), static_cast<size_t>(scene.box.width));
+            }
+            _upload(slot.text, _text_data.data(), _text_data.size());
+        }
+        else
+        {
+            _upload(slot.text, nullptr, 0);
+        }
+        _ensure_buffer(slot.output, gpu.picture_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
+
+        const VkDescriptorBufferInfo buffers[5] = {
+            { gpu.pictures[static_cast<size_t>(picture)].buffer, 0, VK_WHOLE_SIZE },
+            { slot.segments.buffer, 0, VK_WHOLE_SIZE },
+            { slot.tiles.buffer, 0, VK_WHOLE_SIZE },
+            { slot.text.buffer, 0, VK_WHOLE_SIZE },
+            { slot.output.buffer, 0, VK_WHOLE_SIZE },
+        };
+        std::array<VkWriteDescriptorSet, 5> writes {};
+        for (uint32_t b = 0; b < 5; ++b)
+        {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = slot.set;
+            writes[b].dstBinding = b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].pBufferInfo = &buffers[b];
+        }
+        _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+        // a frame of the encoder: NV12, one image with two planes or an image per plane
+        av_frame_unref(slot.frame);
+        const int allocated = av_hwframe_get_buffer(gpu.frames, slot.frame, 0);
+        if (allocated < 0) throw std::runtime_error("no frame for the video encoder (" + ffmpeg::error_string(allocated) + ")");
+        AVVkFrame * vkf = reinterpret_cast<AVVkFrame *>(slot.frame->data[0]);
+        const int images = image_count(vkf);
+        const bool multiplane = images == 1;
+        if (!multiplane && images != 2) throw std::runtime_error("unsupported Vulkan frame layout of the video encoder");
+
+        _lock(slot.frame, true);
+        std::vector<VkImageMemoryBarrier2> image_barriers;
+        std::vector<VkSemaphoreSubmitInfo> waits;
+        std::vector<VkSemaphoreSubmitInfo> signals;
+        for (int j = 0; j < images; ++j)
+        {
+            VkImageMemoryBarrier2 barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            barrier.srcAccessMask = vkf->access[j];
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            // the whole image is written
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = vkf->queue_family[j];
+            barrier.dstQueueFamilyIndex = vkf->queue_family[j] == VK_QUEUE_FAMILY_IGNORED ? VK_QUEUE_FAMILY_IGNORED : _queue_family;
+            barrier.image = vkf->img[j];
+            barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            image_barriers.push_back(barrier);
+
+            VkSemaphoreSubmitInfo wait { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            wait.semaphore = vkf->sem[j];
+            wait.value = vkf->sem_value[j];
+            wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            waits.push_back(wait);
+            wait.value = vkf->sem_value[j] + 1;
+            signals.push_back(wait);
+        }
+
+        check(_fn.vkResetCommandBuffer(slot.command_buffer, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(_fn.vkBeginCommandBuffer(slot.command_buffer, &begin), "vkBeginCommandBuffer");
+
+        // the picture was written by the submission of its frame, the result buffer read by an earlier copy
+        VkMemoryBarrier2 before { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        before.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        before.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+        before.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        before.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &before;
+        _fn.vkCmdPipelineBarrier2(slot.command_buffer, &dependency);
+
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _overlay_draw.pipeline);
+        _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _overlay_draw.layout, 0, 1, &slot.set, 0, nullptr);
+        _fn.vkCmdPushConstants(slot.command_buffer, _overlay_draw.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        _fn.vkCmdDispatch(slot.command_buffer, (gpu.row_words + 7) / 8, (gpu.height / 2 + 7) / 8, 1);
+
+        VkMemoryBarrier2 drawn { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        drawn.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        drawn.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        drawn.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        drawn.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        VkDependencyInfo drawn_dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        drawn_dependency.memoryBarrierCount = 1;
+        drawn_dependency.pMemoryBarriers = &drawn;
+        drawn_dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_barriers.size());
+        drawn_dependency.pImageMemoryBarriers = image_barriers.data();
+        _fn.vkCmdPipelineBarrier2(slot.command_buffer, &drawn_dependency);
+
+        const VkDeviceSize row_bytes = static_cast<VkDeviceSize>(gpu.row_words) * 4;
+        for (int plane = 0; plane < 2; ++plane)
+        {
+            VkBufferImageCopy region {};
+            region.bufferOffset = plane == 0 ? 0 : row_bytes * gpu.height;
+            // in texels: bytes of luma, UV pairs of chroma
+            region.bufferRowLength = plane == 0 ? gpu.row_words * 4 : gpu.row_words * 2;
+            region.bufferImageHeight = plane == 0 ? gpu.height : gpu.height / 2;
+            region.imageSubresource = { static_cast<VkImageAspectFlags>(multiplane ? (plane == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_PLANE_1_BIT)
+                                                                                    : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1 };
+            region.imageExtent = { plane == 0 ? gpu.width : gpu.width / 2, plane == 0 ? gpu.height : gpu.height / 2, 1 };
+            _fn.vkCmdCopyBufferToImage(slot.command_buffer, slot.output.buffer, vkf->img[multiplane ? 0 : plane],
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        }
+        check(_fn.vkEndCommandBuffer(slot.command_buffer), "vkEndCommandBuffer");
+
+        VkCommandBufferSubmitInfo command_info { VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        command_info.commandBuffer = slot.command_buffer;
+        VkSubmitInfo2 submit { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submit.waitSemaphoreInfoCount = static_cast<uint32_t>(waits.size());
+        submit.pWaitSemaphoreInfos = waits.data();
+        submit.commandBufferInfoCount = 1;
+        submit.pCommandBufferInfos = &command_info;
+        submit.signalSemaphoreInfoCount = static_cast<uint32_t>(signals.size());
+        submit.pSignalSemaphoreInfos = signals.data();
+        VkResult result = _fn.vkResetFences(_device, 1, &slot.fence);
+        if (result == VK_SUCCESS)
+        {
+            _lock_queue(true);
+            result = _fn.vkQueueSubmit2(_queue, 1, &submit, slot.fence);
+            _lock_queue(false);
+        }
+        if (result == VK_SUCCESS)
+        {
+            for (int j = 0; j < images; ++j)
+            {
+                vkf->sem_value[j] += 1;
+                vkf->layout[j] = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                vkf->access[j] = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                vkf->queue_family[j] = image_barriers[static_cast<size_t>(j)].dstQueueFamilyIndex;
+            }
+        }
+        _lock(slot.frame, false);
+        check(result, "vkQueueSubmit2");
+        slot.busy = true;
+        ++_draws;
+
+        // the encoder waits for the frame itself
+        gpu.encoder->encode(slot.frame);
+        av_frame_unref(slot.frame);
+        gpu.free_pictures.push_back(picture);
+    }
+
+    void _finish_video(size_t index)
+    {
+        GpuVideo & gpu = _gpu_videos.at(index);
+        if (gpu.encoder) gpu.encoder->finish();
+    }
+
+    //! the motion video of one of the videos, drawn and encoded by this pipeline
+    class GpuTarget final : public MotionVideoTarget {
+    public:
+        GpuTarget(VulkanVideoPipeline & pipeline, size_t index) : _pipeline(pipeline), _index(index) { }
+        std::string description() const override { return _pipeline._gpu_videos[_index].encoder->encoder_name() + ", drawn on the GPU"; }
+        void write(const MotionDetail & detail, const MotionVideoScene & scene) override { _pipeline._draw(_index, detail.gpu_picture, scene); }
+        void finish() override { _pipeline._finish_video(_index); }
+
+    private:
+        VulkanVideoPipeline & _pipeline;
+        size_t _index;
+    };
+
     static void _check_frame(const AVFrame * frame, const ffmpeg::VideoDecoder & decoder)
     {
         if (frame->format != AV_PIX_FMT_VULKAN || !frame->hw_frames_ctx) throw std::runtime_error("no Vulkan decoding for " + decoder.codec_name());
@@ -1077,9 +1553,10 @@ private:
     {
         // per video of a slot: the comparison, the pyramid and the tracking set
         const uint32_t set_count = static_cast<uint32_t>(kSlots * _videos.size());
-        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 3) * set_count };
+        // ... and the picture of the motion video; a set per motion video frame being drawn
+        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 3 + 3) * set_count + 5 * static_cast<uint32_t>(kDrawSlots) };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pool_info.maxSets = 3 * set_count;
+        pool_info.maxSets = 4 * set_count + static_cast<uint32_t>(kDrawSlots);
         pool_info.poolSizeCount = 1;
         pool_info.pPoolSizes = &pool_size;
         check(_fn.vkCreateDescriptorPool(_device, &pool_info, nullptr, &_descriptor_pool), "vkCreateDescriptorPool");
@@ -1112,7 +1589,26 @@ private:
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.pyramid_set), "vkAllocateDescriptorSets");
                 set_info.pSetLayouts = &_lk.set_layout;
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.lk_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_overlay_base.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.base_set), "vkAllocateDescriptorSets");
             }
+        }
+        for (DrawSlot & slot : _draw_slots)
+        {
+            VkCommandBufferAllocateInfo command_info { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            command_info.commandPool = _command_pool;
+            command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            command_info.commandBufferCount = 1;
+            check(_fn.vkAllocateCommandBuffers(_device, &command_info, &slot.command_buffer), "vkAllocateCommandBuffers");
+            VkFenceCreateInfo fence_info { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            check(_fn.vkCreateFence(_device, &fence_info, nullptr, &slot.fence), "vkCreateFence");
+            VkDescriptorSetAllocateInfo set_info { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            set_info.descriptorPool = _descriptor_pool;
+            set_info.descriptorSetCount = 1;
+            set_info.pSetLayouts = &_overlay_draw.set_layout;
+            check(_fn.vkAllocateDescriptorSets(_device, &set_info, &slot.set), "vkAllocateDescriptorSets");
+            slot.frame = av_frame_alloc();
+            if (!slot.frame) throw std::runtime_error("out of memory");
         }
     }
 
@@ -1170,10 +1666,30 @@ private:
 
     void _release()
     {
+        // the encoders of the motion videos and their frames use the device as well
+        for (DrawSlot & slot : _draw_slots) av_frame_free(&slot.frame);
+        for (GpuVideo & gpu : _gpu_videos)
+        {
+            gpu.encoder.reset();
+            av_buffer_unref(&gpu.frames);
+        }
         // our Vulkan objects first, then the frames and decoders, the device last
         if (_device && _fn.vkDeviceWaitIdle)
         {
             _fn.vkDeviceWaitIdle(_device);
+            for (DrawSlot & slot : _draw_slots)
+            {
+                for (Buffer * buffer : { &slot.segments, &slot.tiles, &slot.text, &slot.output }) _destroy_buffer(*buffer);
+                if (slot.fence) _fn.vkDestroyFence(_device, slot.fence, nullptr);
+                slot.fence = VK_NULL_HANDLE;
+            }
+            for (GpuVideo & gpu : _gpu_videos)
+            {
+                for (Buffer & buffer : gpu.pictures) _destroy_buffer(buffer);
+                gpu.pictures.clear();
+            }
+            _destroy_compute(_overlay_base);
+            _destroy_compute(_overlay_draw);
             for (Slot & slot : _slots)
             {
                 for (SlotVideo & video : slot.videos)
@@ -1241,6 +1757,16 @@ private:
     //! motion video: the picture and the points of every frame are kept
     bool _motion_detail = false;
     cv::Mat _scratch;
+    // ... or drawn on the GPU
+    std::vector<GpuVideo> _gpu_videos;
+    std::array<DrawSlot, kDrawSlots> _draw_slots;
+    size_t _draws = 0;
+    Compute _overlay_base;
+    Compute _overlay_draw;
+    std::vector<uint32_t> _tile_offsets;
+    std::vector<uint32_t> _tile_data;
+    std::vector<float> _segment_data;
+    std::vector<uint8_t> _text_data;
     Compute _pyramid;
     Compute _lk;
     MotionCellBinner _binner;

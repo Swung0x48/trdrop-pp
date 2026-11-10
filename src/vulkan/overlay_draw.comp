@@ -1,0 +1,129 @@
+#version 450
+// Motion video: draws the scene of a frame on its picture (see overlay_base.comp for the layout of a picture).
+//
+// The picture is dimmed, the segments (lines with round ends, anti-aliased by their distance) are blended over
+// it in the order of the list, then the text box is darkened and gets the text in white. Everything happens
+// in YUV: dimming and blending are affine, so the result is the same as in RGB.
+//
+// The segments are sorted into tiles on the CPU: tiles[t] .. tiles[t + 1] is the range of tile t in the index
+// list, which follows the tile_count + 1 offsets. An invocation draws a block of 4x2 pixels, which lies in
+// one tile.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct Segment {
+    vec4 ends;  // x0, y0, x1, y1
+    vec4 look;  // radius, Y, U, V
+};
+
+layout(set = 0, binding = 0) readonly buffer Base { uint base[]; };
+layout(set = 0, binding = 1) readonly buffer Segments { Segment segments[]; };
+layout(set = 0, binding = 2) readonly buffer Tiles { uint tiles[]; };
+layout(set = 0, binding = 3) readonly buffer Text { uint text[]; };
+layout(set = 0, binding = 4) writeonly buffer Result { uint result[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint row_words;
+    uint tile_size;       // a multiple of 4
+    uint tiles_x;
+    uint tiles_y;
+    uint box_x;           // the text box, box_width 0: none
+    uint box_y;
+    uint box_width;
+    uint box_height;
+    uint text_row_words;  // uints per row of the text coverage
+    float dim;
+    float box_dim;
+} params;
+
+const vec3 kBlack = vec3(16.0, 128.0, 128.0);
+const vec3 kWhite = vec3(235.0, 128.0, 128.0);
+
+uint byte_of(uint word, uint k)
+{
+    return (word >> (8u * k)) & 255u;
+}
+
+float distance_to(vec2 p, vec4 ends)
+{
+    const vec2 a = ends.xy;
+    const vec2 ab = ends.zw - a;
+    const float length_squared = dot(ab, ab);
+    const float t = length_squared > 0.0 ? clamp(dot(p - a, ab) / length_squared, 0.0, 1.0) : 0.0;
+    return distance(p, a + t * ab);
+}
+
+void main()
+{
+    const uint block_x = gl_GlobalInvocationID.x;
+    const uint block_y = gl_GlobalInvocationID.y;
+    if (block_x >= params.row_words || block_y >= params.height / 2u) return;
+
+    // the 8 pixels of the block, dimmed
+    const uint chroma_word = base[(params.height + block_y) * params.row_words + block_x];
+    vec3 color[8];
+    for (uint row = 0u; row < 2u; ++row)
+    {
+        const uint word = base[(block_y * 2u + row) * params.row_words + block_x];
+        for (uint k = 0u; k < 4u; ++k)
+        {
+            const uint pair = k / 2u;
+            const vec3 yuv = vec3(float(byte_of(word, k)), float(byte_of(chroma_word, 2u * pair)), float(byte_of(chroma_word, 2u * pair + 1u)));
+            color[row * 4u + k] = kBlack + (yuv - kBlack) * params.dim;
+        }
+    }
+
+    const uint tile_count = params.tiles_x * params.tiles_y;
+    const uint tile = min(block_y * 2u / params.tile_size, params.tiles_y - 1u) * params.tiles_x
+                    + min(block_x * 4u / params.tile_size, params.tiles_x - 1u);
+    const uint last = tiles[tile + 1u];
+    for (uint entry = tiles[tile]; entry < last; ++entry)
+    {
+        const Segment segment = segments[tiles[tile_count + 1u + entry]];
+        for (uint row = 0u; row < 2u; ++row)
+        {
+            for (uint k = 0u; k < 4u; ++k)
+            {
+                const vec2 p = vec2(float(block_x * 4u + k), float(block_y * 2u + row));
+                // solid up to the radius, fading out over the next pixel (about what OpenCV's anti-aliased lines cover)
+                const float coverage = clamp(segment.look.x + 1.0 - distance_to(p, segment.ends), 0.0, 1.0);
+                color[row * 4u + k] = mix(color[row * 4u + k], segment.look.yzw, coverage);
+            }
+        }
+    }
+
+    if (params.box_width > 0u)
+    {
+        for (uint row = 0u; row < 2u; ++row)
+        {
+            const uint y = block_y * 2u + row;
+            if (y < params.box_y || y >= params.box_y + params.box_height) continue;
+            for (uint k = 0u; k < 4u; ++k)
+            {
+                const uint x = block_x * 4u + k;
+                if (x < params.box_x || x >= params.box_x + params.box_width) continue;
+                const uint index = (y - params.box_y) * params.text_row_words * 4u + (x - params.box_x);
+                const float coverage = float(byte_of(text[index >> 2], index & 3u)) / 255.0;
+                const vec3 darkened = kBlack + (color[row * 4u + k] - kBlack) * params.box_dim;
+                color[row * 4u + k] = mix(darkened, kWhite, coverage);
+            }
+        }
+    }
+
+    for (uint row = 0u; row < 2u; ++row)
+    {
+        uint word = 0u;
+        for (uint k = 0u; k < 4u; ++k) word |= uint(clamp(color[row * 4u + k].x + 0.5, 0.0, 255.0)) << (8u * k);
+        result[(block_y * 2u + row) * params.row_words + block_x] = word;
+    }
+    uint word = 0u;
+    for (uint pair = 0u; pair < 2u; ++pair)
+    {
+        const vec3 mean = 0.25 * (color[2u * pair] + color[2u * pair + 1u] + color[4u + 2u * pair] + color[4u + 2u * pair + 1u]);
+        word |= uint(clamp(mean.y + 0.5, 0.0, 255.0)) << (16u * pair);
+        word |= uint(clamp(mean.z + 0.5, 0.0, 255.0)) << (16u * pair + 8u);
+    }
+    result[(params.height + block_y) * params.row_words + block_x] = word;
+}

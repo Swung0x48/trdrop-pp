@@ -249,17 +249,25 @@ most: 4K becomes 1080p) and the framerate of the source; the picture is darkened
 With several input videos give one file each, comma separated; an empty name skips a video
 (`--motion-video ,b.mp4`).
 
-Builds with FFmpeg encode H.264 with the first encoder that works on the machine - the GPU's (NVENC, AMF,
-Quick Sync, VideoToolbox), x264 if the FFmpeg build has it, the one of Windows (Media Foundation), OpenH264 -
-and MPEG-4 if none does; the container follows from the name. Builds without FFmpeg write what OpenCV
-can: MPEG-4 (`.mp4`, `.mkv`, `.mov`) or Motion JPEG (`.avi`). The `vN motion video:` line says which it is.
-
 The analysis is the same with and without the option (the CSV is identical), on every decoder: the arrows
-are the points this run measured, on the GPU or on the CPU. With Vulkan Video decoding the planes of every
-frame are copied into host memory for the picture; drawing and encoding run on the CPU. A 4K 120 fps HEVC
-recording is analyzed at about 200 frames per second with the video instead of 600 without (`--decode
-ffmpeg`: 93 instead of 156). The frames wait for their values (the look ahead of the window), at 4K 120 fps
-that takes up to 200 MB of memory.
+are the points this run measured, on the GPU or on the CPU. Where the video is made follows the decoder,
+the `vN motion video:` line says which it is:
+
+| decoding | picture, drawing | encoding | 4K 120 fps HEVC recording, frames per second |
+| --- | --- | --- | --- |
+| Vulkan Video (the default with `--motion`) | on the GPU | on the GPU: H.264 with Vulkan Video (`h264_vulkan`) | 595 (601 without the video) |
+| Vulkan Video on a GPU without Vulkan H.264 encoding | the planes of the frame are copied into memory, drawn on the CPU | as below | about 200 |
+| `--decode ffmpeg` / `opencv` | on the CPU | H.264 with the first encoder that works on the machine - the GPU's (NVENC, AMF, Quick Sync, VideoToolbox), x264 if the FFmpeg build has it, the one of Windows (Media Foundation), OpenH264 - and MPEG-4 if none does | 95 (156 without the video) |
+| builds without FFmpeg | on the CPU | what OpenCV can: MPEG-4 (`.mp4`, `.mkv`, `.mov`) or Motion JPEG (`.avi`) | |
+
+On the GPU a frame never leaves it: a compute shader scales it down into a picture that waits there until
+the analysis has the values of the frame (it looks ahead), a second one dims it and draws the arrows and
+the text box on it, and the result is copied into a frame of the encoder. Only the arrows, the text (four
+lines, rasterized on the CPU) and the encoded video cross between CPU and GPU. Both ways draw the same
+scene and look the same apart from the anti-aliasing of the lines.
+
+The pictures that wait take up to 200 MB at 4K 120 fps - of GPU memory, or of main memory when drawn on
+the CPU. The container follows from the name.
 
 ### Captures that are not in step (`--async-capture`)
 

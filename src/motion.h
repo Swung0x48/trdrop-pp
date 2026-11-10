@@ -76,6 +76,8 @@ struct MotionDetail {
     //! the frame at the resolution the motion is measured at (see motion_picture_size), as I420: the Y plane
     //! followed by the U and V planes of half the size, rows * 3 / 2 rows of 8-bit values
     cv::Mat picture;
+    //! instead of `picture` if the pipeline draws the motion video on the GPU: its handle of the frame's picture
+    int gpu_picture = -1;
     //! the points of the grid, empty if there was no previous frame of the same size
     std::vector<MotionPoint> points;
 };

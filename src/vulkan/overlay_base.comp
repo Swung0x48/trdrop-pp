@@ -1,0 +1,102 @@
+#version 450
+// Motion video: the picture of a frame, scaled down to the resolution the motion is measured at.
+//
+// Source: the luma and chroma planes of the frame as yuv_diff.comp reads them (bytes packed into uints).
+// Result: NV12 - height rows of luma, then height / 2 rows of UV pairs - with row_words uints per row.
+// An invocation writes a block of 4x2 pixels: two words of luma and one word of chroma (U V U V), so no
+// word is written by two invocations.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer Luma { uint luma[]; };
+layout(set = 0, binding = 1) readonly buffer Chroma { uint chroma[]; };
+layout(set = 0, binding = 2) writeonly buffer Picture { uint picture[]; };
+
+layout(push_constant) uniform Params {
+    uint width;            // of the picture, even
+    uint height;
+    uint row_words;        // uints per row of the picture: (width + 3) / 4
+    uint scale;            // source pixels per pixel of the picture, in both directions
+    uint luma_row_words;   // uints per row of the source luma plane
+    uint chroma_mode;      // 0: none, 1: interleaved UV, 2: planar U, V
+    uint chroma_row_bytes;
+    uint v_offset;         // planar: byte offset of the V plane
+    uint chroma_step_x;    // source chroma samples per chroma sample of the picture
+    uint chroma_step_y;
+} params;
+
+uint luma_at(uint x, uint y)
+{
+    const uint index = y * params.luma_row_words * 4u + x;
+    return (luma[index >> 2] >> (8u * (index & 3u))) & 255u;
+}
+
+uint chroma_at(uint index)
+{
+    return (chroma[index >> 2] >> (8u * (index & 3u))) & 255u;
+}
+
+void main()
+{
+    const uint block_x = gl_GlobalInvocationID.x;
+    const uint block_y = gl_GlobalInvocationID.y;
+    if (block_x >= params.row_words || block_y >= params.height / 2u) return;
+
+    const uint scale = params.scale;
+    const uint area = scale * scale;
+    for (uint row = 0u; row < 2u; ++row)
+    {
+        const uint y = block_y * 2u + row;
+        uint word = 0u;
+        for (uint k = 0u; k < 4u; ++k)
+        {
+            const uint x = block_x * 4u + k;
+            if (x >= params.width) continue;
+            uint sum = 0u;
+            for (uint dy = 0u; dy < scale; ++dy)
+            {
+                for (uint dx = 0u; dx < scale; ++dx) sum += luma_at(x * scale + dx, y * scale + dy);
+            }
+            word |= ((sum + area / 2u) / area) << (8u * k);
+        }
+        picture[y * params.row_words + block_x] = word;
+    }
+
+    uint word = 0u;
+    const uint samples = params.chroma_step_x * params.chroma_step_y;
+    for (uint k = 0u; k < 2u; ++k)
+    {
+        const uint chroma_x = block_x * 2u + k;
+        uint u = 128u;
+        uint v = 128u;
+        if (params.chroma_mode != 0u && chroma_x < params.width / 2u)
+        {
+            uint sum_u = 0u;
+            uint sum_v = 0u;
+            for (uint dy = 0u; dy < params.chroma_step_y; ++dy)
+            {
+                for (uint dx = 0u; dx < params.chroma_step_x; ++dx)
+                {
+                    const uint x = chroma_x * params.chroma_step_x + dx;
+                    const uint y = block_y * params.chroma_step_y + dy;
+                    if (params.chroma_mode == 1u)
+                    {
+                        const uint index = y * params.chroma_row_bytes + 2u * x;
+                        sum_u += chroma_at(index);
+                        sum_v += chroma_at(index + 1u);
+                    }
+                    else
+                    {
+                        const uint index = y * params.chroma_row_bytes + x;
+                        sum_u += chroma_at(index);
+                        sum_v += chroma_at(params.v_offset + index);
+                    }
+                }
+            }
+            u = (sum_u + samples / 2u) / samples;
+            v = (sum_v + samples / 2u) / samples;
+        }
+        word |= (u << (16u * k)) | (v << (16u * k + 8u));
+    }
+    picture[(params.height + block_y) * params.row_words + block_x] = word;
+}

@@ -117,9 +117,11 @@ duplicate, animation step, animation error, framerate, perceived smoothness). Us
 see what was measured, or to understand why a stretch could not be measured. `--arrow-scale 8` for slow
 motion, where the arrows would only be a pixel or two long.
 
-It needs nothing but trdrop++ itself and doesn't change the numbers, but drawing and encoding make the run
-about three times as long - leave the option off when only the numbers are wanted. With several input
-videos give one file per video, comma separated.
+It needs nothing but trdrop++ itself and doesn't change the numbers. With Vulkan Video decoding (the
+default) the video is drawn and encoded on the GPU and costs next to nothing; the `v1 motion video:` line
+says `drawn on the GPU` then. If it says `drawn on the CPU` (other decoders, or a GPU that can't encode
+H.264 with Vulkan) the run takes two to three times as long - leave the option off there when only the
+numbers are wanted. With several input videos give one file per video, comma separated.
 
 ## Report
 

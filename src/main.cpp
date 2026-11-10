@@ -81,7 +81,8 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
                                rejected, and the values of the frame. At the resolution the
                                motion is measured at (up to 1920x1080), H.264 in the container
                                the name asks for (.mp4, .mkv, .mov). One file per input video,
-                               comma separated
+                               comma separated. With Vulkan Video decoding it is drawn and
+                               encoded on the GPU, otherwise on the CPU
       --arrow-scale <x>        draw the arrows of the motion video x times longer (default: 1,
                                the real motion; e.g. 8 for slow motion)
       --async-capture          --motion for a capture that didn't run in step with the game's
@@ -543,8 +544,15 @@ int run(const Options & options)
     for (size_t i = 0; i < options.motion_videos.size(); ++i)
     {
         if (options.motion_videos[i].empty()) continue;
+        // drawn and encoded where the frames are if the pipeline can, otherwise on the CPU
+        std::string reason;
+        std::unique_ptr<MotionVideoTarget> target = pipeline.start_motion_video(i, options.motion_videos[i], recorded_framerates[i], reason);
+        if (!target && !reason.empty() && !options.quiet)
+        {
+            std::fprintf(stderr, "trdrop-pp: drawing the motion video on the CPU (%s)\n", reason.c_str());
+        }
         motion_videos[i] = std::make_unique<MotionVideo>(options.motion_videos[i], sources.frame_width(i), sources.frame_height(i)
-                                                       , recorded_framerates[i], options.arrow_scale);
+                                                       , recorded_framerates[i], options.arrow_scale, std::move(target));
         if (!options.quiet)
         {
             std::fprintf(stderr, "v%zu motion video: %s (%dx%d, %s)\n", i + 1, motion_videos[i]->path().c_str()

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "diff_engine.h"
+#include "motion_video_target.h"
 #include "options.h"
 
 namespace trdrop {
@@ -33,6 +34,10 @@ public:
     //! also keep the picture and the tracked points of every frame (RowCounts::detail), after enable_motion().
     //! throws std::runtime_error if the pipeline can't do it
     virtual void enable_motion_detail();
+    //! The motion video of video `index`, drawn and encoded by the pipeline itself where the frames are (on
+    //! the GPU): its frames get MotionDetail::gpu_picture instead of a picture. nullptr if the pipeline doesn't
+    //! do that or can't here, `reason` then says why (empty: it never does). Before the first submit_next()
+    virtual std::unique_ptr<MotionVideoTarget> start_motion_video(size_t index, const std::string & path, double fps, std::string & reason);
 
     //! main thread time spent in the comparison (without decoding), < 0 if decoding and
     //! comparison can't be separated (both run on the GPU)
