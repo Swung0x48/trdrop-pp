@@ -46,6 +46,8 @@
     <string name="chart_error_histogram">动画误差分布</string>
     <string name="chart_hint">触摸图表查看数值，双指缩放，双击还原</string>
     <string name="motion_video">运动矢量视频</string>
+    <string name="play">播放</string>
+    <string name="pause">暂停</string>
     <string name="share_video">分享</string>
     <string name="save_video">保存到相册</string>
     <string name="saved_video">已保存到 Movies/trdrop</string>

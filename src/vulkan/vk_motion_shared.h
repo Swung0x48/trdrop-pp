@@ -53,8 +53,7 @@ struct LkPush {
     float max_residual;
 };
 
-//! the motion is measured at the grid of points of motion.h, at up to 1920x1080
-constexpr uint32_t kMotionPoints = kMotionPointsX * kMotionPointsY;
+//! the motion is measured at the grid of points of motion.h (kMotionPoints of them), at its resolution
 constexpr uint32_t kMotionIterations = 20; // at most, per level
 constexpr uint32_t kMotionGroupSize = 256; // local_size_x of motion_lk.comp
 //! the frames have to match at a point after the tracking (mean absolute difference)
@@ -63,6 +62,7 @@ constexpr float kMaxResidual = 12.0f;
 //! pyramid of the luma plane a frame's motion is measured on
 struct MotionLayout {
     uint32_t scale = 1;
+    MotionGrid grid;
     uint32_t levels = 0;
     uint32_t width[kMaxMotionLevels] = {};
     uint32_t height[kMaxMotionLevels] = {};
@@ -73,7 +73,8 @@ struct MotionLayout {
 inline MotionLayout motion_layout(int width, int height)
 {
     MotionLayout layout;
-    layout.scale = static_cast<uint32_t>(std::max(1.0, std::ceil(std::max(width / 1920.0, height / 1080.0) - 1e-9)));
+    layout.scale = static_cast<uint32_t>(motion_scale(width, height));
+    layout.grid = motion_grid(width, height);
     uint32_t w = static_cast<uint32_t>(width) / layout.scale;
     uint32_t h = static_cast<uint32_t>(height) / layout.scale;
     uint32_t offset = 0;

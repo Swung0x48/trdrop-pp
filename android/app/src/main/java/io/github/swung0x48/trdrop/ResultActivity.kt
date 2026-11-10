@@ -2,15 +2,19 @@ package io.github.swung0x48.trdrop
 
 import android.content.ContentValues
 import android.content.Intent
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
 import android.widget.GridLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.MediaController
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
@@ -30,6 +34,20 @@ import java.io.File
 class ResultActivity : AppCompatActivity() {
     private lateinit var analysis: Analysis
     private val density by lazy { resources.displayMetrics.density }
+    private val handler = Handler(Looper.getMainLooper())
+    /** keeps the controls of the motion video up to date while the page is shown */
+    private var videoTicker: Runnable? = null
+
+    override fun onResume() {
+        super.onResume()
+        videoTicker?.let { handler.post(it) }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        videoTicker?.let { handler.removeCallbacks(it) }
+        findViewById<VideoView>(R.id.video)?.pause()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -189,21 +207,72 @@ class ResultActivity : AppCompatActivity() {
         findViewById<View>(R.id.video_card).visibility = View.VISIBLE
         findViewById<TextView>(R.id.video_info).text = summary.motionVideo
         val video = findViewById<VideoView>(R.id.video)
-        val controller = MediaController(this)
-        controller.setAnchorView(findViewById(R.id.video_frame))
-        video.setMediaController(controller)
+        // The controls are views of the page. A MediaController is a window of its own that is placed over the
+        // video once and stays there when the page is scrolled
+        val play = findViewById<ImageButton>(R.id.video_play)
+        val seek = findViewById<SeekBar>(R.id.video_seek)
+        val position = findViewById<TextView>(R.id.video_position)
+        val duration = findViewById<TextView>(R.id.video_duration)
+        fun time(ms: Int) = String.format("%d:%02d", ms / 60000, ms / 1000 % 60)
+        var player: MediaPlayer? = null
+        var dragging = false
+        var shownPlaying = false
+
         // a VideoView without a height never gets a surface, and without a surface the video isn't opened
         video.post {
             video.layoutParams = video.layoutParams.apply { height = video.width * 9 / 16 }
             video.setVideoPath(file.absolutePath)
         }
-        video.setOnPreparedListener { player ->
+        // also when the video is opened again after the page was left
+        video.setOnPreparedListener { prepared ->
             // the height follows the shape of the video
-            if (player.videoWidth > 0) {
-                video.layoutParams = video.layoutParams.apply { height = video.width * player.videoHeight / player.videoWidth }
+            if (prepared.videoWidth > 0) {
+                video.layoutParams = video.layoutParams.apply { height = video.width * prepared.videoHeight / prepared.videoWidth }
             }
-            player.isLooping = true
+            prepared.isLooping = true
+            player = prepared
+            seek.max = video.duration.coerceAtLeast(1)
+            duration.text = time(video.duration)
             video.seekTo(1)
+        }
+        val toggle = View.OnClickListener { if (video.isPlaying) video.pause() else video.start() }
+        play.setOnClickListener(toggle)
+        findViewById<View>(R.id.video_frame).setOnClickListener(toggle)
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                // to the picture at that time, not to the key frame before it
+                try {
+                    player?.seekTo(progress.toLong(), MediaPlayer.SEEK_CLOSEST) ?: video.seekTo(progress)
+                } catch (e: IllegalStateException) {
+                    video.seekTo(progress)
+                }
+                position.text = time(progress)
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) {
+                dragging = true
+            }
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                dragging = false
+            }
+        })
+        videoTicker = object : Runnable {
+            override fun run() {
+                val playing = video.isPlaying
+                if (playing != shownPlaying) {
+                    shownPlaying = playing
+                    play.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+                    play.contentDescription = getString(if (playing) R.string.pause else R.string.play)
+                }
+                if (playing && !dragging) {
+                    val now = video.currentPosition
+                    seek.progress = now
+                    position.text = time(now)
+                }
+                handler.postDelayed(this, 100)
+            }
         }
         findViewById<View>(R.id.share_video).setOnClickListener { share(file, "video/mp4") }
         val save = findViewById<View>(R.id.save_video)

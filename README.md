@@ -140,7 +140,8 @@ How it works:
    to 1920x1080) at a regular grid of 64x40 points. A point is used if its surroundings have texture and if
    tracking it back from where it arrived ends within 1 pixel of the point - wrong matches (repeating texture,
    motion too large) don't come back. The points are reduced to the median vector per cell of a 32x20 grid
-   (4 points per cell, at least 2 of them).
+   (4 points per cell, at least 2 of them). A video that is higher than wide - a recording of a phone's
+   screen - is measured at up to 1080x1920 with the grid turned (40x64 points, 20x32 cells).
    * GPU (with Vulkan Video decoding): compute shaders (`src/vulkan/motion_pyramid.comp`, `motion_lk.comp`),
      the frames stay on the GPU and only the tracked points are read back.
    * CPU (`--decode ffmpeg` / `opencv`): OpenCV.
@@ -244,7 +245,8 @@ writes a copy of the video that shows what the motion analysis saw, frame by fra
 | text | the row of the frame: new / duplicate / torn, points used and rejected, animation step and the spread of its votes, animation error, framerate and perceived smoothness. With `--async-capture` also where a picture was lost |
 
 The video has the resolution the motion is measured at (the source divided by a whole number, 1920x1080 at
-most: 4K becomes 1080p) and the framerate of the source; the picture is darkened so the arrows stand out.
+most: 4K becomes 1080p; 1080x1920 at most for a video that is higher than wide: 1080x2400 becomes 540x1200)
+and the framerate of the source; the picture is darkened so the arrows stand out.
 `--arrow-scale 8` draws the arrows 8 times longer, for slow motion where they would be a pixel or two.
 With several input videos give one file each, comma separated; an empty name skips a video
 (`--motion-video ,b.mp4`).

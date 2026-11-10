@@ -1041,8 +1041,8 @@ private:
             push.level_offset[level] = layout.offset[level];
         }
         push.levels = layout.levels;
-        push.grid_x = kMotionPointsX;
-        push.grid_y = kMotionPointsY;
+        push.grid_x = static_cast<uint32_t>(layout.grid.points_x());
+        push.grid_y = static_cast<uint32_t>(layout.grid.points_y());
         push.iterations = kMotionIterations;
         push.max_residual = kMaxResidual;
         vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.pipeline);
@@ -1082,21 +1082,24 @@ private:
         if (detail) detail->clear();
         if (!frame.motion_estimated) return;
         field.estimated = true;
-        _binner.clear();
+        const MotionGrid & grid = frame.motion.grid;
+        const float points_x = static_cast<float>(grid.points_x());
+        const float points_y = static_cast<float>(grid.points_y());
+        _binner.clear(grid);
         const float * points = static_cast<const float *>(frame.motion_points.mapped);
-        for (int y = 0; y < kMotionPointsY; ++y)
+        for (int y = 0; y < grid.points_y(); ++y)
         {
-            for (int x = 0; x < kMotionPointsX; ++x)
+            for (int x = 0; x < grid.points_x(); ++x)
             {
-                const float * point = points + 4 * (y * kMotionPointsX + x);
+                const float * point = points + 4 * (y * grid.points_x() + x);
                 // (dx, dy, texture, distance by which the way back misses the point)
                 const bool texture = point[2] >= kMotionMinTexture && std::isfinite(point[0]) && std::isfinite(point[1]);
                 const bool returns = texture && point[3] <= kMotionMaxBackError;
                 if (detail)
                 {
                     MotionPoint tracked;
-                    tracked.x = (static_cast<float>(x) + 0.5f) * static_cast<float>(frame.motion.width[0]) / kMotionPointsX - 0.5f;
-                    tracked.y = (static_cast<float>(y) + 0.5f) * static_cast<float>(frame.motion.height[0]) / kMotionPointsY - 0.5f;
+                    tracked.x = (static_cast<float>(x) + 0.5f) * static_cast<float>(frame.motion.width[0]) / points_x - 0.5f;
+                    tracked.y = (static_cast<float>(y) + 0.5f) * static_cast<float>(frame.motion.height[0]) / points_y - 0.5f;
                     tracked.state = returns ? MotionPoint::Used : texture ? MotionPoint::Rejected : MotionPoint::NoTexture;
                     if (texture)
                     {
@@ -1106,7 +1109,7 @@ private:
                     detail->push_back(tracked);
                 }
                 if (!returns) continue;
-                _binner.add((static_cast<float>(x) + 0.5f) / kMotionPointsX, (static_cast<float>(y) + 0.5f) / kMotionPointsY, point[0], point[1]);
+                _binner.add((static_cast<float>(x) + 0.5f) / points_x, (static_cast<float>(y) + 0.5f) / points_y, point[0], point[1]);
             }
         }
         _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);

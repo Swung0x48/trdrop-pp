@@ -8,7 +8,7 @@ the desktop version.
 | --- | --- |
 | analysis | framerate, frametimes, tears, and the motion analysis (animation step, animation error, perceived smoothness), with the option for captures that are not in step with the game (`--async-capture`) |
 | charts | framerate and perceived smoothness over time, frametime distribution, animation error over time (with the spread of the votes) and its distribution. Drawn by the app itself (`charts/ChartView.kt`); touch a chart for its values, zoom with two fingers, double tap to reset. The Python scripts in `scripts/` draw the same from the CSV |
-| motion video | H.264 in MP4, played in the app, saved to the gallery (`Movies/trdrop`) or shared |
+| motion video | H.264 in MP4, played in the app (the controls are part of the page), saved to the gallery (`Movies/trdrop`) or shared. A recording of the phone's own screen (1080x2400) gives a 540x1200 video |
 | files | every analysis keeps its CSV, log and video in `Android/data/io.github.swung0x48.trdrop/files/analyses/<time>/`; the CSV can be shared |
 
 Android 8.0 or newer, arm64.

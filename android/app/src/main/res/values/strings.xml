@@ -52,6 +52,8 @@
     <string name="chart_error_histogram">Animation error distribution</string>
     <string name="chart_hint">Touch a chart for its values, zoom with two fingers, double tap to reset</string>
     <string name="motion_video">Motion video</string>
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
     <string name="share_video">Share</string>
     <string name="save_video">Save to gallery</string>
     <string name="saved_video">Saved to Movies/trdrop</string>

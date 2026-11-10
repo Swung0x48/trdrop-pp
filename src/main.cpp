@@ -80,7 +80,8 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
                                on it: an arrow per tracked point (colored by its length; they
                                stay, dimmed, on duplicate frames), a red x where a match was
                                rejected, and the values of the frame. At the resolution the
-                               motion is measured at (up to 1920x1080), H.264 in the container
+                               motion is measured at (up to 1920x1080, or 1080x1920 for a
+                               video higher than wide), H.264 in the container
                                the name asks for (.mp4, .mkv, .mov). One file per input video,
                                comma separated. With Vulkan Video decoding it is drawn and
                                encoded on the GPU, otherwise on the CPU

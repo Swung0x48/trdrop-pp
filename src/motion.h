@@ -12,6 +12,7 @@ namespace trdrop {
 
 //! The motion of a frame is kept per cell of a fine grid. Every cell with motion later has one vote on the
 //! animation step of the frame, so a moving part of the picture is enough (a cell is 1 / 640 of it).
+//! The grid of a frame that is wider than high; a higher one has it turned (see motion_grid).
 constexpr int kMotionGridX = 32;
 constexpr int kMotionGridY = 20;
 constexpr int kMotionCells = kMotionGridX * kMotionGridY;
@@ -20,8 +21,7 @@ constexpr int kMotionCells = kMotionGridX * kMotionGridY;
 //! it back ends at most kMotionMaxBackError pixels (of the measured resolution) from the point: wrong matches -
 //! repeating texture, motion too large - don't come back. A cell needs kMotionMinCellPoints of its points.
 constexpr int kMotionCellPoints = 2;
-constexpr int kMotionPointsX = kMotionCellPoints * kMotionGridX;
-constexpr int kMotionPointsY = kMotionCellPoints * kMotionGridY;
+constexpr int kMotionPoints = kMotionCellPoints * kMotionCellPoints * kMotionCells;
 constexpr float kMotionMinTexture = 1.0f; // smaller eigenvalue of the gradient matrix per pixel of the window
 constexpr float kMotionMaxBackError = 1.0f;
 constexpr size_t kMotionMinCellPoints = 2;
@@ -38,10 +38,26 @@ struct MotionField {
     std::array<uint8_t, kMotionCells> points {};
 };
 
+//! The grid of a frame: its longer side lies along the longer side of the frame, so cells and points are about
+//! as far apart in both directions on a high frame (a phone's screen) as on a wide one. The amount of cells
+//! is the same, a cell is just a number to everything that follows.
+struct MotionGrid {
+    int cells_x = kMotionGridX;
+    int cells_y = kMotionGridY;
+    int points_x() const { return kMotionCellPoints * cells_x; }
+    int points_y() const { return kMotionCellPoints * cells_y; }
+};
+MotionGrid motion_grid(int width, int height);
+
 //! collects the motion of tracked points and reduces it to the median per cell
 class MotionCellBinner {
 public:
-    void clear() { _points.clear(); }
+    //! starts a frame with this grid
+    void clear(const MotionGrid & grid)
+    {
+        _grid = grid;
+        _points.clear();
+    }
     //! x, y: position of the point relative to the frame (0 - 1), dx, dy: its motion
     void add(float x, float y, float dx, float dy);
     //! sets the cells with at least min_points points, their motion multiplied by scale
@@ -53,6 +69,7 @@ private:
         float dx;
         float dy;
     };
+    MotionGrid _grid;
     std::vector<Point> _points;
     std::vector<float> _values;
 };
@@ -82,13 +99,15 @@ struct MotionDetail {
     std::vector<MotionPoint> points;
 };
 
-//! the motion of a frame is measured at 1 / this of its resolution (at up to 1920x1080)
+//! the motion of a frame is measured at 1 / this of its resolution: at up to 1920x1080, or up to 1080x1920
+//! if the frame is higher than wide
 int motion_scale(int width, int height);
 //! size of MotionDetail::picture for a frame: the resolution the motion is measured at, made even
 cv::Size motion_picture_size(int width, int height);
 
 //! Measures the motion between consecutive frames on the CPU: the points of the grid are tracked from the
-//! previous frame into the current one and back (pyramidal Lucas-Kanade, sub pixel accurate) at up to 1920x1080.
+//! previous frame into the current one and back (pyramidal Lucas-Kanade, sub pixel accurate) at the resolution
+//! of motion_scale.
 class MotionEstimator {
 public:
     //! luma: 8-bit single channel frame in full resolution, points: if given, receives every point of the grid

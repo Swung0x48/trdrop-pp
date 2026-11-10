@@ -11,8 +11,8 @@ namespace trdrop {
 namespace {
 
 //! the motion is measured at up to this resolution
-constexpr double kMaxWidth = 1920.0;
-constexpr double kMaxHeight = 1080.0;
+constexpr double kMaxLongSide = 1920.0;
+constexpr double kMaxShortSide = 1080.0;
 //! reference motion of a cell: at least this speed (pixels per frame at the measured resolution) ...
 constexpr double kMinSpeed = 0.5;
 //! ... and tracked in this share of the new frames of the window
@@ -97,9 +97,9 @@ double weighted_median(std::pair<double, double> * begin, std::pair<double, doub
 
 void MotionCellBinner::add(float x, float y, float dx, float dy)
 {
-    const int cell_x = std::min(kMotionGridX - 1, std::max(0, static_cast<int>(x * kMotionGridX)));
-    const int cell_y = std::min(kMotionGridY - 1, std::max(0, static_cast<int>(y * kMotionGridY)));
-    _points.push_back({ static_cast<uint16_t>(cell_y * kMotionGridX + cell_x), dx, dy });
+    const int cell_x = std::min(_grid.cells_x - 1, std::max(0, static_cast<int>(x * static_cast<float>(_grid.cells_x))));
+    const int cell_y = std::min(_grid.cells_y - 1, std::max(0, static_cast<int>(y * static_cast<float>(_grid.cells_y))));
+    _points.push_back({ static_cast<uint16_t>(cell_y * _grid.cells_x + cell_x), dx, dy });
 }
 
 void MotionCellBinner::finish(MotionField & field, size_t min_points, float scale)
@@ -126,7 +126,17 @@ void MotionCellBinner::finish(MotionField & field, size_t min_points, float scal
 
 int motion_scale(int width, int height)
 {
-    return std::max(1, static_cast<int>(std::ceil(std::max(width / kMaxWidth, height / kMaxHeight) - 1e-9)));
+    // the limit lies as the frame does: a recording of a phone's screen is not a very high wide picture
+    const double long_side = std::max(width, height);
+    const double short_side = std::min(width, height);
+    return std::max(1, static_cast<int>(std::ceil(std::max(long_side / kMaxLongSide, short_side / kMaxShortSide) - 1e-9)));
+}
+
+MotionGrid motion_grid(int width, int height)
+{
+    MotionGrid grid;
+    if (height > width) std::swap(grid.cells_x, grid.cells_y);
+    return grid;
 }
 
 cv::Size motion_picture_size(int width, int height)
@@ -150,16 +160,17 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma, std::vector<MotionPo
     if (!_previous_pyramid.empty() && _previous_size == _current.size())
     {
         field.estimated = true;
+        const MotionGrid grid = motion_grid(_current.cols, _current.rows);
         if (_points.empty() || _points_size != _current.size())
         {
             _points_size = _current.size();
             _points.clear();
-            for (int y = 0; y < kMotionPointsY; ++y)
+            for (int y = 0; y < grid.points_y(); ++y)
             {
-                for (int x = 0; x < kMotionPointsX; ++x)
+                for (int x = 0; x < grid.points_x(); ++x)
                 {
-                    _points.emplace_back((static_cast<float>(x) + 0.5f) * static_cast<float>(_current.cols) / kMotionPointsX - 0.5f,
-                                         (static_cast<float>(y) + 0.5f) * static_cast<float>(_current.rows) / kMotionPointsY - 0.5f);
+                    _points.emplace_back((static_cast<float>(x) + 0.5f) * static_cast<float>(_current.cols) / static_cast<float>(grid.points_x()) - 0.5f,
+                                         (static_cast<float>(y) + 0.5f) * static_cast<float>(_current.rows) / static_cast<float>(grid.points_y()) - 0.5f);
                 }
             }
         }
@@ -169,7 +180,7 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma, std::vector<MotionPo
         cv::calcOpticalFlowPyrLK(_previous_pyramid, _current_pyramid, _points, _tracked, _status, _error, window, levels, criteria, 0, min_eigenvalue);
         // ... and back: a correct match returns to its point
         cv::calcOpticalFlowPyrLK(_current_pyramid, _previous_pyramid, _tracked, _back, _back_status, _error, window, levels, criteria, 0, min_eigenvalue);
-        _binner.clear();
+        _binner.clear(grid);
         if (points) points->resize(_points.size());
         for (size_t p = 0; p < _points.size(); ++p)
         {
