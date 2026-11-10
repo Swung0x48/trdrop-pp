@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -53,11 +54,26 @@ output:
 
 analysis (single value for all videos, or comma separated per video, e.g. 0,5,0):
       --pixel-diff <0-255>     grayscale difference a pixel may have without counting as
-                               different (default: 0)
+                               different (default: 0, lossy codecs: 4)
+      --tolerance-pct <%>      for lossy codecs (H.264, HEVC, ...), whose duplicate frames differ
+                               by compression noise: a frame only counts as new if more than
+                               this percentage of its pixels is different, a row with at most
+                               this percentage counts as unchanged
+                               (default: 0; lossy codecs: automatic, at least 0.5 and 5% of
+                               what new frames changed in the last 2 seconds)
       --dismiss-tear-pct <%>   tears smaller than this percentage of the frame height are
                                dismissed (default: 10)
       --source-fps <fps>       override the recorded framerate of the container
       --max-frames <n>         stop after n frames
+
+motion (smoothness of the animation, needs coherent motion like a moving camera):
+      --motion                 measure the motion between the frames and how evenly the
+                               animation advances: animation step, animation error and the
+                               perceived smoothness. On the GPU with Vulkan Video decoding,
+                               otherwise on the CPU
+      --motion-window <ms>     the motion of a frame is compared to the average motion in
+                               this window around it (default: 400, growing up to 2000 until
+                               it holds 16 new frames)
 
 backend:
       --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
@@ -87,6 +103,14 @@ per frame columns (vN = N-th input video):
   vN_fps           sum of vN_diff over the last second (ceil(recorded fps) frames)
   vN_frametime_ms  how long the last completed frame was shown
   vN_tears         amount of tears detected in this frame
+
+additional per frame columns with --motion:
+  vN_anim_step      how far the animation advanced since the previous frame, in display
+                    intervals (1 = the average around the frame); empty without usable motion
+  vN_anim_error_ms  new frames: animation step since the previous new frame minus the time
+                    that frame was displayed
+  vN_perceived_fps  perceived smoothness over the last second: the framerate of evenly paced
+                    motion that looks as smooth, fps * sum(step) / sum(step^2)
 
 tear columns:
   frame, video, row_a, row_b, video_height   (the tear is between row_a and row_b)
@@ -159,6 +183,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
 {
     PerVideoValue pixel_diff { "--pixel-diff", {} };
     PerVideoValue dismiss    { "--dismiss-tear-pct", {} };
+    PerVideoValue tolerance  { "--tolerance-pct", {} };
     PerVideoValue source_fps { "--source-fps", {} };
 
     bool only_inputs = false;
@@ -182,8 +207,19 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "-q" || arg == "--quiet") { options.quiet = true; }
         else if (arg == "--pixel-diff") { pixel_diff.values = split(next(), ','); }
         else if (arg == "--dismiss-tear-pct") { dismiss.values = split(next(), ','); }
+        else if (arg == "--tolerance-pct") { tolerance.values = split(next(), ','); }
         else if (arg == "--source-fps") { source_fps.values = split(next(), ','); }
         else if (arg == "--no-vk") { options.use_vulkan = false; }
+        else if (arg == "--motion") { options.motion = true; }
+        else if (arg == "--motion-window")
+        {
+            options.motion_window_ms = parse_double(next(), arg);
+            options.motion = true;
+            if (options.motion_window_ms < 50.0 || options.motion_window_ms > 5000.0)
+            {
+                throw std::invalid_argument("--motion-window must be between 50 and 5000 ms");
+            }
+        }
         else if (arg == "--decode")
         {
             options.decode = next();
@@ -247,6 +283,12 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         const long long value = parse_integer(text, "--pixel-diff");
         if (value < 0 || value > 255) throw std::invalid_argument("--pixel-diff must be between 0 and 255");
         v.pixel_difference = static_cast<int>(value);
+        v.pixel_difference_set = true;
+    });
+    apply_per_video(tolerance, options.videos, [](VideoOptions & v, const std::string & text) {
+        const double value = parse_double(text, "--tolerance-pct");
+        if (value < 0.0 || value >= 100.0) throw std::invalid_argument("--tolerance-pct must be >= 0 and < 100");
+        v.tolerance_pct = value;
     });
     apply_per_video(dismiss, options.videos, [](VideoOptions & v, const std::string & text) {
         const double value = parse_double(text, "--dismiss-tear-pct");
@@ -359,7 +401,8 @@ std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
 #else
         const bool vulkan_available = false;
 #endif
-        const DecoderChoice choice = choose_decoder(options.inputs, vulkan_available);
+        // with --motion the GPU also measures the motion, which is much slower on the CPU
+        const DecoderChoice choice = choose_decoder(options.inputs, vulkan_available, options.motion);
         std::string fallback_reason = choice.reason;
 #ifdef USE_VULKAN
         if (choice.decoder == "vulkan")
@@ -398,6 +441,7 @@ int run(const Options & options)
 {
     std::unique_ptr<FramePipeline> pipeline_owner = make_pipeline(options);
     FramePipeline & pipeline = *pipeline_owner;
+    if (options.motion) pipeline.enable_motion();
     const FramePipeline & sources = pipeline;
     const size_t video_count = sources.count();
 
@@ -417,16 +461,39 @@ int run(const Options & options)
         window_sizes.push_back(static_cast<int>(std::ceil(recorded - 1e-9)));
     }
 
+    // lossy codecs: duplicate frames differ by compression noise, tolerate it unless told otherwise
+    std::vector<VideoOptions> video_options = options.videos;
+    std::vector<std::string> automatic(video_count);
+    for (size_t i = 0; i < video_count; ++i)
+    {
+        VideoOptions & v = video_options[i];
+        const bool lossy = sources.lossy_codec(i);
+        if (lossy && !v.pixel_difference_set)
+        {
+            v.pixel_difference = kLossyPixelDifference;
+            automatic[i] = "pixel-diff";
+        }
+        if (v.tolerance_pct < 0.0)
+        {
+            v.tolerance_pct = lossy ? kLossyTolerancePct : 0.0;
+            v.tolerance_auto = lossy;
+            if (lossy) automatic[i] += automatic[i].empty() ? "tolerance-pct" : " and tolerance-pct";
+        }
+        if (!automatic[i].empty()) automatic[i] = ", " + automatic[i] + " set for the lossy codec";
+    }
+
     if (!options.quiet)
     {
         for (size_t i = 0; i < video_count; ++i)
         {
-            std::fprintf(stderr, "v%zu: %s (%dx%d, %s fps, %lld frames reported, pixel-diff %d, dismiss-tear-pct %s)\n"
+            std::fprintf(stderr, "v%zu: %s (%dx%d, %s, %s fps, %lld frames reported, pixel-diff %d, tolerance-pct %s, dismiss-tear-pct %s%s)\n"
                        , i + 1, options.inputs[i].c_str()
-                       , sources.frame_width(i), sources.frame_height(i)
+                       , sources.frame_width(i), sources.frame_height(i), sources.codec_name(i).c_str()
                        , format_number(recorded_framerates[i]).c_str(), sources.reported_frame_count(i)
-                       , options.videos[i].pixel_difference
-                       , format_number(options.videos[i].dismiss_tear_percentage).c_str());
+                       , video_options[i].pixel_difference
+                       , (video_options[i].tolerance_auto ? "auto" : format_number(video_options[i].tolerance_pct)).c_str()
+                       , format_number(video_options[i].dismiss_tear_percentage).c_str()
+                       , automatic[i].c_str());
         }
     }
 
@@ -454,6 +521,7 @@ int run(const Options & options)
     {
         const std::string prefix = "v" + std::to_string(i + 1) + "_";
         *output << ',' << prefix << "diff" << ',' << prefix << "fps" << ',' << prefix << "frametime_ms" << ',' << prefix << "tears";
+        if (options.motion) *output << ',' << prefix << "anim_step" << ',' << prefix << "anim_error_ms" << ',' << prefix << "perceived_fps";
     }
     *output << '\n';
 
@@ -464,6 +532,44 @@ int run(const Options & options)
     std::vector<RowCounts> row_counts;
     std::string line;
 
+    // --motion: the motion results of a frame need the frames after it, the rows wait for them
+    struct PendingRow {
+        long long frame = 0;
+        std::vector<std::string> columns; // per video, each starts with a comma
+    };
+    std::deque<PendingRow> pending_rows;
+    std::vector<MotionAnalyzer> motion_analyzers;
+    if (options.motion)
+    {
+        for (size_t i = 0; i < video_count; ++i) motion_analyzers.emplace_back(recorded_framerates[i], options.motion_window_ms);
+    }
+    auto write_ready_rows = [&]() {
+        while (!pending_rows.empty())
+        {
+            for (const MotionAnalyzer & motion : motion_analyzers)
+            {
+                if (!motion.ready()) return;
+            }
+            PendingRow & row = pending_rows.front();
+            line = std::to_string(row.frame);
+            for (size_t i = 0; i < video_count; ++i)
+            {
+                MotionSample sample;
+                motion_analyzers[i].pop(sample);
+                line += row.columns[i];
+                line += ',';
+                if (sample.measurable) line += format_number(sample.step);
+                line += ',';
+                if (sample.has_error) line += format_number(sample.error_ms);
+                line += ',';
+                if (sample.has_perceived_fps) line += format_number(sample.perceived_fps);
+            }
+            line += '\n';
+            *output << line;
+            pending_rows.pop_front();
+        }
+    };
+
     using Clock = std::chrono::steady_clock;
     const Clock::time_point start_time = Clock::now();
     Clock::duration analysis_time {};
@@ -473,7 +579,7 @@ int run(const Options & options)
     auto emit_frame = [&]() {
         pipeline.collect(row_counts);
         const Clock::time_point analyzer_start = Clock::now();
-        analyzer.process(row_counts, options.videos);
+        analyzer.process(row_counts, video_options);
         analysis_time += Clock::now() - analyzer_start;
 
         const std::vector<double> framerates = analyzer.framerates();
@@ -491,14 +597,22 @@ int run(const Options & options)
             }
         }
 
-        line = std::to_string(frame);
+        PendingRow row;
+        row.frame = frame;
+        row.columns.resize(video_count);
         for (size_t i = 0; i < video_count; ++i)
         {
-            line += ',';
-            if (analyzer.has_difference()) line += format_number(differences[i]);
-            line += ',' + format_number(framerates[i]);
-            line += ',' + format_number(frametimes[i]);
-            line += ',' + std::to_string(tears_per_video[i]);
+            std::string & column = row.columns[i];
+            column = ',';
+            if (analyzer.has_difference()) column += format_number(differences[i]);
+            column += ',' + format_number(framerates[i]);
+            column += ',' + format_number(frametimes[i]);
+            column += ',' + std::to_string(tears_per_video[i]);
+            if (options.motion)
+            {
+                motion_analyzers[i].push(row_counts[i].motion, analyzer.has_difference() && differences[i] == 0.0
+                                       , analyzer.has_difference() ? analyzer.last_changed_shares()[i] : 1.0);
+            }
 
             if (!analyzer.has_difference()) continue;
             VideoStats & s = stats[i];
@@ -524,20 +638,32 @@ int run(const Options & options)
                 }
             }
         }
-        line += '\n';
-        *output << line;
+        if (options.motion)
+        {
+            pending_rows.push_back(std::move(row));
+            write_ready_rows();
+        }
+        else
+        {
+            line = std::to_string(row.frame);
+            for (const std::string & column : row.columns) line += column;
+            line += '\n';
+            *output << line;
+        }
         ++frame;
     };
 
     // the pipeline may work on a set of frames while the next one is decoded
     long long submitted = 0;
-    while ((options.max_frames == 0 || submitted < options.max_frames) && pipeline.submit_next(options.videos))
+    while ((options.max_frames == 0 || submitted < options.max_frames) && pipeline.submit_next(video_options))
     {
         ++submitted;
         if (pipeline.pending() >= pipeline.max_pending()) emit_frame();
         progress.update(sources);
     }
     while (pipeline.pending() > 0) emit_frame();
+    for (MotionAnalyzer & motion : motion_analyzers) motion.finish();
+    write_ready_rows();
     progress.update(sources, true);
     progress.finish();
     output->flush();
@@ -570,6 +696,22 @@ int run(const Options & options)
             if (s.frametime_samples > 0)
             {
                 std::fprintf(stderr, " | frametime avg %.2f ms max %.2f ms", s.frametime_sum / s.frametime_samples, s.frametime_max);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        for (size_t i = 0; i < motion_analyzers.size(); ++i)
+        {
+            const MotionAnalyzer::Summary m = motion_analyzers[i].summary();
+            const double measurable = m.frames > 0 ? 100.0 * static_cast<double>(m.measurable_frames) / static_cast<double>(m.frames) : 0.0;
+            std::fprintf(stderr, "v%zu motion: usable in %.1f%% of the frames", i + 1, measurable);
+            if (m.animation_frames > 0)
+            {
+                std::fprintf(stderr, " | %.2f new frames/s | perceived smoothness %.2f fps | animation error avg %.2f ms p95 %.2f ms max %.2f ms"
+                           , m.motion_fps, m.perceived_fps, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms);
+            }
+            else
+            {
+                std::fprintf(stderr, " | not enough coherent motion to measure the animation");
             }
             std::fprintf(stderr, "\n");
         }

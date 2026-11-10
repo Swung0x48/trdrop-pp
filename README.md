@@ -4,7 +4,7 @@ Command line version of [trdrop](https://github.com/cirquit/trdrop), a raw video
 It estimates the *real* framerate and frametime of an uncompressed capture and detects frame tears,
 using the same algorithms as the original GUI, and writes the raw per frame data as CSV.
 
-No Qt dependency. The only dependency is OpenCV (`core`, `imgproc`, `videoio`).
+No Qt dependency. The only dependency is OpenCV (`core`, `imgproc`, `videoio`, `video`).
 Optionally the per pixel work runs on the GPU via Vulkan ([build with `-DUSE_VULKAN=ON`](#vulkan-gpu-acceleration)),
 and HEVC / H.264 captures (e.g. OBS / NVENC recordings) are decoded on the GPU as well ([`-DUSE_FFMPEG=ON`](#ffmpeg--vulkan-video-gpu-decoding)).
 The overlay rendering / image sequence export of the GUI is intentionally not part of the CLI.
@@ -19,10 +19,13 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | --- | --- |
 | `-o, --output <file>` | per frame CSV (default / `-`: stdout) |
 | `--tears <file>` | additional CSV with one row per detected tear |
-| `--pixel-diff <0-255>` | grayscale difference a pixel may have without counting as different (default `0`) |
+| `--pixel-diff <0-255>` | grayscale difference a pixel may have without counting as different (default `0`, lossy codecs `4`) |
+| `--tolerance-pct <%>` | for [lossy codecs](#lossy-recordings): a frame only counts as new if more than this percentage of its pixels is different (default `0`, lossy codecs: automatic) |
 | `--dismiss-tear-pct <%>` | tears smaller than this percentage of the frame height are dismissed (default `10`) |
 | `--source-fps <fps>` | override the recorded framerate of the container |
 | `--max-frames <n>` | stop after n frames |
+| `--motion` | [motion analysis](#motion-analysis---motion): animation step, animation error and perceived smoothness |
+| `--motion-window <ms>` | fixed length of the window the motion of a frame is compared to (default: 400, longer for low framerates) |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
@@ -30,15 +33,15 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--list-vkdevices` | list the Vulkan devices with their `--vkdevice` index and exit. Vulkan builds only |
 | `--decode <mode>` | `auto` (default: the fastest), `vulkan`, `ffmpeg` or `opencv`, see [GPU decoding](#ffmpeg--vulkan-video-gpu-decoding). FFmpeg builds only |
 
-`--pixel-diff`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
+`--pixel-diff`, `--tolerance-pct`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
 comma separated values per video, e.g. `--pixel-diff 0,5,0`.
 
 Only the CSV is written to stdout, progress / input info / summary go to stderr, so the output
 can be piped directly into the [plot scripts](#plotting).
 
 Up to 3 videos are read in lockstep; the analysis stops when the shortest video ends.
-Use lossless captures: with lossy codecs (h264, mjpeg, ...) compression noise makes nearly every
-frame "different" unless `--pixel-diff` is raised.
+Lossless captures give exact results. Lossy recordings (H.264, HEVC, ...) are detected and analyzed
+with a tolerance, see [lossy recordings](#lossy-recordings).
 
 ### Example
 
@@ -47,10 +50,10 @@ trdrop-pp fixtures/stutter.avi -o stutter.csv --tears stutter_tears.csv
 ```
 
 ```
-v1: fixtures/stutter.avi (320x180, 60 fps, 240 frames reported, pixel-diff 0, dismiss-tear-pct 10)
-backend: vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
+v1: fixtures/stutter.avi (320x180, FFV1, 60 fps, 240 frames reported, pixel-diff 0, tolerance-pct 0, dismiss-tear-pct 10)
+backend: opencv decode, vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
 frame 240 (100.0%)
-analyzed 240 frames in 0.34 s (703.7 fps) | analysis 15.1 ms (0.063 ms/frame) | vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
+analyzed 240 frames in 0.35 s (681.2 fps) | analysis 13.1 ms (0.055 ms/frame) | opencv decode, vulkan (NVIDIA GeForce RTX 4070 SUPER, device 0)
 v1: effective 29.87 fps | new 119, duplicate 120, torn 0 (0 tears) | fps avg 29.99 min 29.00 max 31.00 | frametime avg 33.52 ms max 50.00 ms
 ```
 
@@ -89,6 +92,114 @@ Per video: effective framerate over the whole clip (`sum(diff) / compared frames
 counts of new / duplicate / torn frames and the min / avg / max of the rolling framerate and frametime
 after the first full one second window.
 
+### Lossy recordings
+
+The original algorithm counts a frame as new as soon as a single pixel is different. That is right for
+lossless captures, but a lossy encoder changes pixels of identical source frames (noise, and blocks
+predicted from the next frame), so nearly every frame would count as new - e.g. a 4K H.264 recording
+whose picture only changed every 4th frame was reported with 58 instead of 14 fps.
+
+`--tolerance-pct <%>`: a frame only counts as new if more than this percentage of its pixels is
+different (by more than `--pixel-diff`); for the tear detection a row with at most this percentage of
+different pixels counts as unchanged. `0` is the original behaviour.
+
+Without the option the codec decides (printed in the `vN:` line):
+
+* lossless codecs (FFV1, HuffYUV, Ut Video, MagicYUV, raw, ...): `--tolerance-pct 0`, as before
+* lossy codecs: `--pixel-diff 4` (unless given) and an automatic tolerance: at least 0.5%, and 5% of
+  what a new frame recently changed (the 90th percentile of the changed pixels per frame over the last
+  2 seconds). The relative part is needed for fast motion, where a few percent of the next frame leak
+  into duplicate frames, while a fixed high value would hide the small changes of a static scene.
+  Rows always use 0.5%.
+
+  Checked against a lossless capture with 271 duplicates in 899 frames (41.9 fps): its 100 Mbit/s HEVC
+  version gives 281 duplicates (41.1 fps) - and 0 duplicates (60 fps) with the original rule.
+
+H.264 / HEVC / AV1 are always treated as lossy, also if they were encoded in a lossless mode
+(pass `--tolerance-pct 0 --pixel-diff 0` then). The automatic values are heuristics: after fast motion
+small real changes may count as duplicates for up to 2 seconds, and tears can't be detected reliably
+in lossy recordings.
+
+## Motion analysis (`--motion`)
+
+The framerate only counts new frames. `--motion` also measures how evenly the animation advances,
+i.e. whether the video looks smooth. It needs coherent motion (a moving camera, scrolling, driving);
+for a static camera it only reports that the motion isn't usable.
+
+```
+trdrop-pp capture.mkv --motion -o capture.csv
+python scripts/smoothness.py capture.csv --fps 60 -o smoothness.png
+```
+
+How it works:
+
+1. Motion vectors between consecutive frames, sub pixel accurate (pyramidal Lucas-Kanade on the luma at up
+   to 1920x1080), reduced to the median vector per cell of an 8x5 grid:
+   * GPU (with Vulkan Video decoding): a regular grid of 64x40 points is tracked by compute shaders
+     (`src/vulkan/motion_pyramid.comp`, `motion_lk.comp`), the frames stay on the GPU and only the tracked
+     points are read back. Points without texture or whose surroundings don't match afterwards are dropped.
+   * CPU (`--decode ffmpeg` / `opencv`): up to 800 corners are tracked with OpenCV.
+2. Animation step of a frame: the common scale of its motion field relative to the average motion field
+   in a window around it (triangular weights): `m_cell = step * v_cell`. It is the weighted median over the
+   cells of `m.v / |v|^2`, so pans, forward motion (the cells move in different directions) and static
+   overlays work. `1` means the frame advanced as much as a display interval does on average, `0` a
+   duplicate, `2` twice as much. If the cells disagree (their median deviation is more than 20% of the
+   step: turns, cuts, moving objects) the frame isn't used.
+   The window is 400 ms and grows up to 2 seconds until it holds 16 new frames: with a low framerate a
+   short window only holds a few steps, their average follows them and hides their differences.
+   `--motion-window <ms>` sets a fixed length.
+3. Animation error of a new frame: its animation step (summed since the previous new frame) minus the
+   time that frame was displayed, in ms. A 30 fps animation in a 60 fps video has no error (step 2 after
+   2 intervals); steps of 0.5 / 1.5 intervals have -8.3 / +8.3 ms.
+4. Perceived smoothness: `fps * sum(step) / sum(step^2)` - the framerate of evenly paced motion that
+   looks as smooth. It equals the framerate of the new frames if they are evenly paced and drops with
+   uneven steps (30 new frames per second with steps 1, 3, 1, 3: 24 fps).
+
+Additional CSV columns (empty where not available):
+
+| column | meaning |
+| --- | --- |
+| `vN_anim_step` | animation step of the frame in display intervals; empty without usable motion |
+| `vN_anim_error_ms` | new frames: animation error |
+| `vN_perceived_fps` | perceived smoothness over the last second |
+
+and a summary line per video:
+
+```
+v1 motion: usable in 99.6% of the frames | 60.00 new frames/s | perceived smoothness 47.90 fps | animation error avg 8.34 ms p95 8.61 ms max 11.17 ms
+```
+
+Accuracy with known answers (H.264 versions of the [fixtures](#tests); GPU and CPU agree within 0.1 fps / 0.1 ms):
+
+| video | expected | measured |
+| --- | --- | --- |
+| even pan / forward motion | 60 fps, error 0 | 59.9 / 59.7 fps, avg 0.1 ms |
+| new frame every 2nd frame | 30 fps, error 0 | 29.98 fps, avg 0.3 ms |
+| steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 47.90 fps, avg 8.34 ms |
+| freeze of 5 frames, time lost | one error of -83.3 ms | -76.4 ms |
+| new frame every 4th frame, steps of 3 / 4 / 5 intervals, fast pan / forward motion | 14.55 fps, errors -16.7 / 0 / +16.7 ms | 14.6 fps, the errors are off by 2.4 ms on average |
+
+Speed with the motion analysis (decoding + comparison + motion, RTX 4070 SUPER / i7-14700KF):
+
+| video | CPU (`--decode ffmpeg`) | GPU (default) |
+| --- | --- | --- |
+| 4K H.264 recordings | 85 - 93 fps | 236 - 244 fps |
+| 1440p HEVC capture | 151 fps | 846 fps |
+
+Limits:
+
+* A frame is compared to the average motion around it, which assumes that the real motion changes slowly
+  within the window. Hard stops look like errors; around a freeze the neighbouring frames get a few ms of
+  error (the freeze lowers the average).
+* The summary of real recordings depends on which frames are usable, and the perceived smoothness reacts
+  strongly to single long steps. On a 4K driving recording (15 fps content in 60 fps) the steps of the GPU
+  and CPU implementation agree on the frames both can use (correlation 0.995), but the CPU uses 69% of the
+  frames and reports 12.1 fps, the GPU 61% and 14.6 fps. Treat differences of that size as noise.
+* It can't tell whether uneven steps come from the game or from the recording.
+* The GPU path needs Vulkan Video decoding (`--decode vulkan`, or `auto`, which prefers it with `--motion`);
+  other sources (e.g. lossless RGB) are measured on the CPU, about 10 ms per 4K frame.
+* The rows of the CSV are written with a delay of up to one second (the look ahead of the window).
+
 ## Plotting
 
 `scripts/` contains two matplotlib scripts that read the per frame CSV, either from a file or
@@ -106,6 +217,7 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | --- | --- |
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
+| `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time and as histogram |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).
 Frametimes are multiples of `1000 / recorded fps`, so by default every distinct value gets its own bar;
@@ -142,7 +254,7 @@ Differences to the GUI:
 
 ## Building
 
-Requirements: CMake >= 3.21, a C++17 compiler and OpenCV 4.
+Requirements: CMake >= 3.21, a C++17 compiler and OpenCV 4 (`core`, `imgproc`, `videoio`, `video`).
 
 ### Windows (MSVC)
 
@@ -280,10 +392,16 @@ lossless test videos with a known pattern:
 | `stutter.avi` | frames held 1, 2, 3, 2, ... frames | ~30 fps, 16.7 - 50 ms |
 | `tear.avi` | 30 fps content, every new frame first appears torn at 40% | 30 fps, diffs 0.6 / 0.4, tear at row 71/72 |
 | `60.avi` | every frame new | 60 fps, 16.7 ms |
+| `motion_even.avi` | `--motion`: a texture panning evenly | step 1, error 0, perceived 60 fps |
+| `motion_30in60.avi` | pan, new frame every 2nd frame | step 2, error 0, perceived 30 fps |
+| `motion_uneven.avi` | pan, the frames advance by 0.5 / 1.5 intervals | error -8.3 / +8.3 ms, perceived 48 fps |
+| `motion_hitch.avi` | pan, frames 100-104 freeze (time lost), frames 170-173 freeze and 174 catches up | error -83.3 ms at frame 105, step 5 without error at 174 |
+| `motion_zoom.avi` | forward motion (zoom), even | step 1, error 0, perceived 60 fps |
 
 ```
 build/trdrop_make_fixtures test-out/fixtures
 build/trdrop-pp test-out/fixtures/tear.avi --tears test-out/tears.csv
+build/trdrop-pp test-out/fixtures/motion_uneven.avi --motion -o motion.csv
 ```
 
 ## License

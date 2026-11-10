@@ -8,7 +8,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-_COLUMN = re.compile(r"^v(\d+)_(diff|fps|frametime_ms|tears)$")
+_COLUMN = re.compile(r"^v(\d+)_(diff|fps|frametime_ms|tears|anim_step|anim_error_ms|perceived_fps)$")
 
 
 @dataclass
@@ -21,6 +21,10 @@ class Video:
     fps: list = field(default_factory=list)
     frametime_ms: list = field(default_factory=list)
     tears: list = field(default_factory=list)
+    # only with trdrop-pp --motion, NaN where not available
+    anim_step: list = field(default_factory=list)
+    anim_error_ms: list = field(default_factory=list)
+    perceived_fps: list = field(default_factory=list)
 
 
 @dataclass

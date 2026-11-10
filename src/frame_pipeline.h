@@ -27,6 +27,10 @@ public:
     //! waits for the oldest submission, one entry per video
     virtual void collect(std::vector<RowCounts> & out) = 0;
 
+    //! also measure the motion between the frames (RowCounts::motion), has to be called before the first
+    //! submit_next(). throws std::runtime_error if the pipeline can't do it
+    virtual void enable_motion();
+
     //! main thread time spent in the comparison (without decoding), < 0 if decoding and
     //! comparison can't be separated (both run on the GPU)
     virtual double analysis_seconds() const = 0;
@@ -41,6 +45,10 @@ public:
     virtual int frame_height(size_t index) const = 0;
     //! sets of frames submitted so far
     virtual long long frames_read() const = 0;
+    //! short name of the video codec (e.g. h264, ffv1)
+    virtual std::string codec_name(size_t index) const = 0;
+    //! true if the codec is (or may be) lossy, i.e. identical source frames may decode to slightly different frames
+    virtual bool lossy_codec(size_t index) const = 0;
 
     //! progress of the shortest video, 0 .. 1 (or < 0 if unknown)
     double progress() const;
@@ -60,7 +68,8 @@ struct DecoderChoice {
     std::string reason;
 };
 //! vulkan_available: Vulkan Video decoding may be used (Vulkan build, not --no-vk)
-DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available);
+//! prefer_gpu: the GPU does more than the comparison (motion), use it whenever it can decode
+DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available, bool prefer_gpu);
 #endif
 
 #if defined(USE_FFMPEG) && defined(USE_VULKAN)

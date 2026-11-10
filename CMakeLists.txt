@@ -14,7 +14,7 @@ option(USE_VULKAN "Build the Vulkan (GPU) accelerated backend (needs the Vulkan 
 option(USE_FFMPEG "Decode with FFmpeg directly, with USE_VULKAN on the GPU via Vulkan Video (needs FFmpeg >= 8.0)" OFF)
 set(FFMPEG_DIR "" CACHE PATH "FFmpeg development files (include/, lib/, bin/), otherwise pkg-config is used")
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio video)
 
 function(trdrop_warnings target)
     if(MSVC)
@@ -31,6 +31,7 @@ add_executable(trdrop-pp
     src/frame_analyzer.cpp
     src/diff_engine_cpu.cpp
     src/opencv_pipeline.cpp
+    src/motion.cpp
 )
 target_include_directories(trdrop-pp PRIVATE src)
 target_link_libraries(trdrop-pp PRIVATE ${OpenCV_LIBS})
@@ -107,7 +108,9 @@ if(USE_FFMPEG)
     target_compile_definitions(trdrop-pp PRIVATE USE_FFMPEG=1)
     if(USE_VULKAN)
         trdrop_shader(yuv_diff _yuv_shader_inc)
-        target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}")
+        trdrop_shader(motion_pyramid _pyramid_shader_inc)
+        trdrop_shader(motion_lk _lk_shader_inc)
+        target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}" "${_pyramid_shader_inc}" "${_lk_shader_inc}")
         message(STATUS "trdrop-pp: FFmpeg decoding enabled (with Vulkan Video)")
     else()
         message(STATUS "trdrop-pp: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")

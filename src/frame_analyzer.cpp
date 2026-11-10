@@ -73,6 +73,8 @@ FrameAnalyzer::FrameAnalyzer(const std::vector<int> & recorded_framerates)
         _current_framecount.push_back(0);
     }
     _last_differences.assign(kMaxVideoCount, 0.0);
+    _last_changed_shares.assign(kMaxVideoCount, 0.0);
+    _share_history.resize(kMaxVideoCount);
 }
 
 void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std::vector<VideoOptions> & video_options)
@@ -98,6 +100,7 @@ void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std
         {
             _frame_diff_lists[i][_current_framecount[i]] = 1.0;
             _last_differences[i] = 1.0;
+            _last_changed_shares[i] = 1.0;
             continue;
         }
         // normalized amount of different pixels per row (0.0 - 1.0),
@@ -105,9 +108,37 @@ void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std
         const int rows = static_cast<int>(counts.counts.size());
         _row_differences.assign(counts.counts.size(), 0.0);
         const double normalization = 255.0 * static_cast<double>(counts.cols);
+        long long changed_pixels = 0;
         for (size_t row = 0; row < counts.counts.size(); ++row)
         {
             _row_differences[row] = static_cast<double>(static_cast<long long>(counts.counts[row]) * 255) / normalization;
+            changed_pixels += counts.counts[row];
+        }
+        const double pixels = static_cast<double>(counts.cols) * static_cast<double>(std::max(1, rows));
+        _last_changed_shares[i] = pixels > 0.0 ? static_cast<double>(changed_pixels) / pixels : 0.0;
+
+        // lossy codecs: compression noise changes a few pixels of identical source frames. The frame
+        // (and for the tear detection every row) only counts as changed above the tolerance
+        const double row_tolerance = std::max(0.0, video_options[i].tolerance_pct) / 100.0;
+        double tolerance = row_tolerance;
+        if (video_options[i].tolerance_auto)
+        {
+            // relative to what a new frame changed recently: 90th percentile of the last 2 seconds
+            std::deque<double> & history = _share_history[i];
+            history.push_back(_last_changed_shares[i]);
+            if (history.size() > std::max<size_t>(2, 2 * _frame_diff_lists[i].size())) history.pop_front();
+            _sorted_shares.assign(history.begin(), history.end());
+            const auto reference = _sorted_shares.begin() + static_cast<std::ptrdiff_t>(0.9 * static_cast<double>(_sorted_shares.size() - 1));
+            std::nth_element(_sorted_shares.begin(), reference, _sorted_shares.end());
+            tolerance = std::max(tolerance, kAutoToleranceRelative * *reference);
+        }
+        if (tolerance > 0.0)
+        {
+            const bool frame_changed = _last_changed_shares[i] > tolerance;
+            for (double & row_difference : _row_differences)
+            {
+                if (!frame_changed || row_difference <= row_tolerance) row_difference = 0.0;
+            }
         }
 
         const double dismiss_tear_percentage = video_options[i].dismiss_tear_percentage / 100.0;

@@ -67,6 +67,8 @@ public:
     int height() const;
 
     std::string codec_name() const;
+    //! true if the codec is (or may be) lossy
+    bool lossy() const;
     //! true if the decoder was asked for hardware frames but didn't get them
     bool hardware_refused() const { return _hardware_refused; }
 

@@ -1,0 +1,128 @@
+#version 450
+// Motion of a regular grid of points between two frames: pyramidal Lucas-Kanade, sub pixel accurate.
+// One workgroup per point, one invocation per pixel of its 15x15 window; the sums over the window
+// are reduced in shared memory. For every level from coarse to fine:
+//   G = sum(grad grad^T) of the previous frame around the point
+//   repeat: b = sum(grad * (previous(x) - current(x + d))),  d += G^-1 b
+//
+// Level L + 1 is the 2x2 box filtered level L, so a position p of level 0 is (p + 0.5) / 2^L - 0.5 at level L.
+// Output per point: d in pixels of level 0, the smaller eigenvalue of G / N at level 0 (texture), the
+// mean absolute difference of the last iteration.
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Previous { float previous[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer Current  { float current[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Points   { vec4 points[]; };
+
+layout(push_constant) uniform Parameters {
+    uvec4 level_width;
+    uvec4 level_height;
+    uvec4 level_offset;
+    uint levels;
+    uint grid_x;
+    uint grid_y;
+    uint iterations;
+} params;
+
+const int kRadius = 7;
+const uint kWindow = 15u;
+const uint kSamples = kWindow * kWindow;
+
+shared vec4 sums[256];
+shared vec2 flow;
+
+float previous_pixel(uint level, ivec2 p)
+{
+    const ivec2 size = ivec2(params.level_width[level], params.level_height[level]);
+    p = clamp(p, ivec2(0), size - 1);
+    return previous[params.level_offset[level] + uint(p.y) * uint(size.x) + uint(p.x)];
+}
+
+float current_pixel(uint level, ivec2 p)
+{
+    const ivec2 size = ivec2(params.level_width[level], params.level_height[level]);
+    p = clamp(p, ivec2(0), size - 1);
+    return current[params.level_offset[level] + uint(p.y) * uint(size.x) + uint(p.x)];
+}
+
+//! bilinear
+float current_sample(uint level, vec2 p)
+{
+    const vec2 base = floor(p);
+    const vec2 f = p - base;
+    const ivec2 i = ivec2(base);
+    const float top = mix(current_pixel(level, i), current_pixel(level, i + ivec2(1, 0)), f.x);
+    const float bottom = mix(current_pixel(level, i + ivec2(0, 1)), current_pixel(level, i + ivec2(1, 1)), f.x);
+    return mix(top, bottom, f.y);
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint point = gl_WorkGroupID.x;
+    const bool in_window = lane < kSamples;
+    const ivec2 offset = ivec2(int(lane % kWindow), int(lane / kWindow)) - kRadius;
+
+    // center of the point at level 0
+    const vec2 grid = vec2(float(point % params.grid_x), float(point / params.grid_x));
+    const vec2 center0 = (grid + 0.5) * vec2(params.level_width[0], params.level_height[0]) / vec2(params.grid_x, params.grid_y) - 0.5;
+
+    if (lane == 0u) flow = vec2(0.0);
+    barrier();
+
+    float texture_strength = 0.0;
+    float residual = 0.0;
+    for (int level = int(params.levels) - 1; level >= 0; --level)
+    {
+        // the window is sampled at whole pixels of the previous frame
+        const ivec2 center = ivec2(round((center0 + 0.5) / float(1 << level) - 0.5));
+        const ivec2 p = center + offset;
+        const float value = previous_pixel(uint(level), p);
+        const float gx = 0.5 * (previous_pixel(uint(level), p + ivec2(1, 0)) - previous_pixel(uint(level), p - ivec2(1, 0)));
+        const float gy = 0.5 * (previous_pixel(uint(level), p + ivec2(0, 1)) - previous_pixel(uint(level), p - ivec2(0, 1)));
+
+        sums[lane] = in_window ? vec4(gx * gx, gx * gy, gy * gy, 0.0) : vec4(0.0);
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride) sums[lane] += sums[lane + stride];
+            barrier();
+        }
+        const vec3 g = sums[0].xyz;
+        const float determinant = g.x * g.z - g.y * g.y;
+        barrier(); // everybody has read sums[0] before it is written again
+
+        for (uint iteration = 0u; iteration < params.iterations; ++iteration)
+        {
+            const float difference = value - current_sample(uint(level), vec2(p) + flow);
+            barrier(); // everybody has read the flow before lane 0 updates it
+            sums[lane] = in_window ? vec4(difference * gx, difference * gy, abs(difference), 0.0) : vec4(0.0);
+            barrier();
+            for (uint stride = 128u; stride > 0u; stride >>= 1u)
+            {
+                if (lane < stride) sums[lane] += sums[lane + stride];
+                barrier();
+            }
+            if (lane == 0u)
+            {
+                const vec3 b = sums[0].xyz;
+                residual = b.z / float(kSamples);
+                if (determinant > 1e-3)
+                {
+                    const vec2 delta = vec2(g.z * b.x - g.y * b.y, g.x * b.y - g.y * b.x) / determinant;
+                    flow += clamp(delta, vec2(-float(kRadius)), vec2(float(kRadius)));
+                }
+            }
+            barrier();
+        }
+
+        if (lane == 0u)
+        {
+            if (level > 0) flow *= 2.0;
+            else texture_strength = 0.5 * (g.x + g.z - sqrt((g.x - g.z) * (g.x - g.z) + 4.0 * g.y * g.y)) / float(kSamples);
+        }
+        barrier();
+    }
+    if (lane == 0u) points[point] = vec4(flow, texture_strength, residual);
+}

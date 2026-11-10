@@ -19,6 +19,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -38,8 +39,85 @@ const uint32_t kYuvDiffSpirv[] = {
 #include "yuv_diff.spv.inc"
 };
 
+const uint32_t kMotionPyramidSpirv[] = {
+#include "motion_pyramid.spv.inc"
+};
+
+const uint32_t kMotionLkSpirv[] = {
+#include "motion_lk.spv.inc"
+};
+
 //! sets of frames in flight
 constexpr size_t kSlots = 3;
+
+//! must match motion_pyramid.comp
+struct PyramidPush {
+    uint32_t mode;
+    uint32_t factor;
+    uint32_t src_width;
+    uint32_t src_height;
+    uint32_t src_base;
+    uint32_t dst_width;
+    uint32_t dst_height;
+    uint32_t dst_offset;
+};
+
+constexpr uint32_t kMaxMotionLevels = 4;
+
+//! must match motion_lk.comp
+struct LkPush {
+    uint32_t level_width[kMaxMotionLevels];
+    uint32_t level_height[kMaxMotionLevels];
+    uint32_t level_offset[kMaxMotionLevels];
+    uint32_t levels;
+    uint32_t grid_x;
+    uint32_t grid_y;
+    uint32_t iterations;
+};
+
+//! the motion is measured at a regular grid of points (a multiple of the cell grid), at up to 1920x1080
+constexpr uint32_t kMotionPointsX = 8 * kMotionGridX;
+constexpr uint32_t kMotionPointsY = 8 * kMotionGridY;
+constexpr uint32_t kMotionPoints = kMotionPointsX * kMotionPointsY;
+constexpr uint32_t kMotionIterations = 5;
+constexpr uint32_t kMotionGroupSize = 256; // local_size_x of motion_lk.comp
+//! a point is used if its window has texture in both directions (smaller eigenvalue of the gradient
+//! matrix per pixel) and the frames match there after the tracking (mean absolute difference)
+constexpr float kMinTexture = 1.0f;
+constexpr float kMaxResidual = 12.0f;
+//! a cell needs this many of its 64 points
+constexpr size_t kMinCellPoints = 6;
+
+//! pyramid of the luma plane a frame's motion is measured on
+struct MotionLayout {
+    uint32_t scale = 1;
+    uint32_t levels = 0;
+    uint32_t width[kMaxMotionLevels] = {};
+    uint32_t height[kMaxMotionLevels] = {};
+    uint32_t offset[kMaxMotionLevels] = {};
+    VkDeviceSize bytes = 0;
+};
+
+MotionLayout motion_layout(int width, int height)
+{
+    MotionLayout layout;
+    layout.scale = static_cast<uint32_t>(std::max(1.0, std::ceil(std::max(width / 1920.0, height / 1080.0) - 1e-9)));
+    uint32_t w = static_cast<uint32_t>(width) / layout.scale;
+    uint32_t h = static_cast<uint32_t>(height) / layout.scale;
+    uint32_t offset = 0;
+    while (layout.levels < kMaxMotionLevels && (layout.levels == 0 || std::min(w, h) >= 32))
+    {
+        layout.width[layout.levels] = w;
+        layout.height[layout.levels] = h;
+        layout.offset[layout.levels] = offset;
+        offset += w * h;
+        w = (w + 1) / 2;
+        h = (h + 1) / 2;
+        ++layout.levels;
+    }
+    layout.bytes = static_cast<VkDeviceSize>(offset) * sizeof(float);
+    return layout;
+}
 
 //! must match yuv_diff.comp
 struct PushConstants {
@@ -108,6 +186,8 @@ public:
             if (created < 0) throw std::runtime_error("FFmpeg could not create a Vulkan device (" + ffmpeg::error_string(created) + ")");
             _load_device();
             _create_pipeline();
+            _pyramid = _create_compute(kMotionPyramidSpirv, sizeof(kMotionPyramidSpirv), 2, sizeof(PyramidPush));
+            _lk = _create_compute(kMotionLkSpirv, sizeof(kMotionLkSpirv), 3, sizeof(LkPush));
             _create_slots();
             for (size_t i = 0; i < paths.size(); ++i)
             {
@@ -137,7 +217,18 @@ public:
 
     std::string description() const override
     {
-        return "vulkan video decode + analysis (" + _device_name + ", device " + std::to_string(_device_index) + "), yuv";
+        return "vulkan video decode + analysis (" + _device_name + ", device " + std::to_string(_device_index) + "), yuv"
+             + (_motion ? ", motion on the GPU" : "");
+    }
+
+    void enable_motion() override
+    {
+        if (_max_group_size < kMotionGroupSize || _max_group_invocations < kMotionGroupSize)
+        {
+            throw std::runtime_error("the Vulkan device '" + _device_name + "' can't run the motion analysis (workgroups of "
+                                   + std::to_string(kMotionGroupSize) + " needed), use --decode ffmpeg");
+        }
+        _motion = true;
     }
 
     bool submit_next(const std::vector<VideoOptions> & video_options) override
@@ -171,6 +262,7 @@ public:
             const AVFrame * frame = slot.videos[i].frame;
             const Plan plan = _plan(frame);
             reallocate |= _videos[i].luma[0].size < plan.luma_bytes || _videos[i].chroma[0].size < plan.chroma_bytes;
+            reallocate |= _motion && _videos[i].pyramid[0].size < motion_layout(frame->width, frame->height).bytes;
         }
         // the buffers may still be used by submissions in flight
         if (reallocate) check(_fn.vkDeviceWaitIdle(_device), "vkDeviceWaitIdle");
@@ -244,6 +336,52 @@ public:
             slot_video.compared = compare;
             slot_video.height = frame->height;
             slot_video.width = frame->width;
+
+            if (_motion)
+            {
+                const MotionLayout layout = motion_layout(frame->width, frame->height);
+                for (Buffer & pyramid : video.pyramid)
+                {
+                    if (pyramid.size >= layout.bytes) continue;
+                    _destroy_buffer(pyramid);
+                    pyramid = _create_buffer(layout.bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
+                }
+                const VkDeviceSize point_bytes = kMotionPoints * 4 * sizeof(float);
+                if (slot_video.motion_points.size < point_bytes)
+                {
+                    _destroy_buffer(slot_video.motion_points);
+                    slot_video.motion_points = _create_buffer(point_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, {
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                    });
+                }
+                slot_video.motion = layout;
+                // the pyramid of the previous frame has the same layout if the frames can be compared
+                slot_video.motion_estimated = compare;
+
+                const VkDescriptorBufferInfo pyramid_buffers[2] = {
+                    { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                    { video.pyramid[video.current].buffer, 0, VK_WHOLE_SIZE },
+                };
+                const VkDescriptorBufferInfo lk_buffers[3] = {
+                    { video.pyramid[1 - video.current].buffer, 0, VK_WHOLE_SIZE },
+                    { video.pyramid[video.current].buffer, 0, VK_WHOLE_SIZE },
+                    { slot_video.motion_points.buffer, 0, VK_WHOLE_SIZE },
+                };
+                std::array<VkWriteDescriptorSet, 5> motion_writes {};
+                for (uint32_t b = 0; b < 5; ++b)
+                {
+                    motion_writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    motion_writes[b].dstSet = b < 2 ? slot_video.pyramid_set : slot_video.lk_set;
+                    motion_writes[b].dstBinding = b < 2 ? b : b - 2;
+                    motion_writes[b].descriptorCount = 1;
+                    motion_writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    motion_writes[b].pBufferInfo = b < 2 ? &pyramid_buffers[b] : &lk_buffers[b - 2];
+                }
+                _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(motion_writes.size()), motion_writes.data(), 0, nullptr);
+            }
         }
 
         // lock the decoded images while their state is read and updated
@@ -286,12 +424,12 @@ public:
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(_fn.vkBeginCommandBuffer(slot.command_buffer, &begin), "vkBeginCommandBuffer");
 
-        // earlier submissions read / wrote the plane buffers, the decoded images become copy sources
+        // earlier submissions read / wrote the plane buffers and pyramids, the decoded images become copy sources
         VkMemoryBarrier2 before { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         before.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        before.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        before.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        before.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        before.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        before.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        before.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         VkDependencyInfo dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         dependency.memoryBarrierCount = 1;
         dependency.pMemoryBarriers = &before;
@@ -320,6 +458,8 @@ public:
             _fn.vkCmdPushConstants(slot.command_buffer, _pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &parameters[i]);
             _fn.vkCmdDispatch(slot.command_buffer, static_cast<uint32_t>(slot.videos[i].height), 1, 1);
         }
+
+        if (_motion) _record_motion(slot);
 
         VkMemoryBarrier2 host { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         host.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -406,6 +546,7 @@ public:
                 const uint32_t * counts = static_cast<const uint32_t *>(slot_video.row_counts.mapped);
                 result.counts.assign(counts, counts + slot_video.height);
             }
+            if (_motion) _read_motion(slot_video, result.motion);
             // the decoded image can be reused by the decoder
             av_frame_unref(slot_video.frame);
         }
@@ -421,6 +562,8 @@ public:
     int frame_width(size_t index) const override { return _videos.at(index).decoder->width(); }
     int frame_height(size_t index) const override { return _videos.at(index).decoder->height(); }
     long long frames_read() const override { return _frames_read; }
+    std::string codec_name(size_t index) const override { return _videos.at(index).decoder->codec_name(); }
+    bool lossy_codec(size_t index) const override { return _videos.at(index).decoder->lossy(); }
 
 private:
     struct Buffer {
@@ -451,6 +594,8 @@ private:
         //! ping pong buffers of the planes
         Buffer luma[2];
         Buffer chroma[2];
+        //! ... and of the luma pyramids for the motion
+        Buffer pyramid[2];
         AVPixelFormat format = AV_PIX_FMT_NONE;
         int current = 0;
         int width = 0;
@@ -466,6 +611,12 @@ private:
         const Buffer * luma = nullptr;
         const Buffer * chroma = nullptr;
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        // motion: tracked points (vec4 per point) are read back
+        Buffer motion_points;
+        VkDescriptorSet pyramid_set = VK_NULL_HANDLE;
+        VkDescriptorSet lk_set = VK_NULL_HANDLE;
+        MotionLayout motion;
+        bool motion_estimated = false;
         bool compared = false;
         int width = 0;
         int height = 0;
@@ -545,6 +696,123 @@ private:
         }
     }
 
+    //! builds the luma pyramids of the frames of the slot and tracks the points from the previous frames
+    void _record_motion(Slot & slot)
+    {
+        VkMemoryBarrier2 written { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        written.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        written.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        written.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        written.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo written_dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        written_dependency.memoryBarrierCount = 1;
+        written_dependency.pMemoryBarriers = &written;
+
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _pyramid.pipeline);
+        for (uint32_t level = 0; level < kMaxMotionLevels; ++level)
+        {
+            bool dispatched = false;
+            for (const SlotVideo & slot_video : slot.videos)
+            {
+                const MotionLayout & layout = slot_video.motion;
+                if (level >= layout.levels) continue;
+                PyramidPush push {};
+                push.dst_width = layout.width[level];
+                push.dst_height = layout.height[level];
+                push.dst_offset = layout.offset[level];
+                if (level == 0)
+                {
+                    push.mode = 0;
+                    push.factor = layout.scale;
+                    push.src_width = static_cast<uint32_t>(slot_video.width);
+                    push.src_height = static_cast<uint32_t>(slot_video.height);
+                    push.src_base = slot_video.plan.luma_row_words;
+                }
+                else
+                {
+                    push.mode = 1;
+                    push.factor = 2;
+                    push.src_width = layout.width[level - 1];
+                    push.src_height = layout.height[level - 1];
+                    push.src_base = layout.offset[level - 1];
+                }
+                _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _pyramid.layout, 0, 1, &slot_video.pyramid_set, 0, nullptr);
+                _fn.vkCmdPushConstants(slot.command_buffer, _pyramid.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                _fn.vkCmdDispatch(slot.command_buffer, (push.dst_width + 15) / 16, (push.dst_height + 15) / 16, 1);
+                dispatched = true;
+            }
+            // the next level / the tracking reads this level
+            if (dispatched) _fn.vkCmdPipelineBarrier2(slot.command_buffer, &written_dependency);
+        }
+
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.pipeline);
+        for (const SlotVideo & slot_video : slot.videos)
+        {
+            if (!slot_video.motion_estimated) continue;
+            const MotionLayout & layout = slot_video.motion;
+            LkPush push {};
+            for (uint32_t level = 0; level < layout.levels; ++level)
+            {
+                push.level_width[level] = layout.width[level];
+                push.level_height[level] = layout.height[level];
+                push.level_offset[level] = layout.offset[level];
+            }
+            push.levels = layout.levels;
+            push.grid_x = kMotionPointsX;
+            push.grid_y = kMotionPointsY;
+            push.iterations = kMotionIterations;
+            _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.layout, 0, 1, &slot_video.lk_set, 0, nullptr);
+            _fn.vkCmdPushConstants(slot.command_buffer, _lk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, kMotionPoints, 1, 1);
+        }
+    }
+
+    //! the tracked points of a frame as the median motion per grid cell
+    void _read_motion(const SlotVideo & slot_video, MotionField & field)
+    {
+        field = MotionField();
+        field.pixel_scale = static_cast<float>(slot_video.motion.scale);
+        if (!slot_video.motion_estimated) return;
+        field.estimated = true;
+        if (!slot_video.motion_points.coherent)
+        {
+            VkMappedMemoryRange range { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            range.memory = slot_video.motion_points.memory;
+            range.size = VK_WHOLE_SIZE;
+            check(_fn.vkInvalidateMappedMemoryRanges(_device, 1, &range), "vkInvalidateMappedMemoryRanges");
+        }
+        for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
+        {
+            _cell_dx[cell].clear();
+            _cell_dy[cell].clear();
+        }
+        const float * points = static_cast<const float *>(slot_video.motion_points.mapped);
+        for (uint32_t y = 0; y < kMotionPointsY; ++y)
+        {
+            for (uint32_t x = 0; x < kMotionPointsX; ++x)
+            {
+                const float * point = points + 4 * (y * kMotionPointsX + x);
+                // (dx, dy, texture, residual)
+                if (!(point[2] >= kMinTexture) || !(point[3] <= kMaxResidual) || !std::isfinite(point[0]) || !std::isfinite(point[1])) continue;
+                const size_t cell = (y * kMotionGridY / kMotionPointsY) * kMotionGridX + x * kMotionGridX / kMotionPointsX;
+                _cell_dx[cell].push_back(point[0]);
+                _cell_dy[cell].push_back(point[1]);
+            }
+        }
+        for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
+        {
+            std::vector<float> & dx = _cell_dx[cell];
+            std::vector<float> & dy = _cell_dy[cell];
+            if (dx.size() < kMinCellPoints) continue;
+            const auto middle = static_cast<std::ptrdiff_t>(dx.size() / 2);
+            std::nth_element(dx.begin(), dx.begin() + middle, dx.end());
+            std::nth_element(dy.begin(), dy.begin() + middle, dy.end());
+            field.points[cell] = static_cast<uint16_t>(dx.size());
+            field.dx[cell] = dx[static_cast<size_t>(middle)] * field.pixel_scale;
+            field.dy[cell] = dy[static_cast<size_t>(middle)] * field.pixel_scale;
+        }
+    }
+
     static void _check_frame(const AVFrame * frame, const ffmpeg::VideoDecoder & decoder)
     {
         if (frame->format != AV_PIX_FMT_VULKAN || !frame->hw_frames_ctx) throw std::runtime_error("no Vulkan decoding for " + decoder.codec_name());
@@ -616,6 +884,8 @@ private:
             _device_name = properties.deviceName;
         }
         _max_workgroups = properties.limits.maxComputeWorkGroupCount[0];
+        _max_group_size = properties.limits.maxComputeWorkGroupSize[0];
+        _max_group_invocations = properties.limits.maxComputeWorkGroupInvocations;
         get_memory_properties(_vk->phys_dev, &_memory_properties);
 
         // a compute queue of the ones FFmpeg created
@@ -679,12 +949,77 @@ private:
         check(result, "vkCreateComputePipelines");
     }
 
+    struct Compute {
+        VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+
+    //! a compute pipeline with `bindings` storage buffers in one set and push constants
+    Compute _create_compute(const uint32_t * code, size_t code_bytes, uint32_t bindings, uint32_t push_bytes)
+    {
+        Compute compute;
+        try
+        {
+            std::vector<VkDescriptorSetLayoutBinding> layout_bindings(bindings);
+            for (uint32_t b = 0; b < bindings; ++b)
+            {
+                layout_bindings[b].binding = b;
+                layout_bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                layout_bindings[b].descriptorCount = 1;
+                layout_bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo set_layout_info { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            set_layout_info.bindingCount = bindings;
+            set_layout_info.pBindings = layout_bindings.data();
+            check(_fn.vkCreateDescriptorSetLayout(_device, &set_layout_info, nullptr, &compute.set_layout), "vkCreateDescriptorSetLayout");
+
+            VkPushConstantRange push_range { VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes };
+            VkPipelineLayoutCreateInfo layout_info { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &compute.set_layout;
+            layout_info.pushConstantRangeCount = 1;
+            layout_info.pPushConstantRanges = &push_range;
+            check(_fn.vkCreatePipelineLayout(_device, &layout_info, nullptr, &compute.layout), "vkCreatePipelineLayout");
+
+            VkShaderModuleCreateInfo module_info { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+            module_info.codeSize = code_bytes;
+            module_info.pCode = code;
+            VkShaderModule module = VK_NULL_HANDLE;
+            check(_fn.vkCreateShaderModule(_device, &module_info, nullptr, &module), "vkCreateShaderModule");
+            VkComputePipelineCreateInfo pipeline_info { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipeline_info.stage.module = module;
+            pipeline_info.stage.pName = "main";
+            pipeline_info.layout = compute.layout;
+            const VkResult result = _fn.vkCreateComputePipelines(_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &compute.pipeline);
+            _fn.vkDestroyShaderModule(_device, module, nullptr);
+            check(result, "vkCreateComputePipelines");
+        }
+        catch (...)
+        {
+            _destroy_compute(compute);
+            throw;
+        }
+        return compute;
+    }
+
+    void _destroy_compute(Compute & compute)
+    {
+        if (compute.pipeline) _fn.vkDestroyPipeline(_device, compute.pipeline, nullptr);
+        if (compute.layout) _fn.vkDestroyPipelineLayout(_device, compute.layout, nullptr);
+        if (compute.set_layout) _fn.vkDestroyDescriptorSetLayout(_device, compute.set_layout, nullptr);
+        compute = Compute();
+    }
+
     void _create_slots()
     {
+        // per video of a slot: the comparison, the pyramid and the tracking set
         const uint32_t set_count = static_cast<uint32_t>(kSlots * _videos.size());
-        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kBindings * set_count };
+        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 3) * set_count };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pool_info.maxSets = set_count;
+        pool_info.maxSets = 3 * set_count;
         pool_info.poolSizeCount = 1;
         pool_info.pPoolSizes = &pool_size;
         check(_fn.vkCreateDescriptorPool(_device, &pool_info, nullptr, &_descriptor_pool), "vkCreateDescriptorPool");
@@ -713,6 +1048,10 @@ private:
                 set_info.descriptorSetCount = 1;
                 set_info.pSetLayouts = &_set_layout;
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.descriptor_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_pyramid.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.pyramid_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_lk.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.lk_set), "vkAllocateDescriptorSets");
             }
         }
     }
@@ -777,7 +1116,11 @@ private:
             _fn.vkDeviceWaitIdle(_device);
             for (Slot & slot : _slots)
             {
-                for (SlotVideo & video : slot.videos) _destroy_buffer(video.row_counts);
+                for (SlotVideo & video : slot.videos)
+                {
+                    _destroy_buffer(video.row_counts);
+                    _destroy_buffer(video.motion_points);
+                }
                 if (slot.fence) _fn.vkDestroyFence(_device, slot.fence, nullptr);
                 slot.fence = VK_NULL_HANDLE;
             }
@@ -785,7 +1128,10 @@ private:
             {
                 for (Buffer & buffer : video.luma) _destroy_buffer(buffer);
                 for (Buffer & buffer : video.chroma) _destroy_buffer(buffer);
+                for (Buffer & buffer : video.pyramid) _destroy_buffer(buffer);
             }
+            _destroy_compute(_pyramid);
+            _destroy_compute(_lk);
             if (_command_pool) _fn.vkDestroyCommandPool(_device, _command_pool, nullptr);
             if (_descriptor_pool) _fn.vkDestroyDescriptorPool(_device, _descriptor_pool, nullptr);
             if (_pipeline) _fn.vkDestroyPipeline(_device, _pipeline, nullptr);
@@ -819,12 +1165,21 @@ private:
     int _device_index = 0;
     std::string _device_name;
     uint32_t _max_workgroups = 65535;
+    uint32_t _max_group_size = 0;
+    uint32_t _max_group_invocations = 0;
     VkPhysicalDeviceMemoryProperties _memory_properties {};
     struct {
 #define TRDROP_VKV_DECLARE(name) PFN_##name name = nullptr;
         TRDROP_VKV_DEVICE_FUNCTIONS(TRDROP_VKV_DECLARE)
 #undef TRDROP_VKV_DECLARE
     } _fn;
+
+    // motion: pyramid and tracking pipelines
+    bool _motion = false;
+    Compute _pyramid;
+    Compute _lk;
+    std::array<std::vector<float>, kMotionCells> _cell_dx;
+    std::array<std::vector<float>, kMotionCells> _cell_dy;
 
     VkDescriptorSetLayout _set_layout = VK_NULL_HANDLE;
     VkPipelineLayout _pipeline_layout = VK_NULL_HANDLE;

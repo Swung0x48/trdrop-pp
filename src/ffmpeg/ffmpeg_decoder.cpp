@@ -235,6 +235,13 @@ long long VideoDecoder::frame_count() const
 int VideoDecoder::width() const { return _format->streams[_stream]->codecpar->width; }
 int VideoDecoder::height() const { return _format->streams[_stream]->codecpar->height; }
 
+bool VideoDecoder::lossy() const
+{
+    // codecs with a lossless mode (H.264, HEVC, ...) are treated as lossy, the mode can't be told from the stream
+    const AVCodecDescriptor * descriptor = _codec ? avcodec_descriptor_get(_codec->codec_id) : nullptr;
+    return descriptor && (descriptor->props & AV_CODEC_PROP_LOSSY) != 0;
+}
+
 std::string VideoDecoder::codec_name() const { return _codec && _codec->codec ? _codec->codec->name : "unknown"; }
 
 } // namespace trdrop::ffmpeg

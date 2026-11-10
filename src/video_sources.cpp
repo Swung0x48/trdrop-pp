@@ -1,5 +1,6 @@
 #include "video_sources.h"
 
+#include <cctype>
 #include <stdexcept>
 
 #include <opencv2/imgproc.hpp>
@@ -56,6 +57,39 @@ int VideoSources::frame_width(size_t index) const
 int VideoSources::frame_height(size_t index) const
 {
     return static_cast<int>(_captures.at(index).get(cv::CAP_PROP_FRAME_HEIGHT));
+}
+
+std::string VideoSources::codec_name(size_t index) const
+{
+    const unsigned fourcc = static_cast<unsigned>(static_cast<long long>(_captures.at(index).get(cv::CAP_PROP_FOURCC)));
+    std::string name;
+    for (int shift = 0; shift < 32; shift += 8)
+    {
+        const char c = static_cast<char>((fourcc >> shift) & 0xFF);
+        // raw formats use numeric tags (BI_RGB = 0, 'BGR\x18', ...)
+        if (c < 32 || c > 126) return "raw";
+        name += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    return name.empty() ? "raw" : name;
+}
+
+bool VideoSources::lossy_codec(size_t index) const
+{
+    // FOURCCs and the first 4 characters of FFmpeg's codec names (used by containers without a FOURCC)
+    static const char * const lossless[] = {
+        "RAW", "RAWV", "DIB", "FFV1", "HFYU", "HUFF", "FFVH", "MAGY", "MAGI", "UTVI", "LAGS", "LAGA", "ZMBV",
+        "PNG", "MPNG", "BMP", "I420", "IYUV", "YV12", "NV12", "NV21", "YUY2", "YUYV", "UYVY", "Y42B", "Y444",
+        "V210", "R210", "V308", "V408", "V410", "BGRA", "RGBA", "BGR0", "RGB0", "24BG",
+    };
+    const std::string name = codec_name(index);
+    for (const char * candidate : lossless)
+    {
+        if (name == candidate) return false;
+    }
+    // Ut Video: ULRG, ULY0, ULH2, UQY2, ...
+    if (name.size() == 4 && name[0] == 'U' && (name[1] == 'L' || name[1] == 'Q' || name[1] == 'M')) return false;
+    return true;
 }
 
 } // namespace trdrop

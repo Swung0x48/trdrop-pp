@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <vector>
 
 #include "diff_engine.h"
@@ -39,6 +40,8 @@ public:
     const std::vector<Tear> & tears() const { return _tears; }
     //! the raw difference value of the last comparison per video (0 = duplicate, 1 = new frame, (0,1) = tear)
     const std::vector<double> & last_differences() const { return _last_differences; }
+    //! share (0 - 1) of the pixels which were different in the last comparison per video
+    const std::vector<double> & last_changed_shares() const { return _last_changed_shares; }
 
 private:
     double _calculate_framerate(size_t video_index) const;
@@ -57,6 +60,10 @@ private:
     std::vector<double> _row_differences;
     std::vector<Tear> _tears;
     std::vector<double> _last_differences;
+    std::vector<double> _last_changed_shares;
+    //! per video: changed shares of the last 2 seconds, for the automatic tolerance
+    std::vector<std::deque<double>> _share_history;
+    std::vector<double> _sorted_shares;
     bool _received_first_frames = false;
     bool _has_difference = false;
 };

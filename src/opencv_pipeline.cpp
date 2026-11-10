@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
+#include <stdexcept>
+
+#include <opencv2/imgproc.hpp>
 
 #include "video_sources.h"
 
@@ -19,6 +23,11 @@ double FramePipeline::progress() const
     return std::min(result, 1.0);
 }
 
+void FramePipeline::enable_motion()
+{
+    throw std::runtime_error("the motion analysis is not available with " + description());
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -33,8 +42,19 @@ public:
 
     bool submit_next(const std::vector<VideoOptions> & video_options) override
     {
-        if (!_sources.read_next_frames(_engine->next_frames())) return false;
+        std::vector<cv::Mat> & frames = _engine->next_frames();
+        if (!_sources.read_next_frames(frames)) return false;
         const Clock::time_point start = Clock::now();
+        if (!_motion.empty())
+        {
+            std::vector<MotionField> fields(frames.size());
+            for (size_t i = 0; i < frames.size(); ++i)
+            {
+                cv::cvtColor(frames[i], _gray, cv::COLOR_BGR2GRAY);
+                fields[i] = _motion[i].estimate(_gray);
+            }
+            _motion_queue.push_back(std::move(fields));
+        }
         _engine->submit(video_options);
         _analysis += Clock::now() - start;
         return true;
@@ -47,8 +67,15 @@ public:
     {
         const Clock::time_point start = Clock::now();
         _engine->collect(out);
+        if (!_motion.empty())
+        {
+            for (size_t i = 0; i < out.size(); ++i) out[i].motion = _motion_queue.front()[i];
+            _motion_queue.pop_front();
+        }
         _analysis += Clock::now() - start;
     }
+
+    void enable_motion() override { _motion.resize(_sources.count()); }
 
     double analysis_seconds() const override { return std::chrono::duration<double>(_analysis).count(); }
 
@@ -58,10 +85,16 @@ public:
     int frame_width(size_t index) const override { return _sources.frame_width(index); }
     int frame_height(size_t index) const override { return _sources.frame_height(index); }
     long long frames_read() const override { return _sources.frames_read(); }
+    std::string codec_name(size_t index) const override { return _sources.codec_name(index); }
+    bool lossy_codec(size_t index) const override { return _sources.lossy_codec(index); }
 
 private:
     VideoSources _sources;
     std::unique_ptr<DiffEngine> _engine;
+    //! motion estimation on the CPU, the fields wait for collect() in submission order
+    std::vector<MotionEstimator> _motion;
+    std::deque<std::vector<MotionField>> _motion_queue;
+    cv::Mat _gray;
     Clock::duration _analysis {};
 };
 

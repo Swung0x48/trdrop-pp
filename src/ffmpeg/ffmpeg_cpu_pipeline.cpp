@@ -153,6 +153,11 @@ public:
                            && previous->format == current->format;
             if (result.compared) compare_yuv(current, previous, std::max(0, video_options[i].pixel_difference), result.counts);
             else result.counts.clear();
+            if (!_motion.empty())
+            {
+                const cv::Mat luma(current->height, current->width, CV_8UC1, current->data[0], static_cast<size_t>(current->linesize[0]));
+                result.motion = _motion[i].estimate(luma);
+            }
         }
         _analysis += Clock::now() - start;
         _pending = 1;
@@ -169,6 +174,8 @@ public:
         _pending = 0;
     }
 
+    void enable_motion() override { _motion.resize(_videos.size()); }
+
     double analysis_seconds() const override { return std::chrono::duration<double>(_analysis).count(); }
 
     size_t count() const override { return _videos.size(); }
@@ -177,6 +184,8 @@ public:
     int frame_width(size_t index) const override { return _videos.at(index).decoder->width(); }
     int frame_height(size_t index) const override { return _videos.at(index).decoder->height(); }
     long long frames_read() const override { return _frames_read; }
+    std::string codec_name(size_t index) const override { return _videos.at(index).decoder->codec_name(); }
+    bool lossy_codec(size_t index) const override { return _videos.at(index).decoder->lossy(); }
 
 private:
     struct Video {
@@ -212,6 +221,7 @@ private:
 
     std::vector<Video> _videos;
     std::vector<RowCounts> _results;
+    std::vector<MotionEstimator> _motion;
     bool _first_frames_ready = false;
     size_t _pending = 0;
     long long _frames_read = 0;
@@ -225,7 +235,7 @@ std::unique_ptr<FramePipeline> make_ffmpeg_cpu_pipeline(const std::vector<std::s
     return std::make_unique<FfmpegCpuPipeline>(paths);
 }
 
-DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available)
+DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available, bool prefer_gpu)
 {
     // CPUs with at least this many threads decode 4K H.264 faster than the hardware decoder
     // (measured: i7-14700KF 28 threads ~320 fps on the CPU, RTX 4070 (SUPER) ~230 fps)
@@ -257,7 +267,7 @@ DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan
     if (vulkan_available && vulkan)
     {
         const unsigned threads = std::thread::hardware_concurrency();
-        if (h264 && threads >= kH264CpuThreads)
+        if (h264 && threads >= kH264CpuThreads && !prefer_gpu)
         {
             return { "ffmpeg", "H.264 decodes faster on the CPU with " + std::to_string(threads) + " threads" };
         }

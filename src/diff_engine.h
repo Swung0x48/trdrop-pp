@@ -7,6 +7,7 @@
 
 #include <opencv2/core.hpp>
 
+#include "motion.h"
 #include "options.h"
 
 namespace trdrop {
@@ -18,6 +19,8 @@ struct RowCounts {
     int cols = 0;
     //! per row: amount of pixels whose grayscale difference is > pixel_difference
     std::vector<uint32_t> counts;
+    //! motion from the previous frame, only if the pipeline measures it (FramePipeline::enable_motion)
+    MotionField motion;
 };
 
 //! Computes the per pixel part of the analysis: grayscale conversion, the difference to the

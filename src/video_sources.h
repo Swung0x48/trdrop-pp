@@ -26,6 +26,10 @@ public:
     long long reported_frame_count(size_t index) const;
     int frame_width(size_t index) const;
     int frame_height(size_t index) const;
+    //! FOURCC / short name of the codec as reported by OpenCV
+    std::string codec_name(size_t index) const;
+    //! false for the known lossless / raw codecs, true for everything else
+    bool lossy_codec(size_t index) const;
     //! frames read so far (same for every video)
     long long frames_read() const { return _frames_read; }
 

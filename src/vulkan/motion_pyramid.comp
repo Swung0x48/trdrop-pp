@@ -1,0 +1,57 @@
+#version 450
+// Builds the luma pyramid the motion is measured on (motion_lk.comp). One dispatch per level:
+//   mode 0: level 0 from the luma plane (bytes, 4 pixels per word), box filtered by an integer factor
+//   mode 1: the next level from the previous one, 2x2 box filter
+// All levels of a frame are stored in one buffer of floats (0 - 255).
+// Pixel (x, y) of level L + 1 covers the pixels (2x, 2y) .. (2x + 1, 2y + 1) of level L.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Luma    { uint luma[]; };
+layout(std430, set = 0, binding = 1)          buffer Pyramid { float pyramid[]; };
+
+layout(push_constant) uniform Parameters {
+    uint mode;
+    uint factor;       // mode 0: downscale factor
+    uint src_width;    // mode 0: of the luma plane, mode 1: of the source level
+    uint src_height;
+    uint src_base;     // mode 0: row stride of the luma plane in words, mode 1: offset of the source level
+    uint dst_width;
+    uint dst_height;
+    uint dst_offset;
+} params;
+
+void main()
+{
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= params.dst_width || pixel.y >= params.dst_height) return;
+
+    float sum = 0.0;
+    if (params.mode == 0u)
+    {
+        for (uint dy = 0u; dy < params.factor; ++dy)
+        {
+            const uint y = min(pixel.y * params.factor + dy, params.src_height - 1u);
+            for (uint dx = 0u; dx < params.factor; ++dx)
+            {
+                const uint x = min(pixel.x * params.factor + dx, params.src_width - 1u);
+                sum += float((luma[y * params.src_base + (x >> 2u)] >> (8u * (x & 3u))) & 0xFFu);
+            }
+        }
+        sum /= float(params.factor * params.factor);
+    }
+    else
+    {
+        for (uint dy = 0u; dy < 2u; ++dy)
+        {
+            const uint y = min(pixel.y * 2u + dy, params.src_height - 1u);
+            for (uint dx = 0u; dx < 2u; ++dx)
+            {
+                const uint x = min(pixel.x * 2u + dx, params.src_width - 1u);
+                sum += pyramid[params.src_base + y * params.src_width + x];
+            }
+        }
+        sum *= 0.25;
+    }
+    pyramid[params.dst_offset + pixel.y * params.dst_width + pixel.x] = sum;
+}
