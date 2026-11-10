@@ -1,0 +1,79 @@
+#version 450
+// Per row count of changed pixels of a YUV frame, one workgroup per (luma) row.
+// A pixel (x, y) changed if |dY| > threshold or if the chroma sample covering it,
+// (x >> shift_x, y >> shift_y), has |dU| > threshold or |dV| > threshold.
+// The same rule is implemented on the CPU (ffmpeg_cpu_pipeline.cpp), both give identical counts.
+//
+// luma:   4 pixels per word, luma_row_words words per row
+// chroma: bytes, chroma_mode 1 = interleaved UV pairs (NV12, ...), 2 = U plane then V plane at v_offset
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer CurrentLuma    { uint current_luma[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer PreviousLuma   { uint previous_luma[]; };
+layout(std430, set = 0, binding = 2) readonly  buffer CurrentChroma  { uint current_chroma[]; };
+layout(std430, set = 0, binding = 3) readonly  buffer PreviousChroma { uint previous_chroma[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer RowCounts      { uint row_counts[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint luma_row_words;
+    uint threshold;         // pixel_difference
+    uint chroma_mode;       // 0: no chroma, 1: interleaved UV, 2: planar U, V
+    uint shift_x;           // chroma subsampling (log2)
+    uint shift_y;
+    uint chroma_row_bytes;  // bytes per chroma row (per plane)
+    uint v_offset;          // planar: byte offset of the V plane
+} params;
+
+shared uint partial_counts[128];
+
+uint current_byte(uint offset)  { return (current_chroma[offset >> 2u]  >> ((offset & 3u) * 8u)) & 0xFFu; }
+uint previous_byte(uint offset) { return (previous_chroma[offset >> 2u] >> ((offset & 3u) * 8u)) & 0xFFu; }
+
+bool differs(uint a, uint b) { return uint(abs(int(a) - int(b))) > params.threshold; }
+
+bool chroma_changed(uint cx, uint cy)
+{
+    const uint row = cy * params.chroma_row_bytes;
+    if (params.chroma_mode == 1u)
+    {
+        const uint u = row + 2u * cx;
+        return differs(current_byte(u), previous_byte(u)) || differs(current_byte(u + 1u), previous_byte(u + 1u));
+    }
+    const uint u = row + cx;
+    const uint v = params.v_offset + row + cx;
+    return differs(current_byte(u), previous_byte(u)) || differs(current_byte(v), previous_byte(v));
+}
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint groups = (params.width + 3u) / 4u;
+    const uint cy = row >> params.shift_y;
+
+    uint count = 0u;
+    for (uint q = lane; q < groups; q += gl_WorkGroupSize.x)
+    {
+        const uint index = row * params.luma_row_words + q;
+        const uint a = current_luma[index];
+        const uint b = previous_luma[index];
+        const uint valid = min(params.width - q * 4u, 4u);
+        for (uint k = 0u; k < valid; ++k)
+        {
+            bool changed = differs((a >> (8u * k)) & 0xFFu, (b >> (8u * k)) & 0xFFu);
+            if (!changed && params.chroma_mode != 0u) changed = chroma_changed((q * 4u + k) >> params.shift_x, cy);
+            if (changed) count += 1u;
+        }
+    }
+
+    partial_counts[lane] = count;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride /= 2u)
+    {
+        if (lane < stride) partial_counts[lane] += partial_counts[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) row_counts[row] = partial_counts[0];
+}

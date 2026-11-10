@@ -35,6 +35,10 @@ add_executable(trdrop-pp
 target_include_directories(trdrop-pp PRIVATE src)
 target_link_libraries(trdrop-pp PRIVATE ${OpenCV_LIBS})
 trdrop_warnings(trdrop-pp)
+if(MSVC)
+    # UTF-8 process code page: non-ASCII file names on the command line
+    target_sources(trdrop-pp PRIVATE src/windows/trdrop-pp.manifest)
+endif()
 
 if(USE_VULKAN)
     # only the headers and the shader compiler are needed at build time,
@@ -102,8 +106,8 @@ if(USE_FFMPEG)
     target_sources(trdrop-pp PRIVATE src/ffmpeg/ffmpeg_decoder.cpp src/ffmpeg/ffmpeg_cpu_pipeline.cpp)
     target_compile_definitions(trdrop-pp PRIVATE USE_FFMPEG=1)
     if(USE_VULKAN)
-        trdrop_shader(luma_diff _luma_shader_inc)
-        target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_luma_shader_inc}")
+        trdrop_shader(yuv_diff _yuv_shader_inc)
+        target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}")
         message(STATUS "trdrop-pp: FFmpeg decoding enabled (with Vulkan Video)")
     else()
         message(STATUS "trdrop-pp: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")

@@ -52,40 +52,66 @@ bool is_luma_format(AVPixelFormat format)
     }
 }
 
-std::string vulkan_decode_blocker(const std::string & path)
+YuvLayout yuv_layout(AVPixelFormat format)
 {
+    YuvLayout layout;
+    const AVPixFmtDescriptor * desc = av_pix_fmt_desc_get(format);
+    if (!desc || desc->nb_components < 3) return layout;
+    layout.chroma = desc->comp[1].plane == desc->comp[2].plane ? YuvLayout::Interleaved : YuvLayout::Planar;
+    layout.shift_x = desc->log2_chroma_w;
+    layout.shift_y = desc->log2_chroma_h;
+    return layout;
+}
+
+Probe probe(const std::string & path)
+{
+    Probe result;
     AVFormatContext * format = nullptr;
-    if (avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0) return "could not open '" + path + "'";
-    std::string reason;
+    if (avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0)
+    {
+        result.error = "could not open '" + path + "'";
+        return result;
+    }
     const AVCodec * decoder = nullptr;
     const int stream = avformat_find_stream_info(format, nullptr) < 0
                      ? -1 : av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (stream < 0 || !decoder)
     {
-        reason = "no decodable video stream in '" + path + "'";
+        result.error = "no decodable video stream in '" + path + "'";
     }
     else
     {
-        bool vulkan = false;
+        result.opened = true;
+        result.codec = decoder->name;
+        result.codec_id = decoder->id;
+        result.format = static_cast<AVPixelFormat>(format->streams[stream]->codecpar->format);
         for (int i = 0;; ++i)
         {
             const AVCodecHWConfig * config = avcodec_get_hw_config(decoder, i);
             if (!config) break;
-            if (config->device_type == AV_HWDEVICE_TYPE_VULKAN && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) vulkan = true;
-        }
-        const AVPixelFormat pixel_format = static_cast<AVPixelFormat>(format->streams[stream]->codecpar->format);
-        if (!vulkan)
-        {
-            reason = std::string("no Vulkan decoding for ") + decoder->name;
-        }
-        else if (pixel_format != AV_PIX_FMT_NONE && !is_luma_format(pixel_format))
-        {
-            const char * name = av_get_pix_fmt_name(pixel_format);
-            reason = std::string("pixel format ") + (name ? name : "unknown") + " has no 8-bit luma plane";
+            if (config->device_type == AV_HWDEVICE_TYPE_VULKAN && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) result.vulkan = true;
         }
     }
     avformat_close_input(&format);
-    return reason;
+    return result;
+}
+
+std::string format_name(AVPixelFormat format)
+{
+    const char * name = av_get_pix_fmt_name(format);
+    return name ? name : "unknown";
+}
+
+std::string vulkan_decode_blocker(const std::string & path)
+{
+    const Probe result = probe(path);
+    if (!result.opened) return result.error;
+    if (!result.vulkan) return "no Vulkan decoding for " + result.codec;
+    if (result.format != AV_PIX_FMT_NONE && !is_luma_format(result.format))
+    {
+        return "pixel format " + format_name(result.format) + " is no 8-bit YUV format";
+    }
+    return "";
 }
 
 VideoDecoder::VideoDecoder(const std::string & path, AVBufferRef * hw_device, int extra_hw_frames)

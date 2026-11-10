@@ -50,13 +50,21 @@ public:
 std::unique_ptr<FramePipeline> make_opencv_pipeline(const std::vector<std::string> & paths, std::unique_ptr<DiffEngine> engine);
 
 #ifdef USE_FFMPEG
-//! FFmpeg decoding on the CPU, compares the luma (Y) plane on the CPU.
+//! FFmpeg decoding on the CPU, compares the Y, U and V planes on the CPU.
 //! throws std::runtime_error if an input has no 8-bit YUV format
 std::unique_ptr<FramePipeline> make_ffmpeg_cpu_pipeline(const std::vector<std::string> & paths);
+
+//! the decoder --decode auto uses for these inputs ("vulkan", "ffmpeg" or "opencv") and why
+struct DecoderChoice {
+    std::string decoder;
+    std::string reason;
+};
+//! vulkan_available: Vulkan Video decoding may be used (Vulkan build, not --no-vk)
+DecoderChoice choose_decoder(const std::vector<std::string> & paths, bool vulkan_available);
 #endif
 
 #if defined(USE_FFMPEG) && defined(USE_VULKAN)
-//! FFmpeg Vulkan Video decoding, the luma (Y) plane stays on the GPU and is compared there.
+//! FFmpeg Vulkan Video decoding, the Y, U and V planes stay on the GPU and are compared there.
 //! throws std::runtime_error if Vulkan decoding isn't available for an input
 std::unique_ptr<FramePipeline> make_vulkan_video_pipeline(const std::vector<std::string> & paths, int device_index);
 #endif

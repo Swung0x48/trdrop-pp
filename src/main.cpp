@@ -22,6 +22,13 @@
 #include "diff_engine.h"
 #include "frame_analyzer.h"
 #include "frame_pipeline.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "options.h"
 
 namespace trdrop {
@@ -57,14 +64,17 @@ backend:
                                discrete GPU, otherwise device 0)
       --no-vk                  don't use Vulkan, analyze with OpenCV on the CPU
       --list-vkdevices         list the Vulkan devices and exit
-      --decode <mode>          auto (default): vulkan if every video can be decoded that way,
-                               otherwise opencv
+      --decode <mode>          auto (default): the fastest of the modes below for the videos
+                               (vulkan for HEVC / AV1 / ..., ffmpeg for H.264 on CPUs with
+                               16+ threads and for YUV formats without Vulkan decoding,
+                               opencv for RGB sources), the choice is printed
                                vulkan: decode on the GPU (FFmpeg Vulkan Video), compare the
-                                 luma (Y) plane on the GPU, frames never leave the GPU
-                               ffmpeg: decode with FFmpeg on the CPU, compare the luma plane
-                                 on the CPU (same results as vulkan)
-                               opencv: decode with OpenCV, compare BGR -> grayscale
-                               luma and grayscale differ slightly, so the results of
+                                 Y, U and V planes on the GPU, frames never leave the GPU
+                               ffmpeg: decode with FFmpeg on the CPU, compare the Y, U and V
+                                 planes on the CPU (same results as vulkan)
+                               opencv: decode with OpenCV, compare BGR -> grayscale (the
+                                 original behaviour, also used with --no-vk)
+                               YUV and grayscale differ slightly, so the results of
                                vulkan / ffmpeg differ slightly from opencv
 
   -h, --help                   show this help
@@ -335,20 +345,51 @@ std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
 {
 #if defined(USE_FFMPEG) && defined(USE_VULKAN)
     if (options.decode == "vulkan") return make_vulkan_video_pipeline(options.inputs, options.vk_device);
-    if (options.decode == "auto" && options.use_vulkan)
-    {
-        try
-        {
-            return make_vulkan_video_pipeline(options.inputs, options.vk_device);
-        }
-        catch (const std::exception & e)
-        {
-            if (!options.quiet) std::fprintf(stderr, "trdrop-pp: no Vulkan Video decoding (%s), decoding with OpenCV\n", e.what());
-        }
-    }
 #endif
 #ifdef USE_FFMPEG
     if (options.decode == "ffmpeg") return make_ffmpeg_cpu_pipeline(options.inputs);
+    // auto: the fastest decoder for the inputs; --no-vk keeps the original OpenCV path
+    if (options.decode == "auto" && options.use_vulkan)
+    {
+        auto note = [&](const std::string & what, const std::string & why) {
+            if (!options.quiet) std::fprintf(stderr, "trdrop-pp: decoding with %s (%s)\n", what.c_str(), why.c_str());
+        };
+#ifdef USE_VULKAN
+        const bool vulkan_available = true;
+#else
+        const bool vulkan_available = false;
+#endif
+        const DecoderChoice choice = choose_decoder(options.inputs, vulkan_available);
+        std::string fallback_reason = choice.reason;
+#ifdef USE_VULKAN
+        if (choice.decoder == "vulkan")
+        {
+            try
+            {
+                return make_vulkan_video_pipeline(options.inputs, options.vk_device);
+            }
+            catch (const std::exception & e)
+            {
+                // e.g. no Vulkan driver or the device can't decode this profile
+                fallback_reason = std::string("no Vulkan Video decoding: ") + e.what();
+            }
+        }
+#endif
+        if (choice.decoder == "vulkan" || choice.decoder == "ffmpeg")
+        {
+            try
+            {
+                std::unique_ptr<FramePipeline> pipeline = make_ffmpeg_cpu_pipeline(options.inputs);
+                note("FFmpeg on the CPU", fallback_reason);
+                return pipeline;
+            }
+            catch (const std::exception & e)
+            {
+                fallback_reason = e.what();
+            }
+        }
+        note("OpenCV", fallback_reason);
+    }
 #endif
     return make_opencv_decode_pipeline(options);
 }
@@ -541,6 +582,10 @@ int run(const Options & options)
 
 int main(int argc, char ** argv)
 {
+#ifdef _WIN32
+    // the manifest makes UTF-8 the process code page, the console has to print it as UTF-8 too
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
     try
     {

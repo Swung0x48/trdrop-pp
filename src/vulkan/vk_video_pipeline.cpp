@@ -1,6 +1,6 @@
-// Vulkan Video pipeline: FFmpeg decodes on the GPU (Vulkan hwaccel), the luma (Y) plane of every
-// decoded image is copied into a buffer on the GPU and compared with the previous one by
-// luma_diff.comp. Only the per row counts are read back, the frames never leave the GPU.
+// Vulkan Video pipeline: FFmpeg decodes on the GPU (Vulkan hwaccel), the Y, U and V planes of every
+// decoded image are copied into buffers on the GPU and compared with the previous ones by
+// yuv_diff.comp. Only the per row counts are read back, the frames never leave the GPU.
 //
 // The Vulkan objects live on FFmpeg's VkDevice. Every decoded image is synchronized through its
 // timeline semaphore (AVVkFrame::sem / sem_value), as required by FFmpeg.
@@ -34,18 +34,36 @@ namespace trdrop {
 
 namespace {
 
-const uint32_t kLumaDiffSpirv[] = {
-#include "luma_diff.spv.inc"
+const uint32_t kYuvDiffSpirv[] = {
+#include "yuv_diff.spv.inc"
 };
 
 //! sets of frames in flight
 constexpr size_t kSlots = 3;
 
+//! must match yuv_diff.comp
 struct PushConstants {
     uint32_t width;
-    uint32_t row_words;
+    uint32_t luma_row_words;
     uint32_t threshold;
+    uint32_t chroma_mode;
+    uint32_t shift_x;
+    uint32_t shift_y;
+    uint32_t chroma_row_bytes;
+    uint32_t v_offset;
 };
+
+constexpr uint32_t kBindings = 5;
+
+uint32_t align4(uint32_t value) { return (value + 3u) & ~3u; }
+
+//! the VkImages of a frame: one multiplane image or one image per plane
+int image_count(const AVVkFrame * vkf)
+{
+    int count = 0;
+    while (count < AV_NUM_DATA_POINTERS && vkf->img[count] != VK_NULL_HANDLE) ++count;
+    return count;
+}
 
 #define TRDROP_VKV_DEVICE_FUNCTIONS(X) \
     X(vkGetDeviceQueue) X(vkGetDeviceQueue2) \
@@ -119,7 +137,7 @@ public:
 
     std::string description() const override
     {
-        return "vulkan video decode + analysis (" + _device_name + ", device " + std::to_string(_device_index) + "), luma";
+        return "vulkan video decode + analysis (" + _device_name + ", device " + std::to_string(_device_index) + "), yuv";
     }
 
     bool submit_next(const std::vector<VideoOptions> & video_options) override
@@ -147,33 +165,42 @@ public:
 
         // buffers / descriptors per video
         std::array<PushConstants, kMaxVideoCount> parameters {};
-        std::array<VkImageMemoryBarrier2, kMaxVideoCount> image_barriers {};
-        std::array<VkSemaphoreSubmitInfo, kMaxVideoCount> waits {};
-        std::array<VkSemaphoreSubmitInfo, kMaxVideoCount> signals {};
+        bool reallocate = false;
+        for (size_t i = 0; i < _videos.size(); ++i)
+        {
+            const AVFrame * frame = slot.videos[i].frame;
+            const Plan plan = _plan(frame);
+            reallocate |= _videos[i].luma[0].size < plan.luma_bytes || _videos[i].chroma[0].size < plan.chroma_bytes;
+        }
+        // the buffers may still be used by submissions in flight
+        if (reallocate) check(_fn.vkDeviceWaitIdle(_device), "vkDeviceWaitIdle");
+
         for (size_t i = 0; i < _videos.size(); ++i)
         {
             VideoState & video = _videos[i];
             SlotVideo & slot_video = slot.videos[i];
             const AVFrame * frame = slot_video.frame;
-            const int width = frame->width;
-            const int height = frame->height;
-            if (static_cast<uint32_t>(height) > _max_workgroups) throw std::runtime_error("frame height exceeds the device limit");
+            const Plan plan = _plan(frame);
+            if (static_cast<uint32_t>(frame->height) > _max_workgroups) throw std::runtime_error("frame height exceeds the device limit");
 
-            const uint32_t row_words = static_cast<uint32_t>((width + 3) / 4);
-            const VkDeviceSize luma_bytes = static_cast<VkDeviceSize>(row_words) * 4 * static_cast<VkDeviceSize>(height);
-            const bool compare = video.has_previous && video.width == width && video.height == height;
-            if (video.luma[0].size < luma_bytes)
+            const bool compare = video.has_previous && video.width == frame->width && video.height == frame->height
+                              && video.format == plan.format;
+            for (int b = 0; b < 2; ++b)
             {
-                // the buffers may still be used by submissions in flight
-                check(_fn.vkDeviceWaitIdle(_device), "vkDeviceWaitIdle");
-                for (Buffer & luma : video.luma)
+                if (video.luma[b].size < plan.luma_bytes)
                 {
-                    _destroy_buffer(luma);
-                    luma = _create_buffer(luma_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                          { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
+                    _destroy_buffer(video.luma[b]);
+                    video.luma[b] = _create_buffer(plan.luma_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                   { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
+                }
+                if (video.chroma[b].size < plan.chroma_bytes)
+                {
+                    _destroy_buffer(video.chroma[b]);
+                    video.chroma[b] = _create_buffer(plan.chroma_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                     { VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0 });
                 }
             }
-            const VkDeviceSize row_bytes = static_cast<VkDeviceSize>(height) * sizeof(uint32_t);
+            const VkDeviceSize row_bytes = static_cast<VkDeviceSize>(frame->height) * sizeof(uint32_t);
             if (slot_video.row_counts.size < row_bytes)
             {
                 _destroy_buffer(slot_video.row_counts);
@@ -184,17 +211,22 @@ public:
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 });
             }
-            video.width = width;
-            video.height = height;
+            video.width = frame->width;
+            video.height = frame->height;
+            video.format = plan.format;
+            slot_video.plan = plan;
             slot_video.luma = &video.luma[video.current];
+            slot_video.chroma = &video.chroma[video.current];
 
-            const std::array<VkDescriptorBufferInfo, 3> buffers = {{
+            const std::array<VkDescriptorBufferInfo, kBindings> buffers = {{
                 { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
                 { video.luma[1 - video.current].buffer, 0, VK_WHOLE_SIZE },
+                { video.chroma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                { video.chroma[1 - video.current].buffer, 0, VK_WHOLE_SIZE },
                 { slot_video.row_counts.buffer, 0, VK_WHOLE_SIZE },
             }};
-            std::array<VkWriteDescriptorSet, 3> writes {};
-            for (uint32_t b = 0; b < 3; ++b)
+            std::array<VkWriteDescriptorSet, kBindings> writes {};
+            for (uint32_t b = 0; b < kBindings; ++b)
             {
                 writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[b].dstSet = slot_video.descriptor_set;
@@ -205,65 +237,69 @@ public:
             }
             _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-            parameters[i] = { static_cast<uint32_t>(width), row_words, static_cast<uint32_t>(std::max(0, video_options[i].pixel_difference)) };
+            parameters[i] = { static_cast<uint32_t>(frame->width), plan.luma_row_words,
+                              static_cast<uint32_t>(std::max(0, video_options[i].pixel_difference)),
+                              static_cast<uint32_t>(plan.layout.chroma), static_cast<uint32_t>(plan.layout.shift_x),
+                              static_cast<uint32_t>(plan.layout.shift_y), plan.chroma_row_bytes, plan.v_offset };
             slot_video.compared = compare;
-            slot_video.height = height;
-            slot_video.width = width;
+            slot_video.height = frame->height;
+            slot_video.width = frame->width;
         }
 
         // lock the decoded images while their state is read and updated
         for (SlotVideo & slot_video : slot.videos) _lock(slot_video.frame, true);
+
+        // one barrier / semaphore wait + signal per VkImage of every frame
+        std::vector<VkImageMemoryBarrier2> image_barriers;
+        std::vector<VkSemaphoreSubmitInfo> waits;
+        std::vector<VkSemaphoreSubmitInfo> signals;
+        for (size_t i = 0; i < _videos.size(); ++i)
+        {
+            const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(slot.videos[i].frame->data[0]);
+            for (int j = 0; j < image_count(vkf); ++j)
+            {
+                VkImageMemoryBarrier2 barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                barrier.srcAccessMask = vkf->access[j];
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                barrier.oldLayout = vkf->layout[j];
+                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier.srcQueueFamilyIndex = vkf->queue_family[j];
+                barrier.dstQueueFamilyIndex = vkf->queue_family[j] == VK_QUEUE_FAMILY_IGNORED ? VK_QUEUE_FAMILY_IGNORED : _queue_family;
+                barrier.image = vkf->img[j];
+                barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                image_barriers.push_back(barrier);
+
+                VkSemaphoreSubmitInfo wait { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                wait.semaphore = vkf->sem[j];
+                wait.value = vkf->sem_value[j];
+                wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                waits.push_back(wait);
+                wait.value = vkf->sem_value[j] + 1;
+                signals.push_back(wait);
+            }
+        }
 
         check(_fn.vkResetCommandBuffer(slot.command_buffer, 0), "vkResetCommandBuffer");
         VkCommandBufferBeginInfo begin { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(_fn.vkBeginCommandBuffer(slot.command_buffer, &begin), "vkBeginCommandBuffer");
 
-        // earlier submissions read / wrote the luma buffers, the decoded images become copy sources
+        // earlier submissions read / wrote the plane buffers, the decoded images become copy sources
         VkMemoryBarrier2 before { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         before.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
         before.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
         before.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
         before.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        for (size_t i = 0; i < _videos.size(); ++i)
-        {
-            const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(slot.videos[i].frame->data[0]);
-            VkImageMemoryBarrier2 & barrier = image_barriers[i];
-            barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            barrier.srcAccessMask = vkf->access[0];
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-            barrier.oldLayout = vkf->layout[0];
-            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.srcQueueFamilyIndex = vkf->queue_family[0];
-            barrier.dstQueueFamilyIndex = vkf->queue_family[0] == VK_QUEUE_FAMILY_IGNORED ? VK_QUEUE_FAMILY_IGNORED : _queue_family;
-            barrier.image = vkf->img[0];
-            barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        }
         VkDependencyInfo dependency { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         dependency.memoryBarrierCount = 1;
         dependency.pMemoryBarriers = &before;
-        dependency.imageMemoryBarrierCount = static_cast<uint32_t>(_videos.size());
+        dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_barriers.size());
         dependency.pImageMemoryBarriers = image_barriers.data();
         _fn.vkCmdPipelineBarrier2(slot.command_buffer, &dependency);
 
-        for (size_t i = 0; i < _videos.size(); ++i)
-        {
-            const AVFrame * frame = slot.videos[i].frame;
-            const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(frame->data[0]);
-            // one VkImage per frame (multiplane format) or one per plane
-            const bool multiplane = vkf->img[1] == VK_NULL_HANDLE;
-            VkBufferImageCopy region {};
-            region.bufferRowLength = parameters[i].row_words * 4;
-            region.bufferImageHeight = static_cast<uint32_t>(frame->height);
-            region.imageSubresource = { static_cast<VkImageAspectFlags>(multiplane ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1 };
-            // hardware frames keep the top / left cropping in the frame properties
-            region.imageOffset = { static_cast<int32_t>(frame->crop_left), static_cast<int32_t>(frame->crop_top), 0 };
-            region.imageExtent = { static_cast<uint32_t>(frame->width), static_cast<uint32_t>(frame->height), 1 };
-            _fn.vkCmdCopyImageToBuffer(slot.command_buffer, vkf->img[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       slot.videos[i].luma->buffer, 1, &region);
-        }
+        for (size_t i = 0; i < _videos.size(); ++i) _record_copies(slot.command_buffer, slot.videos[i]);
 
         VkMemoryBarrier2 copied { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         copied.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -296,25 +332,14 @@ public:
         _fn.vkCmdPipelineBarrier2(slot.command_buffer, &host_dependency);
         check(_fn.vkEndCommandBuffer(slot.command_buffer), "vkEndCommandBuffer");
 
-        // wait for the decoder's work on each image and signal our use of it
-        for (size_t i = 0; i < _videos.size(); ++i)
-        {
-            const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(slot.videos[i].frame->data[0]);
-            waits[i] = { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-            waits[i].semaphore = vkf->sem[0];
-            waits[i].value = vkf->sem_value[0];
-            waits[i].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            signals[i] = waits[i];
-            signals[i].value = vkf->sem_value[0] + 1;
-        }
         VkCommandBufferSubmitInfo command_info { VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
         command_info.commandBuffer = slot.command_buffer;
         VkSubmitInfo2 submit { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-        submit.waitSemaphoreInfoCount = static_cast<uint32_t>(_videos.size());
+        submit.waitSemaphoreInfoCount = static_cast<uint32_t>(waits.size());
         submit.pWaitSemaphoreInfos = waits.data();
         submit.commandBufferInfoCount = 1;
         submit.pCommandBufferInfos = &command_info;
-        submit.signalSemaphoreInfoCount = static_cast<uint32_t>(_videos.size());
+        submit.signalSemaphoreInfoCount = static_cast<uint32_t>(signals.size());
         submit.pSignalSemaphoreInfos = signals.data();
 
         VkResult result = _fn.vkResetFences(_device, 1, &slot.fence);
@@ -326,13 +351,17 @@ public:
         }
         if (result == VK_SUCCESS)
         {
+            size_t barrier_index = 0;
             for (size_t i = 0; i < _videos.size(); ++i)
             {
                 AVVkFrame * vkf = reinterpret_cast<AVVkFrame *>(slot.videos[i].frame->data[0]);
-                vkf->sem_value[0] += 1;
-                vkf->layout[0] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                vkf->access[0] = VK_ACCESS_2_TRANSFER_READ_BIT;
-                vkf->queue_family[0] = image_barriers[i].dstQueueFamilyIndex;
+                for (int j = 0; j < image_count(vkf); ++j)
+                {
+                    vkf->sem_value[j] += 1;
+                    vkf->layout[j] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    vkf->access[j] = VK_ACCESS_2_TRANSFER_READ_BIT;
+                    vkf->queue_family[j] = image_barriers[barrier_index++].dstQueueFamilyIndex;
+                }
             }
         }
         for (SlotVideo & slot_video : slot.videos) _lock(slot_video.frame, false);
@@ -402,12 +431,27 @@ private:
         bool coherent = true;
     };
 
+    //! how the planes of a frame are laid out in the buffers
+    struct Plan {
+        AVPixelFormat format = AV_PIX_FMT_NONE;
+        ffmpeg::YuvLayout layout;
+        uint32_t luma_row_words = 0;
+        VkDeviceSize luma_bytes = 0;
+        uint32_t chroma_width = 0;
+        uint32_t chroma_height = 0;
+        uint32_t chroma_row_bytes = 0;
+        uint32_t v_offset = 0;
+        VkDeviceSize chroma_bytes = 0;
+    };
+
     struct VideoState {
         std::unique_ptr<ffmpeg::VideoDecoder> decoder;
         //! decoded while probing, the first submission
         AVFrame * first_frame = nullptr;
-        //! luma ping pong buffers
+        //! ping pong buffers of the planes
         Buffer luma[2];
+        Buffer chroma[2];
+        AVPixelFormat format = AV_PIX_FMT_NONE;
         int current = 0;
         int width = 0;
         int height = 0;
@@ -417,8 +461,10 @@ private:
     struct SlotVideo {
         AVFrame * frame = nullptr;
         Buffer row_counts;
-        //! luma buffer the frame is copied to
+        //! buffers the planes of the frame are copied to
+        Plan plan;
         const Buffer * luma = nullptr;
+        const Buffer * chroma = nullptr;
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         bool compared = false;
         int width = 0;
@@ -432,6 +478,73 @@ private:
         std::vector<SlotVideo> videos;
     };
 
+    //! buffer layout of the planes of a decoded frame
+    Plan _plan(const AVFrame * frame) const
+    {
+        const AVHWFramesContext * frames = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
+        Plan plan;
+        plan.format = frames->sw_format;
+        plan.layout = ffmpeg::yuv_layout(frames->sw_format);
+        plan.luma_row_words = static_cast<uint32_t>((frame->width + 3) / 4);
+        plan.luma_bytes = static_cast<VkDeviceSize>(plan.luma_row_words) * 4 * static_cast<VkDeviceSize>(frame->height);
+        plan.chroma_width = static_cast<uint32_t>(AV_CEIL_RSHIFT(frame->width, plan.layout.shift_x));
+        plan.chroma_height = static_cast<uint32_t>(AV_CEIL_RSHIFT(frame->height, plan.layout.shift_y));
+        uint32_t bytes = 4; // placeholder buffer without chroma
+        if (plan.layout.chroma == ffmpeg::YuvLayout::Interleaved)
+        {
+            plan.chroma_row_bytes = 2 * plan.chroma_width;
+            bytes = plan.chroma_row_bytes * plan.chroma_height;
+        }
+        else if (plan.layout.chroma == ffmpeg::YuvLayout::Planar)
+        {
+            plan.chroma_row_bytes = plan.chroma_width;
+            plan.v_offset = align4(plan.chroma_width * plan.chroma_height);
+            bytes = plan.v_offset + plan.chroma_width * plan.chroma_height;
+        }
+        plan.chroma_bytes = align4(bytes);
+        return plan;
+    }
+
+    //! copies the planes of the decoded image into the luma / chroma buffers of the slot
+    void _record_copies(VkCommandBuffer command_buffer, const SlotVideo & slot_video)
+    {
+        const AVFrame * frame = slot_video.frame;
+        const AVVkFrame * vkf = reinterpret_cast<const AVVkFrame *>(frame->data[0]);
+        const Plan & plan = slot_video.plan;
+        const int planes = plan.layout.chroma == ffmpeg::YuvLayout::None ? 1 : (plan.layout.chroma == ffmpeg::YuvLayout::Interleaved ? 2 : 3);
+        const int images = image_count(vkf);
+        // one multiplane image or one image per plane
+        const bool multiplane = images == 1 && planes > 1;
+        if (!multiplane && images != planes) throw std::runtime_error("unsupported Vulkan frame layout");
+        const VkImageAspectFlagBits plane_aspects[3] = { VK_IMAGE_ASPECT_PLANE_0_BIT, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_IMAGE_ASPECT_PLANE_2_BIT };
+
+        auto copy = [&](int plane, VkBuffer buffer, VkDeviceSize offset, uint32_t row_texels, uint32_t width, uint32_t height,
+                        int shift_x, int shift_y) {
+            VkBufferImageCopy region {};
+            region.bufferOffset = offset;
+            region.bufferRowLength = row_texels;
+            region.bufferImageHeight = height;
+            region.imageSubresource = { static_cast<VkImageAspectFlags>(multiplane ? plane_aspects[plane] : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1 };
+            // hardware frames keep the top / left cropping in the frame properties
+            region.imageOffset = { static_cast<int32_t>(frame->crop_left >> shift_x), static_cast<int32_t>(frame->crop_top >> shift_y), 0 };
+            region.imageExtent = { width, height, 1 };
+            _fn.vkCmdCopyImageToBuffer(command_buffer, vkf->img[multiplane ? 0 : plane], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+        };
+        copy(0, slot_video.luma->buffer, 0, plan.luma_row_words * 4, static_cast<uint32_t>(frame->width), static_cast<uint32_t>(frame->height), 0, 0);
+        const int sx = plan.layout.shift_x;
+        const int sy = plan.layout.shift_y;
+        if (plan.layout.chroma == ffmpeg::YuvLayout::Interleaved)
+        {
+            // UV pairs, row length in (2 byte) texels
+            copy(1, slot_video.chroma->buffer, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+        }
+        else if (plan.layout.chroma == ffmpeg::YuvLayout::Planar)
+        {
+            copy(1, slot_video.chroma->buffer, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+            copy(2, slot_video.chroma->buffer, plan.v_offset, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
+        }
+    }
+
     static void _check_frame(const AVFrame * frame, const ffmpeg::VideoDecoder & decoder)
     {
         if (frame->format != AV_PIX_FMT_VULKAN || !frame->hw_frames_ctx) throw std::runtime_error("no Vulkan decoding for " + decoder.codec_name());
@@ -439,7 +552,7 @@ private:
         if (!ffmpeg::is_luma_format(frames->sw_format))
         {
             const char * name = av_get_pix_fmt_name(frames->sw_format);
-            throw std::runtime_error(std::string("pixel format ") + (name ? name : "unknown") + " has no 8-bit luma plane");
+            throw std::runtime_error(std::string("pixel format ") + (name ? name : "unknown") + " is no 8-bit YUV format");
         }
     }
 
@@ -529,8 +642,8 @@ private:
 
     void _create_pipeline()
     {
-        std::array<VkDescriptorSetLayoutBinding, 3> bindings {};
-        for (uint32_t b = 0; b < 3; ++b)
+        std::array<VkDescriptorSetLayoutBinding, kBindings> bindings {};
+        for (uint32_t b = 0; b < kBindings; ++b)
         {
             bindings[b].binding = b;
             bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -551,8 +664,8 @@ private:
         check(_fn.vkCreatePipelineLayout(_device, &layout_info, nullptr, &_pipeline_layout), "vkCreatePipelineLayout");
 
         VkShaderModuleCreateInfo module_info { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-        module_info.codeSize = sizeof(kLumaDiffSpirv);
-        module_info.pCode = kLumaDiffSpirv;
+        module_info.codeSize = sizeof(kYuvDiffSpirv);
+        module_info.pCode = kYuvDiffSpirv;
         VkShaderModule module = VK_NULL_HANDLE;
         check(_fn.vkCreateShaderModule(_device, &module_info, nullptr, &module), "vkCreateShaderModule");
         VkComputePipelineCreateInfo pipeline_info { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -569,7 +682,7 @@ private:
     void _create_slots()
     {
         const uint32_t set_count = static_cast<uint32_t>(kSlots * _videos.size());
-        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * set_count };
+        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kBindings * set_count };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         pool_info.maxSets = set_count;
         pool_info.poolSizeCount = 1;
@@ -670,8 +783,8 @@ private:
             }
             for (VideoState & video : _videos)
             {
-                _destroy_buffer(video.luma[0]);
-                _destroy_buffer(video.luma[1]);
+                for (Buffer & buffer : video.luma) _destroy_buffer(buffer);
+                for (Buffer & buffer : video.chroma) _destroy_buffer(buffer);
             }
             if (_command_pool) _fn.vkDestroyCommandPool(_device, _command_pool, nullptr);
             if (_descriptor_pool) _fn.vkDestroyDescriptorPool(_device, _descriptor_pool, nullptr);
