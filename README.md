@@ -123,8 +123,8 @@ in lossy recordings.
 ## Motion analysis (`--motion`)
 
 The framerate only counts new frames. `--motion` also measures how evenly the animation advances,
-i.e. whether the video looks smooth. It needs coherent motion (a moving camera, scrolling, driving);
-for a static camera it only reports that the motion isn't usable.
+i.e. whether the video looks smooth. It needs motion it can track - a moving camera, scrolling, driving,
+or moving objects which cover at least 2% of the picture; the rest may be static.
 
 ```
 trdrop-pp capture.mkv --motion -o capture.csv
@@ -134,17 +134,23 @@ python scripts/smoothness.py capture.csv --fps 60 -o smoothness.png
 How it works:
 
 1. Motion vectors between consecutive frames, sub pixel accurate (pyramidal Lucas-Kanade on the luma at up
-   to 1920x1080), reduced to the median vector per cell of an 8x5 grid:
-   * GPU (with Vulkan Video decoding): a regular grid of 64x40 points is tracked by compute shaders
-     (`src/vulkan/motion_pyramid.comp`, `motion_lk.comp`), the frames stay on the GPU and only the tracked
-     points are read back. Points without texture or whose surroundings don't match afterwards are dropped.
-   * CPU (`--decode ffmpeg` / `opencv`): up to 800 corners are tracked with OpenCV.
+   to 1920x1080) at a regular grid of 64x40 points. A point is used if its surroundings have texture and if
+   tracking it back from where it arrived ends within 1 pixel of the point - wrong matches (repeating texture,
+   motion too large) don't come back. The points are reduced to the median vector per cell of a 32x20 grid
+   (4 points per cell, at least 2 of them).
+   * GPU (with Vulkan Video decoding): compute shaders (`src/vulkan/motion_pyramid.comp`, `motion_lk.comp`),
+     the frames stay on the GPU and only the tracked points are read back.
+   * CPU (`--decode ffmpeg` / `opencv`): OpenCV.
 2. Animation step of a frame: the common scale of its motion field relative to the average motion field
-   in a window around it (triangular weights): `m_cell = step * v_cell`. It is the weighted median over the
-   cells of `m.v / |v|^2`, so pans, forward motion (the cells move in different directions) and static
-   overlays work. `1` means the frame advanced as much as a display interval does on average, `0` a
-   duplicate, `2` twice as much. A frame isn't used if its cells disagree completely (median deviation of
-   more than 75% of the step, e.g. cuts); in real footage they typically differ by 20 - 30%.
+   in a window around it (triangular weights): `m_cell = step * v_cell`. Every cell with motion (at least
+   0.5 pixels per frame on average) has one vote, `m.v / |v|^2`, and the weighted median of the votes is the
+   step. So pans, forward motion (the cells move in different directions), static overlays and a picture of
+   which only a part moves all work: a frame needs 12 voting cells (2% of the picture). `1` means the frame
+   advanced as much as a display interval does on average, `0` a duplicate, `2` twice as much. The steps are
+   scaled so that the animation advances by one interval per displayed interval on average over the window.
+   The cells never agree exactly in real footage (the depth of what a cell shows changes, objects move on
+   their own). No frame is dropped for that; instead the spread of the votes (their scaled median absolute
+   deviation) is written next to the step.
    The window is 400 ms and grows up to 1 second until it holds 10 new frames: with a low framerate a
    short window only holds a few steps, their average follows them and hides their differences.
    `--motion-window <ms>` sets a fixed length.
@@ -161,17 +167,19 @@ Additional CSV columns (empty where not available):
 | column | meaning |
 | --- | --- |
 | `vN_anim_step` | animation step of the frame in display intervals; empty without usable motion |
+| `vN_anim_step_spread` | how much the moving parts of the picture disagree about the step, in display intervals (`0`: rigid motion). A difference between two steps which is smaller than this says little |
 | `vN_anim_error_ms` | new frames: animation error |
 | `vN_perceived_fps` | perceived smoothness over the last second (needs 6 steps and usable motion in half of it) |
 
 and a summary line per video:
 
 ```
-v1 motion: measured 239 of 239 new frames (100.0%) | 60.00 new frames/s | perceived smoothness 48.04 fps (10% low 47.99, whole video 48.03) | animation error median 8.31 ms avg 8.32 ms p95 8.61 ms max 8.96 ms
+v1 motion: measured 239 of 239 new frames (100.0%) | 60.00 new frames/s | perceived smoothness 48.02 fps (10% low 47.98, whole video 48.01) | animation error median 8.32 ms avg 8.32 ms p95 8.61 ms max 8.95 ms (spread of the votes on a step: 0.12 ms)
 ```
 
 The perceived smoothness is the median of the values over one second each (and their 10th percentile),
-which a single long step hardly changes; "whole video" is the same formula over all steps.
+which a single long step hardly changes; "whole video" is the same formula over all steps. The spread
+is the median of `vN_anim_step_spread` over the new frames, as time.
 
 Accuracy with known answers (H.264 versions of the [fixtures](#tests); GPU and CPU agree within 0.1 fps / 0.1 ms):
 
@@ -179,31 +187,39 @@ Accuracy with known answers (H.264 versions of the [fixtures](#tests); GPU and C
 | --- | --- | --- |
 | even pan / forward motion | 60 fps, error 0 | 60.00 fps, avg 0.1 ms |
 | new frame every 2nd frame | 30 fps, error 0 | 30.00 fps, avg 0.2 ms |
-| steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 48.04 fps, avg 8.32 ms |
+| steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 48.0 fps, avg 8.3 ms |
+| the same, but only a window of 5% of the picture moves | 48 fps, error 8.33 ms | 47.9 fps, avg 8.4 ms |
 | freeze of 5 frames, time lost | one error of -83.3 ms | -75.8 ms |
 | new frame every 4th frame, steps of 3 / 4 / 5 intervals, fast pan / forward motion | 14.55 fps, errors -16.7 / 0 / +16.7 ms | 14.66 fps, the errors are off by 3.2 ms on average |
+| real footage: a 4K 60 fps game recording re-timed to a new frame every 4th frame which advances by 3 / 4 / 5 source frames (truth: the steps the 60 fps source itself shows) | 13.3 fps, errors of 17.5 ms on average | 13.5 fps (CPU) / 13.8 fps (GPU), the errors are off by 10 - 11 ms on average (median 7 ms) and 3.5 ms too positive |
 
 Speed with the motion analysis (decoding + comparison + motion, RTX 4070 SUPER / i7-14700KF):
 
 | video | CPU (`--decode ffmpeg`) | GPU (default) |
 | --- | --- | --- |
-| 4K H.264 recordings | 85 - 93 fps | 236 - 244 fps |
-| 1440p HEVC capture | 151 fps | 846 fps |
+| 4K H.264 recordings | 127 - 174 fps | 236 - 244 fps |
+| 1440p HEVC capture | 236 fps | 807 fps |
 
 Limits:
 
 * A frame is compared to the average motion around it, which assumes that the real motion changes slowly
-  within the window. Hard stops look like errors; around a freeze the neighbouring frames get a few ms of
-  error (the freeze lowers the average).
-* Real recordings: on a 4K driving recording (15 - 17 fps content in a 60 fps video) 86% of the new frames
-  are measured, the GPU and CPU implementation agree on the perceived smoothness within 3% (15.2 / 14.8 fps)
-  and on the steps of the frames both measure (correlation 0.97). The animation errors lean positive there
-  (+6 to +9 ms on average, measured steps about 9% longer than the display time): with changing speed the
-  frames on the faster side of the window are measured more often. The perceived smoothness doesn't depend
-  on that scale, single animation errors of real footage should be read with care.
+  within the window: a camera that speeds up can't be told from frames that advance further. Hard stops look
+  like errors; around a freeze the neighbouring frames get a few ms of error (the freeze lowers the average).
+* Single animation errors of real footage should be read with care: with the known answer above they are off
+  by about 10 ms, which is also what the spread of the votes says there (9 - 10 ms; 0.1 ms for the rigid
+  fixtures). The spread doesn't contain the first limit. The perceived smoothness averages over many steps
+  and doesn't depend on their scale; it was within 1 - 3% of the truth.
+* On a 4K driving recording (15 - 17 fps content in a 60 fps video) 91% (GPU) / 92% (CPU) of the new frames
+  are measured, both agree on the perceived smoothness within 1% (14.6 / 14.4 fps) and on the steps of the
+  frames both measure (correlation 0.98).
+* Only what can be tracked counts as motion: the camera, characters, vehicles. Flames, particles, water and
+  the like can't. In a recording with a static camera, a walking character and a fire, 17% of the new
+  frames are measured - those in which the character covers enough of the picture.
+* Parts of the picture which update at different rates (e.g. a 30 fps animation in a 60 fps camera pan) are
+  not separated, the larger part wins.
 * It can't tell whether uneven steps come from the game or from the recording.
 * The GPU path needs Vulkan Video decoding (`--decode vulkan`, or `auto`, which prefers it with `--motion`);
-  other sources (e.g. lossless RGB) are measured on the CPU, about 10 ms per 4K frame.
+  other sources (e.g. lossless RGB) are measured on the CPU.
 * The rows of the CSV are written with a delay of up to half a second (the look ahead of the window).
 
 ## Plotting
@@ -223,7 +239,7 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | --- | --- |
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
-| `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time and as histogram |
+| `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).
 Frametimes are multiples of `1000 / recorded fps`, so by default every distinct value gets its own bar;
@@ -403,6 +419,7 @@ lossless test videos with a known pattern:
 | `motion_uneven.avi` | pan, the frames advance by 0.5 / 1.5 intervals | error -8.3 / +8.3 ms, perceived 48 fps |
 | `motion_hitch.avi` | pan, frames 100-104 freeze (time lost), frames 170-173 freeze and 174 catches up | error -83.3 ms at frame 105, step 5 without error at 174 |
 | `motion_zoom.avi` | forward motion (zoom), even | step 1, error 0, perceived 60 fps |
+| `motion_partial.avi` | a static picture, only a window of 5% of it shows the pan advancing by 0.5 / 1.5 intervals | error -8.3 / +8.3 ms, perceived 48 fps |
 
 ```
 build/trdrop_make_fixtures test-out/fixtures

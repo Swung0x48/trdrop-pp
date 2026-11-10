@@ -73,20 +73,15 @@ struct LkPush {
     uint32_t grid_x;
     uint32_t grid_y;
     uint32_t iterations;
+    float max_residual;
 };
 
-//! the motion is measured at a regular grid of points (a multiple of the cell grid), at up to 1920x1080
-constexpr uint32_t kMotionPointsX = 8 * kMotionGridX;
-constexpr uint32_t kMotionPointsY = 8 * kMotionGridY;
+//! the motion is measured at the grid of points of motion.h, at up to 1920x1080
 constexpr uint32_t kMotionPoints = kMotionPointsX * kMotionPointsY;
-constexpr uint32_t kMotionIterations = 5;
+constexpr uint32_t kMotionIterations = 20; // at most, per level
 constexpr uint32_t kMotionGroupSize = 256; // local_size_x of motion_lk.comp
-//! a point is used if its window has texture in both directions (smaller eigenvalue of the gradient
-//! matrix per pixel) and the frames match there after the tracking (mean absolute difference)
-constexpr float kMinTexture = 1.0f;
+//! the frames have to match at a point after the tracking (mean absolute difference)
 constexpr float kMaxResidual = 12.0f;
-//! a cell needs this many of its 64 points
-constexpr size_t kMinCellPoints = 6;
 
 //! pyramid of the luma plane a frame's motion is measured on
 struct MotionLayout {
@@ -761,6 +756,7 @@ private:
             push.grid_x = kMotionPointsX;
             push.grid_y = kMotionPointsY;
             push.iterations = kMotionIterations;
+            push.max_residual = kMaxResidual;
             _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.layout, 0, 1, &slot_video.lk_set, 0, nullptr);
             _fn.vkCmdPushConstants(slot.command_buffer, _lk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
             _fn.vkCmdDispatch(slot.command_buffer, kMotionPoints, 1, 1);
@@ -781,36 +777,19 @@ private:
             range.size = VK_WHOLE_SIZE;
             check(_fn.vkInvalidateMappedMemoryRanges(_device, 1, &range), "vkInvalidateMappedMemoryRanges");
         }
-        for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
-        {
-            _cell_dx[cell].clear();
-            _cell_dy[cell].clear();
-        }
+        _binner.clear();
         const float * points = static_cast<const float *>(slot_video.motion_points.mapped);
-        for (uint32_t y = 0; y < kMotionPointsY; ++y)
+        for (int y = 0; y < kMotionPointsY; ++y)
         {
-            for (uint32_t x = 0; x < kMotionPointsX; ++x)
+            for (int x = 0; x < kMotionPointsX; ++x)
             {
                 const float * point = points + 4 * (y * kMotionPointsX + x);
-                // (dx, dy, texture, residual)
-                if (!(point[2] >= kMinTexture) || !(point[3] <= kMaxResidual) || !std::isfinite(point[0]) || !std::isfinite(point[1])) continue;
-                const size_t cell = (y * kMotionGridY / kMotionPointsY) * kMotionGridX + x * kMotionGridX / kMotionPointsX;
-                _cell_dx[cell].push_back(point[0]);
-                _cell_dy[cell].push_back(point[1]);
+                // (dx, dy, texture, distance by which the way back misses the point)
+                if (!(point[2] >= kMotionMinTexture) || !(point[3] <= kMotionMaxBackError) || !std::isfinite(point[0]) || !std::isfinite(point[1])) continue;
+                _binner.add((static_cast<float>(x) + 0.5f) / kMotionPointsX, (static_cast<float>(y) + 0.5f) / kMotionPointsY, point[0], point[1]);
             }
         }
-        for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
-        {
-            std::vector<float> & dx = _cell_dx[cell];
-            std::vector<float> & dy = _cell_dy[cell];
-            if (dx.size() < kMinCellPoints) continue;
-            const auto middle = static_cast<std::ptrdiff_t>(dx.size() / 2);
-            std::nth_element(dx.begin(), dx.begin() + middle, dx.end());
-            std::nth_element(dy.begin(), dy.begin() + middle, dy.end());
-            field.points[cell] = static_cast<uint16_t>(dx.size());
-            field.dx[cell] = dx[static_cast<size_t>(middle)] * field.pixel_scale;
-            field.dy[cell] = dy[static_cast<size_t>(middle)] * field.pixel_scale;
-        }
+        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);
     }
 
     static void _check_frame(const AVFrame * frame, const ffmpeg::VideoDecoder & decoder)
@@ -1178,8 +1157,7 @@ private:
     bool _motion = false;
     Compute _pyramid;
     Compute _lk;
-    std::array<std::vector<float>, kMotionCells> _cell_dx;
-    std::array<std::vector<float>, kMotionCells> _cell_dy;
+    MotionCellBinner _binner;
 
     VkDescriptorSetLayout _set_layout = VK_NULL_HANDLE;
     VkPipelineLayout _pipeline_layout = VK_NULL_HANDLE;

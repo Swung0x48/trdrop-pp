@@ -13,16 +13,12 @@ namespace {
 //! the motion is measured at up to this resolution
 constexpr double kMaxWidth = 1920.0;
 constexpr double kMaxHeight = 1080.0;
-constexpr int kMaxCorners = 800;
-//! a cell needs this many tracked points
-constexpr int kMinPoints = 3;
-
 //! reference motion of a cell: at least this speed (pixels per frame at the measured resolution) ...
 constexpr double kMinSpeed = 0.5;
-//! ... and tracked in this share of the frames of the window
-constexpr double kMinTrackedShare = 0.6;
-//! a frame needs this many usable cells
-constexpr int kMinCells = 6;
+//! ... and tracked in this share of the new frames of the window
+constexpr double kMinTrackedShare = 0.3;
+//! a frame needs this many cells with motion (2% of the picture)
+constexpr int kMinCells = kMotionCells / 50;
 //! a frame whose animation step is smaller didn't advance the animation
 constexpr double kMinStep = 0.3;
 //! ... it is a duplicate if less than this share of its pixels changed, otherwise the scene changed without moving
@@ -31,10 +27,6 @@ constexpr double kDuplicateShare = 0.02;
 constexpr double kDefaultWindowMs = 400.0;
 constexpr double kMaxWindowSeconds = 1.0;
 constexpr size_t kMinWindowFrames = 10;
-//! the cells have to agree roughly on the step of a frame: their median deviation from it, relative to
-//! max(1, step), may be at most this. In real footage the cells typically deviate by 20 - 30% (the depth
-//! of what a cell shows changes), this only drops frames whose motion isn't the average motion scaled at all
-constexpr double kMaxStepSpread = 0.75;
 //! the perceived smoothness needs this many steps and this share of measurable frames in the last second
 constexpr size_t kMinRollingSteps = 6;
 constexpr double kMinRollingMeasurable = 0.5;
@@ -54,7 +46,72 @@ float median(std::vector<float> & values)
     return *middle;
 }
 
+//! weighted median of (value, weight) pairs with the sum of weights `total`: the first value, in ascending
+//! order, at which the cumulated weight reaches half of the total. Reorders the pairs.
+double weighted_median(std::pair<double, double> * begin, std::pair<double, double> * end, double total)
+{
+    if (begin == end) return 0.0;
+    const double half = 0.5 * total;
+    double below = 0.0; // weight of the pairs before begin
+    while (end - begin > 16)
+    {
+        std::pair<double, double> * middle = begin + (end - begin) / 2;
+        std::nth_element(begin, middle, end);
+        double left = 0.0;
+        for (const std::pair<double, double> * pair = begin; pair < middle; ++pair) left += pair->second;
+        if (below + left >= half)
+        {
+            end = middle;
+        }
+        else if (below + left + middle->second >= half)
+        {
+            return middle->first;
+        }
+        else
+        {
+            below += left + middle->second;
+            begin = middle + 1;
+        }
+    }
+    std::sort(begin, end);
+    for (const std::pair<double, double> * pair = begin; pair < end; ++pair)
+    {
+        below += pair->second;
+        if (below >= half) return pair->first;
+    }
+    return (end - 1)->first;
+}
+
 } // namespace
+
+void MotionCellBinner::add(float x, float y, float dx, float dy)
+{
+    const int cell_x = std::min(kMotionGridX - 1, std::max(0, static_cast<int>(x * kMotionGridX)));
+    const int cell_y = std::min(kMotionGridY - 1, std::max(0, static_cast<int>(y * kMotionGridY)));
+    _points.push_back({ static_cast<uint16_t>(cell_y * kMotionGridX + cell_x), dx, dy });
+}
+
+void MotionCellBinner::finish(MotionField & field, size_t min_points, float scale)
+{
+    std::sort(_points.begin(), _points.end(), [](const Point & a, const Point & b) { return a.cell < b.cell; });
+    for (size_t begin = 0; begin < _points.size();)
+    {
+        size_t end = begin;
+        while (end < _points.size() && _points[end].cell == _points[begin].cell) ++end;
+        if (end - begin >= min_points)
+        {
+            const size_t cell = _points[begin].cell;
+            field.points[cell] = static_cast<uint8_t>(std::min<size_t>(end - begin, 255));
+            _values.clear();
+            for (size_t k = begin; k < end; ++k) _values.push_back(_points[k].dx);
+            field.dx[cell] = median(_values) * scale;
+            _values.clear();
+            for (size_t k = begin; k < end; ++k) _values.push_back(_points[k].dy);
+            field.dy[cell] = median(_values) * scale;
+        }
+        begin = end;
+    }
+}
 
 MotionField MotionEstimator::estimate(const cv::Mat & luma)
 {
@@ -70,41 +127,35 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma)
     if (!_previous_pyramid.empty() && _previous_size == _current.size())
     {
         field.estimated = true;
-        // corners are detected at half the resolution (level 1 of the pyramid) for large frames, they only seed the tracking
-        const int corner_level = _current.cols > 960 && levels >= 1 ? 1 : 0;
-        const cv::Mat & corner_image = _previous_pyramid[static_cast<size_t>(2 * corner_level)];
-        const double min_distance = std::max(4.0, corner_image.cols / 80.0);
-        cv::goodFeaturesToTrack(corner_image, _corners, kMaxCorners, 0.01, min_distance, cv::noArray(), corner_level == 1 ? 5 : 7);
-        if (corner_level == 1)
+        if (_points.empty() || _points_size != _current.size())
         {
-            for (cv::Point2f & corner : _corners) corner = cv::Point2f(corner.x * 2.0f + 0.5f, corner.y * 2.0f + 0.5f);
-        }
-        if (_corners.size() >= 8)
-        {
-            cv::calcOpticalFlowPyrLK(_previous_pyramid, _current_pyramid, _corners, _tracked, _status, _error, window, levels,
-                                     cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 20, 0.01));
-            for (int cell = 0; cell < kMotionCells; ++cell)
+            _points_size = _current.size();
+            _points.clear();
+            for (int y = 0; y < kMotionPointsY; ++y)
             {
-                _cell_dx[static_cast<size_t>(cell)].clear();
-                _cell_dy[static_cast<size_t>(cell)].clear();
-            }
-            for (size_t p = 0; p < _corners.size(); ++p)
-            {
-                if (!_status[p]) continue;
-                const int cell_x = std::min(kMotionGridX - 1, std::max(0, static_cast<int>(_corners[p].x) * kMotionGridX / _current.cols));
-                const int cell_y = std::min(kMotionGridY - 1, std::max(0, static_cast<int>(_corners[p].y) * kMotionGridY / _current.rows));
-                const size_t cell = static_cast<size_t>(cell_y * kMotionGridX + cell_x);
-                _cell_dx[cell].push_back(_tracked[p].x - _corners[p].x);
-                _cell_dy[cell].push_back(_tracked[p].y - _corners[p].y);
-            }
-            for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
-            {
-                if (_cell_dx[cell].size() < static_cast<size_t>(kMinPoints)) continue;
-                field.points[cell] = static_cast<uint16_t>(std::min<size_t>(_cell_dx[cell].size(), 65535));
-                field.dx[cell] = median(_cell_dx[cell]) * field.pixel_scale;
-                field.dy[cell] = median(_cell_dy[cell]) * field.pixel_scale;
+                for (int x = 0; x < kMotionPointsX; ++x)
+                {
+                    _points.emplace_back((static_cast<float>(x) + 0.5f) * static_cast<float>(_current.cols) / kMotionPointsX - 0.5f,
+                                         (static_cast<float>(y) + 0.5f) * static_cast<float>(_current.rows) / kMotionPointsY - 0.5f);
+                }
             }
         }
+        const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 20, 0.01);
+        // OpenCV's eigenvalue is the one of the gradient matrix per pixel / 1024 (derivatives * 32, sums / 2^20)
+        const double min_eigenvalue = kMotionMinTexture / 1024.0;
+        cv::calcOpticalFlowPyrLK(_previous_pyramid, _current_pyramid, _points, _tracked, _status, _error, window, levels, criteria, 0, min_eigenvalue);
+        // ... and back: a correct match returns to its point
+        cv::calcOpticalFlowPyrLK(_current_pyramid, _previous_pyramid, _tracked, _back, _back_status, _error, window, levels, criteria, 0, min_eigenvalue);
+        _binner.clear();
+        for (size_t p = 0; p < _points.size(); ++p)
+        {
+            if (!_status[p] || !_back_status[p]) continue;
+            const cv::Point2f back = _back[p] - _points[p];
+            if (back.x * back.x + back.y * back.y > kMotionMaxBackError * kMotionMaxBackError) continue;
+            _binner.add((_points[p].x + 0.5f) / static_cast<float>(_current.cols), (_points[p].y + 0.5f) / static_cast<float>(_current.rows),
+                        _tracked[p].x - _points[p].x, _tracked[p].y - _points[p].y);
+        }
+        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);
     }
     _previous_size = _current.size();
     std::swap(_previous_pyramid, _current_pyramid);
@@ -191,13 +242,9 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
         const size_t distance = k > position ? k - position : position - k;
         return static_cast<double>(half_window + 1 - distance);
     };
-    // Reference motion of a cell: its motion per display interval, v = sum(motion) / sum(display time) over the
-    // new frames of the window in which the cell was tracked. A new frame stands for the intervals since the
-    // previous new frame (its duplicates). If the cell wasn't tracked in a new frame - which mostly happens
-    // with fast motion - its motion and its time are left out; counting it as "no motion" would lower v.
-    const size_t count = last - first + 1;
-    _group_weight.assign(count, 0.0);  // per new frame: sum of the weights of its intervals
-    _group_scale.assign(count, 0.0);   // ... divided by the number of intervals
+    // The new frames of the window. A new frame stands for the intervals since the previous new frame (its
+    // duplicates): its weight is the sum of their weights.
+    _groups.clear();
     double window = 0.0;
     {
         double pending = 0.0;
@@ -213,60 +260,79 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
             pending += weight(k);
             ++intervals;
             if (_entries[k].duplicate) continue;
-            _group_weight[k - first] = pending;
-            _group_scale[k - first] = pending / static_cast<double>(intervals);
+            _groups.push_back({ &_entries[k].field, pending, pending / static_cast<double>(intervals) });
             window += pending;
             pending = 0.0;
             intervals = 0;
         }
     }
 
-    // animation step: weighted median over the cells of m.v / |v|^2
-    std::array<std::pair<double, double>, kMotionCells> ratios; // (ratio, weight)
-    size_t usable = 0;
-    double weight_sum = 0.0;
-    auto weighted_median = [&]() {
-        std::sort(ratios.begin(), ratios.begin() + static_cast<std::ptrdiff_t>(usable));
-        double cumulative = 0.0;
-        for (size_t k = 0; k < usable; ++k)
-        {
-            cumulative += ratios[k].second;
-            if (cumulative >= 0.5 * weight_sum) return ratios[k].first;
-        }
-        return 0.0;
-    };
+    // Reference motion of a cell: its motion per display interval, v = sum(motion) / sum(display time) over the
+    // new frames of the window in which the cell was tracked. If the cell wasn't tracked in a new frame - which
+    // mostly happens with fast motion - its motion and its time are left out; counting it as "no motion" would lower v.
+    size_t reference_cells = 0;
     if (entry.field.estimated && window > 0.0)
     {
         const double min_speed = kMinSpeed * entry.field.pixel_scale;
         for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
         {
-            if (entry.field.points[cell] < kMinPoints) continue;
             double vx = 0.0, vy = 0.0, tracked = 0.0;
-            for (size_t k = 0; k < count; ++k)
+            for (const Group & group : _groups)
             {
-                if (_group_weight[k] <= 0.0 || _entries[first + k].field.points[cell] < kMinPoints) continue;
-                vx += _group_scale[k] * _entries[first + k].field.dx[cell];
-                vy += _group_scale[k] * _entries[first + k].field.dy[cell];
-                tracked += _group_weight[k];
+                if (group.field->points[cell] == 0) continue;
+                vx += group.scale * group.field->dx[cell];
+                vy += group.scale * group.field->dy[cell];
+                tracked += group.weight;
             }
-            if (tracked / window <= kMinTrackedShare) continue;
+            _reference[cell].usable = false;
+            if (tracked <= kMinTrackedShare * window) continue;
             vx /= tracked;
             vy /= tracked;
             const double speed_squared = vx * vx + vy * vy;
             if (speed_squared < min_speed * min_speed) continue;
-            const double speed = std::sqrt(speed_squared);
-            ratios[usable++] = { (entry.field.dx[cell] * vx + entry.field.dy[cell] * vy) / speed_squared, speed };
-            weight_sum += speed;
+            _reference[cell] = { true, vx / speed_squared, vy / speed_squared, std::sqrt(speed_squared) };
+            ++reference_cells;
         }
     }
-    if (usable >= static_cast<size_t>(kMinCells))
+    // Step of a motion field: every cell with motion votes with m.v / |v|^2, the weighted median wins.
+    std::array<std::pair<double, double>, kMotionCells> votes; // (step, weight)
+    size_t voters = 0;
+    double weight_sum = 0.0;
+    auto step_of = [&](const MotionField & field) {
+        voters = 0;
+        weight_sum = 0.0;
+        for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
+        {
+            const Reference & v = _reference[cell];
+            if (!v.usable || field.points[cell] == 0) continue;
+            votes[voters++] = { field.dx[cell] * v.x + field.dy[cell] * v.y, v.speed };
+            weight_sum += v.speed;
+        }
+        return voters >= static_cast<size_t>(kMinCells) ? weighted_median(votes.data(), votes.data() + voters, weight_sum) : 0.0;
+    };
+    if (reference_cells >= static_cast<size_t>(kMinCells))
     {
-        sample.step = weighted_median();
-        // the cells have to agree roughly: weighted median of their deviations from the step
-        for (size_t k = 0; k < usable; ++k) ratios[k].first = std::fabs(ratios[k].first - sample.step);
-        const double spread = weighted_median();
-        sample.measurable = spread <= kMaxStepSpread * std::max(1.0, std::fabs(sample.step));
-        if (!sample.measurable) sample.step = 0.0;
+        // The steps are scaled so that the animation advances by one interval per displayed interval on average over
+        // the window. The reference motion alone doesn't ensure that: a cell is tracked more often in the frames with
+        // small steps, and the motion of a frame is part of its own reference.
+        double measured = 0.0, displayed = 0.0;
+        for (const Group & group : _groups)
+        {
+            const double step = step_of(*group.field);
+            if (voters < static_cast<size_t>(kMinCells)) continue;
+            measured += group.scale * std::max(0.0, step);
+            displayed += group.weight;
+        }
+        const double scale = measured > 0.0 ? displayed / measured : 1.0;
+        const double step = step_of(entry.field);
+        if (voters >= static_cast<size_t>(kMinCells))
+        {
+            sample.measurable = true;
+            sample.step = scale * step;
+            // the cells never agree exactly: scaled median absolute deviation of their votes
+            for (size_t k = 0; k < voters; ++k) votes[k].first = std::fabs(votes[k].first - step);
+            sample.step_spread = scale * 1.4826 * weighted_median(votes.data(), votes.data() + voters, weight_sum);
+        }
     }
 
     if (entry.field.estimated && !entry.duplicate) ++_new_frames;
@@ -305,6 +371,7 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
                 sample.error_ms = (_accumulated_step - static_cast<double>(_shown)) * 1000.0 / _fps;
                 _errors.push_back(static_cast<float>(sample.error_ms));
                 ++_animation_frames;
+                _step_spread.push_back(static_cast<float>(sample.step_spread));
                 _shown_total += _shown;
                 _step_sum += _accumulated_step;
                 _step_square_sum += _accumulated_step * _accumulated_step;
@@ -360,6 +427,11 @@ MotionAnalyzer::Summary MotionAnalyzer::summary() const
     if (_step_square_sum > 0.0 && _shown_total > 0)
     {
         result.perceived_fps = perceived_smoothness(_fps, _step_sum, _step_square_sum, static_cast<double>(_shown_total));
+    }
+    if (!_step_spread.empty())
+    {
+        std::vector<float> sorted = _step_spread;
+        result.median_step_spread_ms = median(sorted) * 1000.0 / _fps;
     }
     if (!_rolling_values.empty())
     {

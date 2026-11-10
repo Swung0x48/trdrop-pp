@@ -15,6 +15,8 @@
 // motion_hitch.avi   pan, frames 100-104 freeze and the time is lost       -> one error of -83.3 ms,
 //                    frames 170-173 freeze and frame 174 catches up        -> step 5 after 83.3 ms, error 0
 // motion_zoom.avi    forward motion (zoom), every frame advances evenly    -> step 1, error 0, perceived 60 fps
+// motion_partial.avi a static picture, only a window of 5% of it shows the
+//                    pan advancing by 0.5 / 1.5 intervals                  -> error -8.3 / +8.3 ms, perceived 48 fps
 
 #include <cmath>
 #include <cstdio>
@@ -95,6 +97,15 @@ cv::Mat zoom_frame(const cv::Mat & texture, double time)
                             , 0.0, scale, texture.rows / 2.0 - scale * kMotionSize.height / 2.0 };
     cv::Mat frame;
     cv::warpAffine(texture, frame, cv::Mat(2, 3, CV_64F, const_cast<double *>(matrix)), kMotionSize, cv::INTER_CUBIC | cv::WARP_INVERSE_MAP);
+    return frame;
+}
+
+//! only a part of the picture moves: a window (5% of the picture) shows the pan, the rest is static
+cv::Mat partial_frame(const cv::Mat & texture, const cv::Mat & background, double time)
+{
+    const cv::Rect window(400, 200, 128, 90);
+    cv::Mat frame = background.clone();
+    pan_frame(texture, time)(window).copyTo(frame(window));
     return frame;
 }
 
@@ -185,6 +196,11 @@ int main(int argc, char ** argv)
         std::vector<cv::Mat> zoom;
         for (int i = 0; i < count; ++i) zoom.push_back(zoom_frame(large, i));
         ok &= write_video(dir / "motion_zoom.avi", zoom);
+
+        const cv::Mat background = zoom_frame(large, 0);
+        std::vector<cv::Mat> partial;
+        for (int i = 0; i < count; ++i) partial.push_back(partial_frame(texture, background, i % 2 == 0 ? i : i - 0.5));
+        ok &= write_video(dir / "motion_partial.avi", partial);
     }
     return ok ? 0 : 1;
 }

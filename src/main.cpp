@@ -107,6 +107,8 @@ per frame columns (vN = N-th input video):
 additional per frame columns with --motion:
   vN_anim_step      how far the animation advanced since the previous frame, in display
                     intervals (1 = the average around the frame); empty without usable motion
+  vN_anim_step_spread  how much the moving parts of the picture disagree about the step (in
+                    intervals, 0 = rigid motion); smaller differences between steps say little
   vN_anim_error_ms  new frames: animation step since the previous new frame minus the time
                     that frame was displayed
   vN_perceived_fps  perceived smoothness over the last second: the framerate of evenly paced
@@ -521,7 +523,11 @@ int run(const Options & options)
     {
         const std::string prefix = "v" + std::to_string(i + 1) + "_";
         *output << ',' << prefix << "diff" << ',' << prefix << "fps" << ',' << prefix << "frametime_ms" << ',' << prefix << "tears";
-        if (options.motion) *output << ',' << prefix << "anim_step" << ',' << prefix << "anim_error_ms" << ',' << prefix << "perceived_fps";
+        if (options.motion)
+        {
+            *output << ',' << prefix << "anim_step" << ',' << prefix << "anim_step_spread" << ',' << prefix << "anim_error_ms"
+                    << ',' << prefix << "perceived_fps";
+        }
     }
     *output << '\n';
 
@@ -559,6 +565,8 @@ int run(const Options & options)
                 line += row.columns[i];
                 line += ',';
                 if (sample.measurable) line += format_number(sample.step);
+                line += ',';
+                if (sample.measurable) line += format_number(sample.step_spread);
                 line += ',';
                 if (sample.has_error) line += format_number(sample.error_ms);
                 line += ',';
@@ -717,8 +725,8 @@ int run(const Options & options)
                 {
                     std::fprintf(stderr, " | %.2f new frames/s | perceived smoothness %.2f fps", m.motion_fps, m.perceived_fps);
                 }
-                std::fprintf(stderr, " | animation error median %.2f ms avg %.2f ms p95 %.2f ms max %.2f ms"
-                           , m.median_abs_error_ms, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms);
+                std::fprintf(stderr, " | animation error median %.2f ms avg %.2f ms p95 %.2f ms max %.2f ms (spread of the votes on a step: %.2f ms)"
+                           , m.median_abs_error_ms, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms, m.median_step_spread_ms);
             }
             else
             {

@@ -10,10 +10,21 @@
 
 namespace trdrop {
 
-//! the motion of a frame is measured on a grid of cells
-constexpr int kMotionGridX = 8;
-constexpr int kMotionGridY = 5;
+//! The motion of a frame is kept per cell of a fine grid. Every cell with motion later has one vote on the
+//! animation step of the frame, so a moving part of the picture is enough (a cell is 1 / 640 of it).
+constexpr int kMotionGridX = 32;
+constexpr int kMotionGridY = 20;
 constexpr int kMotionCells = kMotionGridX * kMotionGridY;
+//! The motion is measured at a regular grid of points, this many per cell in both directions. A point is used if
+//! its surroundings have texture in both directions, the frames match there after the tracking and tracking
+//! it back ends at most kMotionMaxBackError pixels (of the measured resolution) from the point: wrong matches -
+//! repeating texture, motion too large - don't come back. A cell needs kMotionMinCellPoints of its points.
+constexpr int kMotionCellPoints = 2;
+constexpr int kMotionPointsX = kMotionCellPoints * kMotionGridX;
+constexpr int kMotionPointsY = kMotionCellPoints * kMotionGridY;
+constexpr float kMotionMinTexture = 1.0f; // smaller eigenvalue of the gradient matrix per pixel of the window
+constexpr float kMotionMaxBackError = 1.0f;
+constexpr size_t kMotionMinCellPoints = 2;
 
 //! motion from the previous frame to a frame: one vector per grid cell
 struct MotionField {
@@ -21,14 +32,33 @@ struct MotionField {
     bool estimated = false;
     //! source pixels per pixel of the resolution the motion was measured at
     float pixel_scale = 1.0f;
-    //! per cell: motion in source pixels and the amount of tracked points it is the median of
+    //! per cell: motion in source pixels and the amount of tracked points it is the median of (0: none)
     std::array<float, kMotionCells> dx {};
     std::array<float, kMotionCells> dy {};
-    std::array<uint16_t, kMotionCells> points {};
+    std::array<uint8_t, kMotionCells> points {};
 };
 
-//! Measures the motion between consecutive frames on the CPU: corners of the previous frame are
-//! tracked into the current one (pyramidal Lucas-Kanade, sub pixel accurate) at up to 1920x1080
+//! collects the motion of tracked points and reduces it to the median per cell
+class MotionCellBinner {
+public:
+    void clear() { _points.clear(); }
+    //! x, y: position of the point relative to the frame (0 - 1), dx, dy: its motion
+    void add(float x, float y, float dx, float dy);
+    //! sets the cells with at least min_points points, their motion multiplied by scale
+    void finish(MotionField & field, size_t min_points, float scale);
+
+private:
+    struct Point {
+        uint16_t cell;
+        float dx;
+        float dy;
+    };
+    std::vector<Point> _points;
+    std::vector<float> _values;
+};
+
+//! Measures the motion between consecutive frames on the CPU: the points of the grid are tracked from the
+//! previous frame into the current one and back (pyramidal Lucas-Kanade, sub pixel accurate) at up to 1920x1080.
 class MotionEstimator {
 public:
     //! luma: 8-bit single channel frame in full resolution
@@ -39,12 +69,14 @@ private:
     cv::Size _previous_size;
     std::vector<cv::Mat> _previous_pyramid;
     std::vector<cv::Mat> _current_pyramid;
-    std::vector<cv::Point2f> _corners;
+    std::vector<cv::Point2f> _points;
+    cv::Size _points_size;
     std::vector<cv::Point2f> _tracked;
+    std::vector<cv::Point2f> _back;
     std::vector<unsigned char> _status;
+    std::vector<unsigned char> _back_status;
     std::vector<float> _error;
-    std::array<std::vector<float>, kMotionCells> _cell_dx;
-    std::array<std::vector<float>, kMotionCells> _cell_dy;
+    MotionCellBinner _binner;
 };
 
 //! what the motion says about one frame
@@ -54,6 +86,9 @@ struct MotionSample {
     //! animation step: how far the animation advanced since the previous frame, in display intervals
     //! (1 = as much as it advances per captured frame on average around this frame)
     double step = 0.0;
+    //! how much the cells disagree about the step: scaled median absolute deviation of their votes, in display
+    //! intervals. 0 for rigid motion; on real footage the error of a step has about this size
+    double step_spread = 0.0;
     //! animation error of a new frame: animation step since the previous new frame minus the time
     //! that frame was displayed
     bool has_error = false;
@@ -67,8 +102,11 @@ struct MotionSample {
 //!
 //! The animation step of a frame is the common scale of its motion field relative to the average motion
 //! field around it: m_cell(frame) = step * v_cell, v being the motion of the cell per display interval in a
-//! window around the frame. It is the weighted median over the cells of m.v / |v|^2, so it works for pans,
-//! forward motion and frames with static overlays.
+//! window around the frame. Every cell with motion votes with m.v / |v|^2 and the weighted median wins, so it
+//! works for pans, forward motion, static overlays and if only a part of the picture moves. The steps are scaled
+//! so that the animation advances by one interval per displayed interval on average over the window. The cells
+//! never agree exactly in real footage (the depth of what a cell shows changes); how much they disagree is
+//! reported with the step instead of rejecting frames.
 //!
 //! The window grows (up to 1 second) until it holds enough new frames.
 //! The results are delayed by half the longest reference window (look ahead).
@@ -94,6 +132,8 @@ public:
         double median_abs_error_ms = 0.0;
         double p95_abs_error_ms = 0.0;
         double max_abs_error_ms = 0.0;
+        //! median spread of the votes on the steps of the new frames, as time
+        double median_step_spread_ms = 0.0;
     };
 
     //! fps: recorded framerate, window_ms: length of the reference window (0: automatic)
@@ -157,9 +197,24 @@ private:
     double _step_square_sum = 0.0;
     std::vector<float> _errors;
     std::vector<float> _rolling_values;
+    std::vector<float> _step_spread;
     // scratch of _finalize
-    std::vector<double> _group_weight;
-    std::vector<double> _group_scale;
+    //! a new frame of the window with the intervals since the previous new frame
+    struct Group {
+        const MotionField * field;
+        //! sum of the weights of its intervals, and divided by their number
+        double weight;
+        double scale;
+    };
+    //! reference motion of a cell: v / |v|^2 and |v|
+    struct Reference {
+        bool usable = false;
+        double x = 0.0;
+        double y = 0.0;
+        double speed = 0.0;
+    };
+    std::vector<Group> _groups;
+    std::array<Reference, kMotionCells> _reference;
 };
 
 } // namespace trdrop

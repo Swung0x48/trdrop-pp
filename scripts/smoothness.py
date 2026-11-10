@@ -3,7 +3,8 @@
 
 Three charts, all videos overlaid:
   framerate            pixel based framerate (vN_fps) and perceived smoothness (vN_perceived_fps)
-  animation error      per new frame over time (vN_anim_error_ms)
+  animation error      per new frame over time (vN_anim_error_ms), with --fps also the
+                       uncertainty of the steps as a band (vN_anim_step_spread)
   animation error      histogram
 
     trdrop-pp capture.mkv --motion -o capture.csv
@@ -68,6 +69,18 @@ def main():
                      f"p95 {percentile(absolute, 95):.1f} ms, max {absolute[-1]:.0f} ms")
             error_axis.vlines([p for p, _ in points], 0, [max(-limit, min(limit, e)) for e in errors], color=color, linewidth=0.5, alpha=0.6)
             error_axis.plot([p for p, _ in points], [max(-limit, min(limit, e)) for e in errors], ".", markersize=3, color=color, label=label)
+            # how much the moving parts of the picture disagree about a step: errors inside the band say little
+            spread = [s for s, e in zip(video.anim_step_spread, video.anim_error_ms) if not math.isnan(e)]
+            if args.fps and len(spread) == len(points) and not any(math.isnan(s) for s in spread):
+                spread_ms = [s * 1000.0 / args.fps for s in spread]
+                smooth = [percentile(sorted(spread_ms[max(0, k - 7):k + 8]), 50) for k in range(len(spread_ms))]
+                # no band over stretches without measured motion (longer than half a second)
+                positions = [p for p, _ in points]
+                connected = [k == 0 or positions[k] - positions[k - 1] <= 0.5 for k in range(len(positions))]
+                error_axis.fill_between(positions, [-min(limit, s) for s in smooth], [min(limit, s) for s in smooth],
+                                        where=[c and (k + 1 == len(connected) or connected[k + 1] or connected[k]) for k, c in enumerate(connected)],
+                                        color=color, alpha=0.15, linewidth=0,
+                                        label=f"{video.label}: spread of the votes on a step (median {percentile(sorted(spread_ms), 50):.1f} ms)")
             bin_width = limit / 30.0
             bins = [-limit + k * bin_width for k in range(61)]
             histogram_axis.hist([max(-limit, min(limit - 1e-9, e)) for e in errors], bins=bins, color=color,
