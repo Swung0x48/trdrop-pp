@@ -312,6 +312,7 @@ On Windows this gives a folder that can be copied to another PC and used as it i
 | --- | --- |
 | `bin/` | `trdrop-pp.exe` and the DLLs it needs: OpenCV (with its FFmpeg plugin), with `-DUSE_FFMPEG=ON` and `FFMPEG_DIR` the FFmpeg DLLs, and the MSVC runtime. `-DTRDROP_INSTALL_RUNTIME=OFF` installs the program alone |
 | `scripts/` | the [plot scripts](#plotting), `motion_vectors.py`, `make_ball_videos.py` and `requirements.txt` (they need Python, see there) |
+| `skills/` | the [agent skill](#agent-skill) |
 | `licenses/` | the license of trdrop++ and those of the DLLs in `bin/` |
 | `README.md` | this file |
 
@@ -319,7 +320,7 @@ The Vulkan loader is not included, it comes with the graphics driver. This was t
 Windows pack; a vcpkg OpenCV has further DLLs of its own which these rules don't collect, use vcpkg's
 deployment (`X_VCPKG_APPLOCAL_DEPS_INSTALL`) there.
 
-On Linux / macOS the program goes to `<prefix>/bin`, the scripts to `<prefix>/share/trdrop-pp/scripts` and
+On Linux / macOS the program goes to `<prefix>/bin`, the scripts and skills to `<prefix>/share/trdrop-pp/` and
 README / licenses to `<prefix>/share/doc/trdrop-pp`; the libraries are those of the system.
 
 ### Vulkan (GPU acceleration)
@@ -419,6 +420,14 @@ i7-14700KF (28 threads), RTX 4070 SUPER, no other GPU load):
 
 `--decode vulkan` on the H.264 recordings: 3.0 - 3.6x. Comparing U and V as well costs no measurable
 time on the GPU.
+
+## Agent skill
+
+`skills/trdrop-pp/` is a skill for AI coding agents (Claude Code and others that read `SKILL.md`): how to
+run an analysis, read the summary, plot and report it, which options fit which recording, and what the tool
+can't measure. To use it, copy or link the folder into the agent's skills folder (Claude Code:
+`~/.claude/skills/` or `<project>/.claude/skills/`) and put `trdrop-pp` on the `PATH`. In an installed
+package the skill also finds the program and the scripts next to itself (`bin/`, `scripts/`).
 
 ## Tests
 

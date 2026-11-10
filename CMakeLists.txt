@@ -19,16 +19,18 @@ set(FFMPEG_DIR "" CACHE PATH "FFmpeg development files (include/, lib/, bin/), o
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio video)
 
 # Where `cmake --install` puts things. Windows: a folder that can be zipped and used anywhere
-# (bin/, scripts/, licenses/, README.md); elsewhere the usual prefix layout.
+# (bin/, scripts/, skills/, licenses/, README.md); elsewhere the usual prefix layout.
 include(GNUInstallDirs)
 if(WIN32)
     set(TRDROP_INSTALL_BINDIR bin)
     set(TRDROP_INSTALL_SCRIPTDIR scripts)
+    set(TRDROP_INSTALL_SKILLDIR skills)
     set(TRDROP_INSTALL_DOCDIR .)
     set(TRDROP_INSTALL_LICENSEDIR licenses)
 else()
     set(TRDROP_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
     set(TRDROP_INSTALL_SCRIPTDIR "${CMAKE_INSTALL_DATADIR}/trdrop-pp/scripts")
+    set(TRDROP_INSTALL_SKILLDIR "${CMAKE_INSTALL_DATADIR}/trdrop-pp/skills")
     set(TRDROP_INSTALL_DOCDIR "${CMAKE_INSTALL_DOCDIR}")
     set(TRDROP_INSTALL_LICENSEDIR "${CMAKE_INSTALL_DOCDIR}/licenses")
 endif()
@@ -200,7 +202,7 @@ if(WIN32)
     endif()
 endif()
 
-# ---- install: the program with what it needs to run, the Python scripts, README and licenses
+# ---- install: the program with what it needs to run, the Python scripts, the skills, README and licenses
 #   cmake --install <build dir> --prefix <folder>
 install(TARGETS trdrop-pp RUNTIME DESTINATION "${TRDROP_INSTALL_BINDIR}")
 if(WIN32 AND TRDROP_INSTALL_RUNTIME)
@@ -234,6 +236,8 @@ install(FILES
         scripts/requirements.txt
         tools/make_ball_videos.py
     DESTINATION "${TRDROP_INSTALL_SCRIPTDIR}")
+# agent skills (skills/<name>/SKILL.md); they expect the scripts in ../../scripts relative to themselves
+install(DIRECTORY skills/ DESTINATION "${TRDROP_INSTALL_SKILLDIR}")
 install(FILES README.md DESTINATION "${TRDROP_INSTALL_DOCDIR}")
 install(FILES LICENSE DESTINATION "${TRDROP_INSTALL_LICENSEDIR}" RENAME trdrop++-LICENSE.txt)
 
