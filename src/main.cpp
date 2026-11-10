@@ -72,8 +72,8 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
                                perceived smoothness. On the GPU with Vulkan Video decoding,
                                otherwise on the CPU
       --motion-window <ms>     the motion of a frame is compared to the average motion in
-                               this window around it (default: 400, growing up to 2000 until
-                               it holds 16 new frames)
+                               this window around it (default: 400, growing up to 1000 until
+                               it holds 10 new frames)
 
 backend:
       --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
@@ -110,7 +110,7 @@ additional per frame columns with --motion:
   vN_anim_error_ms  new frames: animation step since the previous new frame minus the time
                     that frame was displayed
   vN_perceived_fps  perceived smoothness over the last second: the framerate of evenly paced
-                    motion that looks as smooth, fps * sum(step) / sum(step^2)
+                    motion that looks as smooth, new frames per second / (1 + cv(step)^2)
 
 tear columns:
   frame, video, row_a, row_b, video_height   (the tear is between row_a and row_b)
@@ -702,12 +702,23 @@ int run(const Options & options)
         for (size_t i = 0; i < motion_analyzers.size(); ++i)
         {
             const MotionAnalyzer::Summary m = motion_analyzers[i].summary();
-            const double measurable = m.frames > 0 ? 100.0 * static_cast<double>(m.measurable_frames) / static_cast<double>(m.frames) : 0.0;
-            std::fprintf(stderr, "v%zu motion: usable in %.1f%% of the frames", i + 1, measurable);
+            // share of the new frames whose motion could be measured (duplicates are easy and say little)
+            const double measurable = m.new_frames > 0 ? 100.0 * static_cast<double>(m.measurable_new_frames) / static_cast<double>(m.new_frames) : 0.0;
+            std::fprintf(stderr, "v%zu motion: measured %lld of %lld new frames (%.1f%%)", i + 1, m.measurable_new_frames, m.new_frames, measurable);
             if (m.animation_frames > 0)
             {
-                std::fprintf(stderr, " | %.2f new frames/s | perceived smoothness %.2f fps | animation error avg %.2f ms p95 %.2f ms max %.2f ms"
-                           , m.motion_fps, m.perceived_fps, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms);
+                // per second values are robust against single long steps, short videos only have the overall value
+                if (m.perceived_fps_median > 0.0)
+                {
+                    std::fprintf(stderr, " | %.2f new frames/s | perceived smoothness %.2f fps (10%% low %.2f, whole video %.2f)"
+                               , m.motion_fps, m.perceived_fps_median, m.perceived_fps_low, m.perceived_fps);
+                }
+                else
+                {
+                    std::fprintf(stderr, " | %.2f new frames/s | perceived smoothness %.2f fps", m.motion_fps, m.perceived_fps);
+                }
+                std::fprintf(stderr, " | animation error median %.2f ms avg %.2f ms p95 %.2f ms max %.2f ms"
+                           , m.median_abs_error_ms, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms);
             }
             else
             {

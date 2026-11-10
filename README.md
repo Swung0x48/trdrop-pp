@@ -143,17 +143,18 @@ How it works:
    in a window around it (triangular weights): `m_cell = step * v_cell`. It is the weighted median over the
    cells of `m.v / |v|^2`, so pans, forward motion (the cells move in different directions) and static
    overlays work. `1` means the frame advanced as much as a display interval does on average, `0` a
-   duplicate, `2` twice as much. If the cells disagree (their median deviation is more than 20% of the
-   step: turns, cuts, moving objects) the frame isn't used.
-   The window is 400 ms and grows up to 2 seconds until it holds 16 new frames: with a low framerate a
+   duplicate, `2` twice as much. A frame isn't used if its cells disagree completely (median deviation of
+   more than 75% of the step, e.g. cuts); in real footage they typically differ by 20 - 30%.
+   The window is 400 ms and grows up to 1 second until it holds 10 new frames: with a low framerate a
    short window only holds a few steps, their average follows them and hides their differences.
    `--motion-window <ms>` sets a fixed length.
 3. Animation error of a new frame: its animation step (summed since the previous new frame) minus the
    time that frame was displayed, in ms. A 30 fps animation in a 60 fps video has no error (step 2 after
    2 intervals); steps of 0.5 / 1.5 intervals have -8.3 / +8.3 ms.
-4. Perceived smoothness: `fps * sum(step) / sum(step^2)` - the framerate of evenly paced motion that
-   looks as smooth. It equals the framerate of the new frames if they are evenly paced and drops with
-   uneven steps (30 new frames per second with steps 1, 3, 1, 3: 24 fps).
+4. Perceived smoothness: the framerate of evenly paced motion that looks as smooth - the new frames per
+   second divided by `1 + cv^2`, `cv` being the coefficient of variation of the steps
+   (`fps * sum(step)^2 / (displayed intervals * sum(step^2))`). It equals the framerate of the new frames if
+   they are evenly paced and drops with uneven steps (30 new frames per second with steps 1, 3, 1, 3: 24 fps).
 
 Additional CSV columns (empty where not available):
 
@@ -161,23 +162,26 @@ Additional CSV columns (empty where not available):
 | --- | --- |
 | `vN_anim_step` | animation step of the frame in display intervals; empty without usable motion |
 | `vN_anim_error_ms` | new frames: animation error |
-| `vN_perceived_fps` | perceived smoothness over the last second |
+| `vN_perceived_fps` | perceived smoothness over the last second (needs 6 steps and usable motion in half of it) |
 
 and a summary line per video:
 
 ```
-v1 motion: usable in 99.6% of the frames | 60.00 new frames/s | perceived smoothness 47.90 fps | animation error avg 8.34 ms p95 8.61 ms max 11.17 ms
+v1 motion: measured 239 of 239 new frames (100.0%) | 60.00 new frames/s | perceived smoothness 48.04 fps (10% low 47.99, whole video 48.03) | animation error median 8.31 ms avg 8.32 ms p95 8.61 ms max 8.96 ms
 ```
+
+The perceived smoothness is the median of the values over one second each (and their 10th percentile),
+which a single long step hardly changes; "whole video" is the same formula over all steps.
 
 Accuracy with known answers (H.264 versions of the [fixtures](#tests); GPU and CPU agree within 0.1 fps / 0.1 ms):
 
 | video | expected | measured |
 | --- | --- | --- |
-| even pan / forward motion | 60 fps, error 0 | 59.9 / 59.7 fps, avg 0.1 ms |
-| new frame every 2nd frame | 30 fps, error 0 | 29.98 fps, avg 0.3 ms |
-| steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 47.90 fps, avg 8.34 ms |
-| freeze of 5 frames, time lost | one error of -83.3 ms | -76.4 ms |
-| new frame every 4th frame, steps of 3 / 4 / 5 intervals, fast pan / forward motion | 14.55 fps, errors -16.7 / 0 / +16.7 ms | 14.6 fps, the errors are off by 2.4 ms on average |
+| even pan / forward motion | 60 fps, error 0 | 60.00 fps, avg 0.1 ms |
+| new frame every 2nd frame | 30 fps, error 0 | 30.00 fps, avg 0.2 ms |
+| steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 48.04 fps, avg 8.32 ms |
+| freeze of 5 frames, time lost | one error of -83.3 ms | -75.8 ms |
+| new frame every 4th frame, steps of 3 / 4 / 5 intervals, fast pan / forward motion | 14.55 fps, errors -16.7 / 0 / +16.7 ms | 14.66 fps, the errors are off by 3.2 ms on average |
 
 Speed with the motion analysis (decoding + comparison + motion, RTX 4070 SUPER / i7-14700KF):
 
@@ -191,14 +195,16 @@ Limits:
 * A frame is compared to the average motion around it, which assumes that the real motion changes slowly
   within the window. Hard stops look like errors; around a freeze the neighbouring frames get a few ms of
   error (the freeze lowers the average).
-* The summary of real recordings depends on which frames are usable, and the perceived smoothness reacts
-  strongly to single long steps. On a 4K driving recording (15 fps content in 60 fps) the steps of the GPU
-  and CPU implementation agree on the frames both can use (correlation 0.995), but the CPU uses 69% of the
-  frames and reports 12.1 fps, the GPU 61% and 14.6 fps. Treat differences of that size as noise.
+* Real recordings: on a 4K driving recording (15 - 17 fps content in a 60 fps video) 86% of the new frames
+  are measured, the GPU and CPU implementation agree on the perceived smoothness within 3% (15.2 / 14.8 fps)
+  and on the steps of the frames both measure (correlation 0.97). The animation errors lean positive there
+  (+6 to +9 ms on average, measured steps about 9% longer than the display time): with changing speed the
+  frames on the faster side of the window are measured more often. The perceived smoothness doesn't depend
+  on that scale, single animation errors of real footage should be read with care.
 * It can't tell whether uneven steps come from the game or from the recording.
 * The GPU path needs Vulkan Video decoding (`--decode vulkan`, or `auto`, which prefers it with `--motion`);
   other sources (e.g. lossless RGB) are measured on the CPU, about 10 ms per 4K frame.
-* The rows of the CSV are written with a delay of up to one second (the look ahead of the window).
+* The rows of the CSV are written with a delay of up to half a second (the look ahead of the window).
 
 ## Plotting
 

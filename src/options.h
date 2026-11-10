@@ -54,7 +54,7 @@ struct Options {
     //! measure the motion between the frames: animation step, animation error, perceived smoothness
     bool motion = false;
     //! length of the window the motion of a frame is compared to, 0: automatic
-    //! (400 ms, longer if the framerate is low: until it holds 16 new frames, at most 2 seconds)
+    //! (400 ms, longer if the framerate is low: until it holds 10 new frames, at most 1 second)
     double motion_window_ms = 0.0;
 };
 

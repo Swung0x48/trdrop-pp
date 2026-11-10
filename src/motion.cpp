@@ -29,14 +29,23 @@ constexpr double kMinStep = 0.3;
 constexpr double kDuplicateShare = 0.02;
 //! automatic reference window: this long, growing up to kMaxWindowSeconds until it holds kMinWindowFrames new frames
 constexpr double kDefaultWindowMs = 400.0;
-constexpr double kMaxWindowSeconds = 2.0;
-constexpr size_t kMinWindowFrames = 16;
-//! the cells have to agree on the step of a frame: their median deviation from it, relative to max(1, step),
-//! may be at most this. They disagree if the motion isn't the average motion scaled (turns, cuts, moving objects)
-constexpr double kMaxStepSpread = 0.2;
+constexpr double kMaxWindowSeconds = 1.0;
+constexpr size_t kMinWindowFrames = 10;
+//! the cells have to agree roughly on the step of a frame: their median deviation from it, relative to
+//! max(1, step), may be at most this. In real footage the cells typically deviate by 20 - 30% (the depth
+//! of what a cell shows changes), this only drops frames whose motion isn't the average motion scaled at all
+constexpr double kMaxStepSpread = 0.75;
 //! the perceived smoothness needs this many steps and this share of measurable frames in the last second
 constexpr size_t kMinRollingSteps = 6;
-constexpr double kMinRollingMeasurable = 0.8;
+constexpr double kMinRollingMeasurable = 0.5;
+
+//! Framerate of evenly paced motion that looks as smooth as the steps: the new frames per second divided by
+//! 1 + (coefficient of variation of the steps)^2 = fps * sum(step)^2 / (displayed intervals * sum(step^2)).
+//! Evenly paced steps give the framerate of the new frames; it doesn't depend on the scale of the steps.
+double perceived_smoothness(double fps, double step_sum, double step_square_sum, double displayed_intervals)
+{
+    return fps * step_sum * step_sum / (displayed_intervals * step_square_sum);
+}
 
 float median(std::vector<float> & values)
 {
@@ -182,33 +191,69 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
         const size_t distance = k > position ? k - position : position - k;
         return static_cast<double>(half_window + 1 - distance);
     };
+    // Reference motion of a cell: its motion per display interval, v = sum(motion) / sum(display time) over the
+    // new frames of the window in which the cell was tracked. A new frame stands for the intervals since the
+    // previous new frame (its duplicates). If the cell wasn't tracked in a new frame - which mostly happens
+    // with fast motion - its motion and its time are left out; counting it as "no motion" would lower v.
+    const size_t count = last - first + 1;
+    _group_weight.assign(count, 0.0);  // per new frame: sum of the weights of its intervals
+    _group_scale.assign(count, 0.0);   // ... divided by the number of intervals
     double window = 0.0;
-    for (size_t k = first; k <= last; ++k) window += weight(k);
+    {
+        double pending = 0.0;
+        size_t intervals = 0;
+        for (size_t k = first; k <= last; ++k)
+        {
+            if (!_entries[k].field.estimated)
+            {
+                pending = 0.0;
+                intervals = 0;
+                continue;
+            }
+            pending += weight(k);
+            ++intervals;
+            if (_entries[k].duplicate) continue;
+            _group_weight[k - first] = pending;
+            _group_scale[k - first] = pending / static_cast<double>(intervals);
+            window += pending;
+            pending = 0.0;
+            intervals = 0;
+        }
+    }
 
-    // animation step: weighted median over the cells of m.v / |v|^2 (v: mean motion of the cell in the window)
+    // animation step: weighted median over the cells of m.v / |v|^2
     std::array<std::pair<double, double>, kMotionCells> ratios; // (ratio, weight)
     size_t usable = 0;
     double weight_sum = 0.0;
-    if (entry.field.estimated)
+    auto weighted_median = [&]() {
+        std::sort(ratios.begin(), ratios.begin() + static_cast<std::ptrdiff_t>(usable));
+        double cumulative = 0.0;
+        for (size_t k = 0; k < usable; ++k)
+        {
+            cumulative += ratios[k].second;
+            if (cumulative >= 0.5 * weight_sum) return ratios[k].first;
+        }
+        return 0.0;
+    };
+    if (entry.field.estimated && window > 0.0)
     {
         const double min_speed = kMinSpeed * entry.field.pixel_scale;
         for (size_t cell = 0; cell < static_cast<size_t>(kMotionCells); ++cell)
         {
             if (entry.field.points[cell] < kMinPoints) continue;
             double vx = 0.0, vy = 0.0, tracked = 0.0;
-            for (size_t k = first; k <= last; ++k)
+            for (size_t k = 0; k < count; ++k)
             {
-                const MotionField & field = _entries[k].field;
-                if (!field.estimated || field.points[cell] < kMinPoints) continue;
-                const double w = weight(k);
-                vx += w * field.dx[cell];
-                vy += w * field.dy[cell];
-                tracked += w;
+                if (_group_weight[k] <= 0.0 || _entries[first + k].field.points[cell] < kMinPoints) continue;
+                vx += _group_scale[k] * _entries[first + k].field.dx[cell];
+                vy += _group_scale[k] * _entries[first + k].field.dy[cell];
+                tracked += _group_weight[k];
             }
-            vx /= window;
-            vy /= window;
+            if (tracked / window <= kMinTrackedShare) continue;
+            vx /= tracked;
+            vy /= tracked;
             const double speed_squared = vx * vx + vy * vy;
-            if (speed_squared < min_speed * min_speed || tracked / window <= kMinTrackedShare) continue;
+            if (speed_squared < min_speed * min_speed) continue;
             const double speed = std::sqrt(speed_squared);
             ratios[usable++] = { (entry.field.dx[cell] * vx + entry.field.dy[cell] * vy) / speed_squared, speed };
             weight_sum += speed;
@@ -216,34 +261,15 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
     }
     if (usable >= static_cast<size_t>(kMinCells))
     {
-        std::sort(ratios.begin(), ratios.begin() + static_cast<std::ptrdiff_t>(usable));
-        double cumulative = 0.0;
-        for (size_t k = 0; k < usable; ++k)
-        {
-            cumulative += ratios[k].second;
-            if (cumulative >= 0.5 * weight_sum)
-            {
-                sample.step = ratios[k].first;
-                break;
-            }
-        }
-        // weighted median of the deviations from the step
+        sample.step = weighted_median();
+        // the cells have to agree roughly: weighted median of their deviations from the step
         for (size_t k = 0; k < usable; ++k) ratios[k].first = std::fabs(ratios[k].first - sample.step);
-        std::sort(ratios.begin(), ratios.begin() + static_cast<std::ptrdiff_t>(usable));
-        double spread = 0.0;
-        cumulative = 0.0;
-        for (size_t k = 0; k < usable; ++k)
-        {
-            cumulative += ratios[k].second;
-            if (cumulative >= 0.5 * weight_sum)
-            {
-                spread = ratios[k].first;
-                break;
-            }
-        }
+        const double spread = weighted_median();
         sample.measurable = spread <= kMaxStepSpread * std::max(1.0, std::fabs(sample.step));
         if (!sample.measurable) sample.step = 0.0;
     }
+
+    if (entry.field.estimated && !entry.duplicate) ++_new_frames;
 
     // animation chain: a new frame ends the step which started at the previous new frame
     if (!sample.measurable)
@@ -253,6 +279,7 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
     else
     {
         ++_measurable_frames;
+        if (!entry.duplicate) ++_measurable_new_frames;
         const bool small = sample.step < kMinStep;
         if (small && (entry.duplicate || entry.changed_share < kDuplicateShare))
         {
@@ -281,7 +308,7 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
                 _shown_total += _shown;
                 _step_sum += _accumulated_step;
                 _step_square_sum += _accumulated_step * _accumulated_step;
-                _rolling_steps.emplace_back(_finalized, _accumulated_step);
+                _rolling_steps.push_back({ _finalized, _accumulated_step, static_cast<double>(_shown) });
             }
             _chain = true;
             _accumulated_step = 0.0;
@@ -297,23 +324,25 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
         _rolling_measurable_count -= _rolling_measurable.front();
         _rolling_measurable.pop_front();
     }
-    while (!_rolling_steps.empty() && _rolling_steps.front().first + static_cast<long long>(_rolling_window) <= _finalized)
+    while (!_rolling_steps.empty() && _rolling_steps.front().frame + static_cast<long long>(_rolling_window) <= _finalized)
     {
         _rolling_steps.pop_front();
     }
     if (_rolling_steps.size() >= kMinRollingSteps
         && static_cast<double>(_rolling_measurable_count) > kMinRollingMeasurable * static_cast<double>(_rolling_window))
     {
-        double sum = 0.0, square_sum = 0.0;
-        for (const auto & step : _rolling_steps)
+        double sum = 0.0, square_sum = 0.0, displayed = 0.0;
+        for (const RollingStep & step : _rolling_steps)
         {
-            sum += step.second;
-            square_sum += step.second * step.second;
+            sum += step.step;
+            square_sum += step.step * step.step;
+            displayed += step.displayed;
         }
-        if (square_sum > 0.0)
+        if (square_sum > 0.0 && displayed > 0.0)
         {
             sample.has_perceived_fps = true;
-            sample.perceived_fps = _fps * sum / square_sum;
+            sample.perceived_fps = perceived_smoothness(_fps, sum, square_sum, displayed);
+            _rolling_values.push_back(static_cast<float>(sample.perceived_fps));
         }
     }
     return sample;
@@ -324,9 +353,21 @@ MotionAnalyzer::Summary MotionAnalyzer::summary() const
     Summary result;
     result.frames = _finalized;
     result.measurable_frames = _measurable_frames;
+    result.new_frames = _new_frames;
+    result.measurable_new_frames = _measurable_new_frames;
     result.animation_frames = _animation_frames;
     if (_shown_total > 0) result.motion_fps = _fps * static_cast<double>(_animation_frames) / static_cast<double>(_shown_total);
-    if (_step_square_sum > 0.0) result.perceived_fps = _fps * _step_sum / _step_square_sum;
+    if (_step_square_sum > 0.0 && _shown_total > 0)
+    {
+        result.perceived_fps = perceived_smoothness(_fps, _step_sum, _step_square_sum, static_cast<double>(_shown_total));
+    }
+    if (!_rolling_values.empty())
+    {
+        std::vector<float> sorted = _rolling_values;
+        std::sort(sorted.begin(), sorted.end());
+        result.perceived_fps_median = sorted[sorted.size() / 2];
+        result.perceived_fps_low = sorted[sorted.size() / 10];
+    }
     if (!_errors.empty())
     {
         std::vector<float> absolute(_errors.size());
@@ -338,6 +379,7 @@ MotionAnalyzer::Summary MotionAnalyzer::summary() const
         }
         std::sort(absolute.begin(), absolute.end());
         result.mean_abs_error_ms = sum / static_cast<double>(absolute.size());
+        result.median_abs_error_ms = absolute[absolute.size() / 2];
         result.p95_abs_error_ms = absolute[std::min(absolute.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(absolute.size())))];
         result.max_abs_error_ms = absolute.back();
     }

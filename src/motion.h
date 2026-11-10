@@ -66,23 +66,32 @@ struct MotionSample {
 //! Turns the motion fields of a video into animation steps, the animation error and the perceived smoothness.
 //!
 //! The animation step of a frame is the common scale of its motion field relative to the average motion
-//! field around it: m_cell(frame) = step * v_cell. It is the weighted median over the cells of
-//! m.v / |v|^2, so it works for pans, forward motion and frames with static overlays.
+//! field around it: m_cell(frame) = step * v_cell, v being the motion of the cell per display interval in a
+//! window around the frame. It is the weighted median over the cells of m.v / |v|^2, so it works for pans,
+//! forward motion and frames with static overlays.
 //!
-//! The window grows (up to 2 seconds) until it holds enough new frames.
+//! The window grows (up to 1 second) until it holds enough new frames.
 //! The results are delayed by half the longest reference window (look ahead).
 class MotionAnalyzer {
 public:
     struct Summary {
         long long frames = 0;
         long long measurable_frames = 0;
+        //! frames the pixel comparison counts as new, and how many of them have a usable motion
+        long long new_frames = 0;
+        long long measurable_new_frames = 0;
         //! new frames with an animation step
         long long animation_frames = 0;
         //! new frames per second while the motion was measurable
         double motion_fps = 0.0;
-        //! framerate of evenly paced motion that would look as smooth: fps * sum(step) / sum(step^2)
+        //! framerate of evenly paced motion that would look as smooth: the new frames per second divided by
+        //! 1 + (coefficient of variation of the steps)^2, over the whole video (a single long step lowers it a lot)
         double perceived_fps = 0.0;
+        //! ... of the values over one second each: median and the 10th percentile (0 without a full second)
+        double perceived_fps_median = 0.0;
+        double perceived_fps_low = 0.0;
         double mean_abs_error_ms = 0.0;
+        double median_abs_error_ms = 0.0;
         double p95_abs_error_ms = 0.0;
         double max_abs_error_ms = 0.0;
     };
@@ -129,17 +138,28 @@ private:
     long long _shown = 0;
 
     // perceived smoothness over the last second
-    std::deque<std::pair<long long, double>> _rolling_steps;
+    struct RollingStep {
+        long long frame;
+        double step;
+        double displayed;
+    };
+    std::deque<RollingStep> _rolling_steps;
     std::deque<unsigned char> _rolling_measurable;
     long long _rolling_measurable_count = 0;
 
     // summary
     long long _measurable_frames = 0;
+    long long _new_frames = 0;
+    long long _measurable_new_frames = 0;
     long long _animation_frames = 0;
     long long _shown_total = 0;
     double _step_sum = 0.0;
     double _step_square_sum = 0.0;
     std::vector<float> _errors;
+    std::vector<float> _rolling_values;
+    // scratch of _finalize
+    std::vector<double> _group_weight;
+    std::vector<double> _group_scale;
 };
 
 } // namespace trdrop
