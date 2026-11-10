@@ -1,5 +1,5 @@
-// trdrop++ (trdrop-pp): command line version of trdrop (https://github.com/cirquit/trdrop)
-// Analyzes raw (uncompressed) captures and writes the per frame framerate / frametime / tear data.
+// trdrop++ (trdrop-pp): analyzes captured video and writes the per frame framerate / frametime / tear
+// data and, with --motion, how evenly the animation advances.
 
 #include <algorithm>
 #include <chrono>
@@ -35,7 +35,7 @@
 namespace trdrop {
 namespace {
 
-constexpr const char * kVersion = "1.1.1-cli";
+constexpr const char * kVersion = "1.1.1";
 
 void print_usage(std::ostream & out)
 {
@@ -88,8 +88,8 @@ backend:
                                  Y, U and V planes on the GPU, frames never leave the GPU
                                ffmpeg: decode with FFmpeg on the CPU, compare the Y, U and V
                                  planes on the CPU (same results as vulkan)
-                               opencv: decode with OpenCV, compare BGR -> grayscale (the
-                                 original behaviour, also used with --no-vk)
+                               opencv: decode with OpenCV, compare BGR -> grayscale (also
+                                 used with --no-vk)
                                YUV and grayscale differ slightly, so the results of
                                vulkan / ffmpeg differ slightly from opencv
 
@@ -392,7 +392,7 @@ std::unique_ptr<FramePipeline> make_pipeline(const Options & options)
 #endif
 #ifdef USE_FFMPEG
     if (options.decode == "ffmpeg") return make_ffmpeg_cpu_pipeline(options.inputs);
-    // auto: the fastest decoder for the inputs; --no-vk keeps the original OpenCV path
+    // auto: the fastest decoder for the inputs; --no-vk keeps the OpenCV path
     if (options.decode == "auto" && options.use_vulkan)
     {
         auto note = [&](const std::string & what, const std::string & why) {

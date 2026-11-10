@@ -1,14 +1,13 @@
 # trdrop++
 
-Command line version of [trdrop](https://github.com/cirquit/trdrop), a raw video analysis program.
+Analyzes captured game video. It estimates the *real* framerate and frametime of a capture, detects frame
+tears and, from the motion between the frames, measures how evenly the animation advances
+([perceived smoothness](#motion-analysis---motion)). The per frame data is written as CSV.
 The program and the repository are called `trdrop-pp`, `pp` being the `++` that file names and URLs don't like.
-It estimates the *real* framerate and frametime of an uncompressed capture and detects frame tears,
-using the same algorithms as the original GUI, and writes the raw per frame data as CSV.
 
-No Qt dependency. The only dependency is OpenCV (`core`, `imgproc`, `videoio`, `video`).
+The only required dependency is OpenCV (`core`, `imgproc`, `videoio`, `video`).
 Optionally the per pixel work runs on the GPU via Vulkan ([build with `-DUSE_VULKAN=ON`](#vulkan-gpu-acceleration)),
 and HEVC / H.264 captures (e.g. OBS / NVENC recordings) are decoded on the GPU as well ([`-DUSE_FFMPEG=ON`](#ffmpeg--vulkan-video-gpu-decoding)).
-The overlay rendering / image sequence export of the GUI is intentionally not part of the CLI.
 
 ## Usage
 
@@ -95,18 +94,18 @@ after the first full one second window.
 
 ### Lossy recordings
 
-The original algorithm counts a frame as new as soon as a single pixel is different. That is right for
+The basic rule counts a frame as new as soon as a single pixel is different. That is right for
 lossless captures, but a lossy encoder changes pixels of identical source frames (noise, and blocks
 predicted from the next frame), so nearly every frame would count as new - e.g. a 4K H.264 recording
 whose picture only changed every 4th frame was reported with 58 instead of 14 fps.
 
 `--tolerance-pct <%>`: a frame only counts as new if more than this percentage of its pixels is
 different (by more than `--pixel-diff`); for the tear detection a row with at most this percentage of
-different pixels counts as unchanged. `0` is the original behaviour.
+different pixels counts as unchanged. With `0` every different pixel counts.
 
 Without the option the codec decides (printed in the `vN:` line):
 
-* lossless codecs (FFV1, HuffYUV, Ut Video, MagicYUV, raw, ...): `--tolerance-pct 0`, as before
+* lossless codecs (FFV1, HuffYUV, Ut Video, MagicYUV, raw, ...): `--tolerance-pct 0`
 * lossy codecs: `--pixel-diff 4` (unless given) and an automatic tolerance: at least 0.5%, and 5% of
   what a new frame recently changed (the 90th percentile of the changed pixels per frame over the last
   2 seconds). The relative part is needed for fast motion, where a few percent of the next frame leak
@@ -114,7 +113,7 @@ Without the option the codec decides (printed in the `vN:` line):
   Rows always use 0.5%.
 
   Checked against a lossless capture with 271 duplicates in 899 frames (41.9 fps): its 100 Mbit/s HEVC
-  version gives 281 duplicates (41.1 fps) - and 0 duplicates (60 fps) with the original rule.
+  version gives 281 duplicates (41.1 fps) - and 0 duplicates (60 fps) without the tolerance.
 
 H.264 / HEVC / AV1 are always treated as lossy, also if they were encoded in a lossless mode
 (pass `--tolerance-pct 0 --pixel-diff 0` then). The automatic values are heuristics: after fast motion
@@ -254,7 +253,7 @@ window is still filling up), `--skip N` hides the first N frames, `--max-fps` fi
 
 ## Algorithm
 
-Identical to trdrop's `FrameProcessing`:
+Framerate, frametime and tears:
 
 1. Both frames are converted to grayscale, a pixel is different if `|a - b| > pixel-diff`.
 2. For every row the share of different pixels is computed.
@@ -266,14 +265,7 @@ Identical to trdrop's `FrameProcessing`:
    the frametime is the time between the last two frame changes in that window.
 
 Note: every boundary between an unchanged row and a changed row counts as a tear. On real captures
-with static black bars or HUD elements this produces tears on most new frames (same as the GUI).
-
-Differences to the GUI:
-
-* All frames are analyzed from the first one (the GUI consumed the first frame for its preview).
-* The CSV is overwritten instead of appended to, and contains additional columns.
-* Fixed: tears of multiple videos were mixed when computing the torn part, and a difference
-  in the last row of a frame was ignored.
+with static black bars or HUD elements this produces tears on most new frames.
 
 ## Building
 
@@ -370,7 +362,7 @@ cmake --build build-gpu
 | `auto` (default) | the fastest of the modes below, see the rules | | the choice and its reason are printed |
 | `vulkan` | GPU (Vulkan Video) | Y + U + V, GPU | |
 | `ffmpeg` | FFmpeg on the CPU (multi threaded) | Y + U + V, CPU (row parallel) | same results as `vulkan` |
-| `opencv` | OpenCV | BGR -> grayscale, GPU or CPU | the original behaviour, always used with `--no-vk` |
+| `opencv` | OpenCV | BGR -> grayscale, GPU or CPU | always used with `--no-vk` |
 
 `auto` uses `vulkan` if every video can be decoded with Vulkan Video, except H.264 on CPUs with
 16 or more threads: the hardware decoders of e.g. the RTX 4070 (SUPER) decode 4K H.264 slower
@@ -388,10 +380,10 @@ Supported are 8-bit YUV formats (4:2:0 / 4:2:2 / 4:4:4, NV12, ...), tested with 
 GPU, yuv420p on the CPU). 10-bit (HDR) and RGB sources use the `opencv` path. Rotation metadata is
 ignored by `vulkan` / `ffmpeg`.
 
-Speed compared to the original CPU only version (wall time incl. startup, i7-14700KF (28 threads),
-RTX 4070 SUPER, no other GPU load):
+Speed compared to decoding and comparing with OpenCV on the CPU only (wall time incl. startup,
+i7-14700KF (28 threads), RTX 4070 SUPER, no other GPU load):
 
-| input | original | default (`auto`) | `auto` chose |
+| input | OpenCV, CPU | default (`auto`) | `auto` chose |
 | --- | --- | --- | --- |
 | 4K H.264 game recording, 1007 frames | 18.2 s | **3.3 s (5.6x)** | `ffmpeg` |
 | 4K H.264 game recording, 1580 frames | 21.3 s | **5.0 s (4.3x)** | `ffmpeg` |
@@ -430,4 +422,5 @@ build/trdrop-pp test-out/fixtures/motion_uneven.avi --motion -o motion.csv
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Based on trdrop by Alexander Isenko.
+MIT, see [LICENSE](LICENSE). The framerate, frametime and tear analysis is based on
+[trdrop](https://github.com/cirquit/trdrop) by Alexander Isenko.
