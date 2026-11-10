@@ -56,6 +56,9 @@ struct Options {
     //! length of the window the motion of a frame is compared to, 0: automatic
     //! (400 ms, longer if the framerate is low: until it holds 10 new frames, at most 1 second)
     double motion_window_ms = 0.0;
+    //! the capture didn't run in step with what it recorded: a picture may have been recorded up to one
+    //! interval late and pictures may be missing (see MotionAnalyzer)
+    bool async_capture = false;
 };
 
 } // namespace trdrop

@@ -8,7 +8,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-_COLUMN = re.compile(r"^v(\d+)_(diff|fps|frametime_ms|tears|anim_step|anim_step_spread|anim_error_ms|perceived_fps)$")
+_COLUMN = re.compile(r"^v(\d+)_(diff|fps|frametime_ms|tears|anim_step|anim_step_spread|anim_error_ms|perceived_fps|lost)$")
 
 
 @dataclass
@@ -26,6 +26,8 @@ class Video:
     anim_step_spread: list = field(default_factory=list)
     anim_error_ms: list = field(default_factory=list)
     perceived_fps: list = field(default_factory=list)
+    # only with trdrop-pp --async-capture: pictures the capture lost before a new frame
+    lost: list = field(default_factory=list)
 
 
 @dataclass

@@ -93,6 +93,8 @@ struct MotionSample {
     //! that frame was displayed
     bool has_error = false;
     double error_ms = 0.0;
+    //! asynchronous capture: pictures the capture lost between the previous new frame and this one
+    int lost = 0;
     //! perceived smoothness over the last second
     bool has_perceived_fps = false;
     double perceived_fps = 0.0;
@@ -110,6 +112,21 @@ struct MotionSample {
 //!
 //! The window grows (up to 1 second) until it holds enough new frames.
 //! The results are delayed by half the longest reference window (look ahead).
+//!
+//! Asynchronous capture: if the capture doesn't run in step with what it records (variable refresh rate, a
+//! capture program with its own clock), a picture shown at time t is first recorded at the next tick of the
+//! capture, up to one interval later, and a picture shown for less than an interval may not be recorded at
+//! all. A picture that is recorded an interval late looks like a repeated frame, the one that makes up for it
+//! like a jump: animation errors of -1 and +1 interval which are not in what was recorded. In this mode
+//!  - the time a picture was shown is only known to one interval: the animation error is what is left if
+//!    every picture may have been shown up to one interval before it was recorded. The drift (animation time
+//!    minus recorded time) may move freely within a band of one interval, only what pushes the band counts.
+//!  - a step twice as long as the steps around it, after a picture which was recorded once, stands for two
+//!    pictures of which the capture lost one: it counts as two steps. The same step after a
+//!    picture that was recorded twice (the capture repeated one picture and lost the next, or the game showed
+//!    it twice) counts as two as well while the capture demonstrably loses pictures.
+//! A game that really shows a picture an interval late and makes up for it later looks exactly the same, so this
+//! is an assumption about the capture and not something the video can tell.
 class MotionAnalyzer {
 public:
     struct Summary {
@@ -134,10 +151,21 @@ public:
         double max_abs_error_ms = 0.0;
         //! median spread of the votes on the steps of the new frames, as time
         double median_step_spread_ms = 0.0;
+        //! share (0 - 1) of the animation errors which are about one whole interval too short / too long:
+        //! many of both is what an asynchronous capture looks like without async_capture
+        double interval_errors_short = 0.0;
+        double interval_errors_long = 0.0;
+        //! asynchronous capture: new frames whose display time was moved by more than half an interval,
+        //! and pictures the capture lost (they are counted in animation_frames, motion_fps and the smoothness)
+        long long retimed_frames = 0;
+        long long lost_frames = 0;
+        //! ... of them after a picture that was recorded twice (attributed to the capture, not proven)
+        long long lost_after_repeat = 0;
     };
 
-    //! fps: recorded framerate, window_ms: length of the reference window (0: automatic)
-    MotionAnalyzer(double fps, double window_ms);
+    //! fps: recorded framerate, window_ms: length of the reference window (0: automatic),
+    //! async_capture: the capture didn't run in step with what it recorded (see above)
+    MotionAnalyzer(double fps, double window_ms, bool async_capture = false);
 
     //! next frame. duplicate: the pixel comparison counts the frame as a duplicate,
     //! changed_share: share (0 - 1) of its pixels which are different
@@ -177,6 +205,17 @@ private:
     double _accumulated_step = 0.0;
     long long _shown = 0;
 
+    // asynchronous capture: the drift of the current new frame is 0, the lower edge of the band of one
+    // interval in which it may move lies somewhere in [_band_low, _band_high]
+    bool _async_capture;
+    double _band_low = -1.0;
+    double _band_high = 0.0;
+    long long _retimed_frames = 0;
+    long long _lost_frames = 0;
+    long long _lost_after_repeat = 0;
+    //! frames at which a picture was missing, of the last second
+    std::deque<long long> _lost_evidence;
+
     // perceived smoothness over the last second
     struct RollingStep {
         long long frame;
@@ -215,6 +254,7 @@ private:
     };
     std::vector<Group> _groups;
     std::array<Reference, kMotionCells> _reference;
+    std::vector<float> _recent_steps;
 };
 
 } // namespace trdrop

@@ -74,6 +74,18 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
       --motion-window <ms>     the motion of a frame is compared to the average motion in
                                this window around it (default: 400, growing up to 1000 until
                                it holds 10 new frames)
+      --async-capture          --motion for a capture that didn't run in step with the game's
+                               output (variable refresh rate, or a capture program with its
+                               own clock): a picture may be recorded an interval late, which
+                               looks like a repeated frame, and the one that makes up for it
+                               looks like a jump. The display time of a picture then counts
+                               as known to one interval only - the animation error is what
+                               that can't explain - and a step twice as long as those around
+                               it, after a picture that was recorded once, counts as two
+                               pictures of which the capture lost one (while that happens,
+                               also after a picture that was recorded twice).
+                               A game that really shows a picture an interval late looks the
+                               same: use it only if you know the capture is not in step
 
 backend:
       --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
@@ -113,6 +125,9 @@ additional per frame columns with --motion:
                     that frame was displayed
   vN_perceived_fps  perceived smoothness over the last second: the framerate of evenly paced
                     motion that looks as smooth, new frames per second / (1 + cv(step)^2)
+  vN_lost           only with --async-capture, new frames: pictures the capture lost between
+                    the previous new frame and this one (they count as frames in
+                    vN_perceived_fps, vN_fps doesn't know them)
 
 tear columns:
   frame, video, row_a, row_b, video_height   (the tear is between row_a and row_b)
@@ -213,6 +228,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--source-fps") { source_fps.values = split(next(), ','); }
         else if (arg == "--no-vk") { options.use_vulkan = false; }
         else if (arg == "--motion") { options.motion = true; }
+        else if (arg == "--async-capture") { options.motion = true; options.async_capture = true; }
         else if (arg == "--motion-window")
         {
             options.motion_window_ms = parse_double(next(), arg);
@@ -527,6 +543,7 @@ int run(const Options & options)
         {
             *output << ',' << prefix << "anim_step" << ',' << prefix << "anim_step_spread" << ',' << prefix << "anim_error_ms"
                     << ',' << prefix << "perceived_fps";
+            if (options.async_capture) *output << ',' << prefix << "lost";
         }
     }
     *output << '\n';
@@ -547,7 +564,10 @@ int run(const Options & options)
     std::vector<MotionAnalyzer> motion_analyzers;
     if (options.motion)
     {
-        for (size_t i = 0; i < video_count; ++i) motion_analyzers.emplace_back(recorded_framerates[i], options.motion_window_ms);
+        for (size_t i = 0; i < video_count; ++i)
+        {
+            motion_analyzers.emplace_back(recorded_framerates[i], options.motion_window_ms, options.async_capture);
+        }
     }
     auto write_ready_rows = [&]() {
         while (!pending_rows.empty())
@@ -571,6 +591,11 @@ int run(const Options & options)
                 if (sample.has_error) line += format_number(sample.error_ms);
                 line += ',';
                 if (sample.has_perceived_fps) line += format_number(sample.perceived_fps);
+                if (options.async_capture)
+                {
+                    line += ',';
+                    if (sample.has_error) line += std::to_string(sample.lost);
+                }
             }
             line += '\n';
             *output << line;
@@ -727,6 +752,20 @@ int run(const Options & options)
                 }
                 std::fprintf(stderr, " | animation error median %.2f ms avg %.2f ms p95 %.2f ms max %.2f ms (spread of the votes on a step: %.2f ms)"
                            , m.median_abs_error_ms, m.mean_abs_error_ms, m.p95_abs_error_ms, m.max_abs_error_ms, m.median_step_spread_ms);
+                if (options.async_capture)
+                {
+                    std::fprintf(stderr, " | asynchronous capture: %lld pictures re-timed by an interval, %lld lost pictures counted in"
+                                         " (%lld of them after a repeated picture)"
+                               , m.retimed_frames, m.lost_frames, m.lost_after_repeat);
+                }
+                else if (m.interval_errors_short >= 0.05 && m.interval_errors_long >= 0.05)
+                {
+                    // what a capture out of step with the output looks like; a game with uneven pacing too
+                    std::fprintf(stderr, "\nv%zu note: %.0f%% of the animation errors are about one whole interval (%.1f ms), early and late alike."
+                                         " A capture that doesn't run in step with the game's output (variable refresh rate, a capture program"
+                                         " with its own clock) does that: if this is one, see --async-capture"
+                               , i + 1, 100.0 * (m.interval_errors_short + m.interval_errors_long), 1000.0 / recorded_framerates[i]);
+                }
             }
             else
             {

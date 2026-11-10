@@ -26,6 +26,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--max-frames <n>` | stop after n frames |
 | `--motion` | [motion analysis](#motion-analysis---motion): animation step, animation error and perceived smoothness |
 | `--motion-window <ms>` | fixed length of the window the motion of a frame is compared to (default: 400, longer for low framerates) |
+| `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
@@ -170,6 +171,7 @@ Additional CSV columns (empty where not available):
 | `vN_anim_step_spread` | how much the moving parts of the picture disagree about the step, in display intervals (`0`: rigid motion). A difference between two steps which is smaller than this says little |
 | `vN_anim_error_ms` | new frames: animation error |
 | `vN_perceived_fps` | perceived smoothness over the last second (needs 6 steps and usable motion in half of it) |
+| `vN_lost` | only with `--async-capture`, new frames: pictures the capture lost between the previous new frame and this one |
 
 and a summary line per video:
 
@@ -217,10 +219,65 @@ Limits:
   frames are measured - those in which the character covers enough of the picture.
 * Parts of the picture which update at different rates (e.g. a 30 fps animation in a 60 fps camera pan) are
   not separated, the larger part wins.
-* It can't tell whether uneven steps come from the game or from the recording.
+* It can't tell whether uneven steps come from the game or from the recording. If the recording is known to be
+  out of step with the game's output, `--async-capture` (below) takes that into account.
 * The GPU path needs Vulkan Video decoding (`--decode vulkan`, or `auto`, which prefers it with `--motion`);
   other sources (e.g. lossless RGB) are measured on the CPU.
 * The rows of the CSV are written with a delay of up to half a second (the look ahead of the window).
+
+### Captures that are not in step (`--async-capture`)
+
+A capture card that records a console at a fixed 60 Hz in step with its output sees every picture exactly as
+long as it was shown. A capture that has its own clock does not - a variable refresh rate output recorded at
+a fixed rate, or a capture program (OBS, ...) that composes its frames at its own pace from what the card
+delivers. A picture shown at time t is first recorded at the next tick of the capture, up to one interval
+later, and a picture that is shown for less than an interval may not be recorded at all. In the recording
+that looks like trouble the game doesn't have:
+
+```
+shown by the game   A  B  C  D  E  F  G  H  I     120 fps, evenly paced
+recorded            A  B  B  C  D  E  G  H  I     B twice (C was a moment late for its tick), F lost
+animation step         1  0  1  1  1  2  1  1
+animation error        0    -1  0  0 +1  0  0     in intervals: C after B was recorded twice, G after E once
+```
+
+A repeated picture, later a step twice as long, and in between an animation error of -1 and +1 interval;
+the framerate and the perceived smoothness drop although every picture of the game was on time. Without the
+option the summary points it out if many errors are one whole interval, early and late alike.
+
+With `--async-capture` (it implies `--motion`):
+
+* The time a picture was shown counts as known to one interval only. The drift between animation time and
+  recorded time may move freely within a band of one interval - that is the capture - and only what pushes
+  the band along is animation error. Above: 0 for every frame.
+* A step about twice as long as the steps around it, after a picture that was recorded once, stands for two
+  pictures of which the capture lost one (`vN_lost`). They count as two steps in the perceived smoothness and
+  in the new frames per second of the motion line, and `smoothness.py` adds them to the framerate. This
+  needs pictures that are shown for about one interval (1.2 at most): a picture that is shown longer is
+  always recorded.
+* If the repeat and the lost picture fall together (`A B B D`), the recording is the same as a game that
+  showed one picture twice. While the capture demonstrably loses pictures (at least 3 in the last second)
+  it counts as the capture; the summary says how many these are.
+* The summary line ends with `asynchronous capture: 1404 pictures re-timed by an interval, 933 lost pictures
+  counted in (218 of them after a repeated picture)`.
+
+The first line of the summary and `vN_diff` / `vN_fps` / `vN_frametime_ms` stay what the recording contains.
+
+What it costs: a game that really shows a picture an interval late and makes up for it afterwards (bad frame
+pacing: 30 fps shown for 1, 3, 1, 3 intervals) produces exactly the same recording, and animation errors of
+less than one interval peak to peak disappear altogether (`motion_ball_uneven`: 0 instead of 8.3 ms; its
+perceived smoothness stays 48 fps, the steps are still uneven). So the option is a statement about the
+capture which the video can't confirm: use it if you know that the capture is not in step, not to make a
+result look better. Better still, fix the capture - no analysis brings back a picture that was not recorded.
+
+Measured (`motion_ball_capture` from `tools/make_ball_videos.py`: an even 60 fps, 10 times per second one
+picture recorded twice and another one lost; and a 4K 120 fps recording of a game locked to 120 fps, made
+with a capture program that lost and repeated about 20 pictures per second):
+
+| video | as recorded | with `--async-capture` |
+| --- | --- | --- |
+| `motion_ball_capture` | 50.1 fps, perceived 45.2 fps, animation error avg 5.1 ms | 59.8 fps, perceived 60.0 fps, avg 0.2 ms |
+| game recording, 120 fps | 99.3 fps, perceived 90.4 fps, avg 2.9 ms (31% of the errors are +-8.3 ms) | 119.5 fps, perceived 119.5 fps, avg 0.4 ms |
 
 ## Plotting
 
@@ -239,7 +296,7 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | --- | --- |
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
-| `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram |
+| `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram. With `--fps` and an `--async-capture` CSV the framerate includes the pictures the capture lost |
 | `motion_vectors.py` | writes a copy of a video with its motion vectors drawn on top (measured like the CPU path of `--motion`; with `--csv` also the values of every frame). Needs numpy, opencv-python and ffmpeg |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).

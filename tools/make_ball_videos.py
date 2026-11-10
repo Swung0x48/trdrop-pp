@@ -21,6 +21,12 @@ The pacing changes every 2 seconds (8 seconds, the ball moves half as fast), the
   motion_ball_change   like motion_ball_60, then _uneven, then _stutter,       60 / 60 / 30 / 60 fps,
                        then _60 again                                          perceived 60 / 48 / 24 / 60
 
+An even 60 fps recorded by a capture that is out of step with it (see --async-capture): 10 times per second
+one picture is recorded twice and another one is lost
+
+  motion_ball_capture  as recorded                                             50 fps, perceived 45
+                       with --async-capture                                    60 fps, perceived 60
+
 Needs numpy, opencv-python and an ffmpeg with the chosen encoder.
 """
 
@@ -49,7 +55,12 @@ def videos():
     # advancing by 1 / 3, even steps
     steps = np.concatenate([np.ones(120), np.tile([0.5, 1.5], 60), np.tile([0.0, 1.0, 0.0, 3.0], 30), np.ones(120)])
     steps[0] = 0.0
+    # capture out of step: in every 6 frames one picture is recorded an interval late (a repeat) and stays late
+    # for `lag` frames, then one picture is lost. The lag changes every half second, 1: lost right after the repeat
+    lag = np.array([3, 1, 2, 5, 4, 1, 3, 2])[np.minimum(frames // 30, 7)]
+    capture = np.maximum(np.where(frames % 6 < lag, frames - 1, frames), 0)
     return {
+        "capture": (capture.astype(float), 1.0),
         "60": (frames.astype(float), 1.0),
         "30": ((frames // 2 * 2).astype(float), 1.0),
         "15": ((frames // 4 * 4).astype(float), 1.0),

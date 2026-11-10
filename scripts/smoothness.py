@@ -2,7 +2,9 @@
 """Plots the motion analysis of a trdrop++ CSV written with --motion.
 
 Three charts, all videos overlaid:
-  framerate            pixel based framerate (vN_fps) and perceived smoothness (vN_perceived_fps)
+  framerate            pixel based framerate (vN_fps) and perceived smoothness (vN_perceived_fps);
+                       with --fps and a CSV written with --async-capture the framerate includes
+                       the pictures the capture lost (vN_lost)
   animation error      per new frame over time (vN_anim_error_ms), with --fps also the
                        uncertainty of the steps as a band (vN_anim_step_spread)
   animation error      histogram
@@ -53,10 +55,19 @@ def main():
     for number, video in enumerate(analysis.videos):
         color = colors[number % len(colors)]
         perceived = [v for v in video.perceived_fps[skip:] if not math.isnan(v)]
-        measured = [v for v in video.fps[skip:] if not math.isnan(v)]
+        framerate, lost = video.fps, 0
+        if args.fps and any(v > 0 for v in video.lost):
+            # --async-capture: the pictures the capture lost belong to the framerate (the sum over the last second)
+            total = [0.0]
+            for v in video.lost:
+                total.append(total[-1] + (0.0 if math.isnan(v) else v))
+            framerate = [rate + total[k + 1] - total[max(0, k + 1 - skip)] for k, rate in enumerate(video.fps)]
+            lost = int(total[-1])
+        measured = [v for v in framerate[skip:] if not math.isnan(v)]
         highest_rate = max([highest_rate] + measured + perceived)
-        rate_axis.plot(x[skip:], video.fps[skip:], color=color, linewidth=1.0, alpha=0.45,
-                       label=f"{video.label}: framerate (avg {sum(measured) / max(1, len(measured)):.1f} fps)")
+        rate_axis.plot(x[skip:], framerate[skip:], color=color, linewidth=1.0, alpha=0.45,
+                       label=f"{video.label}: framerate" + (f" with {lost} pictures the capture lost" if lost else "")
+                             + f" (avg {sum(measured) / max(1, len(measured)):.1f} fps)")
         rate_axis.plot(x[skip:], video.perceived_fps[skip:], color=color, linewidth=1.5,
                        label=f"{video.label}: perceived smoothness"
                              + (f" (avg {sum(perceived) / len(perceived):.1f} fps)" if perceived else " (not measurable)"))

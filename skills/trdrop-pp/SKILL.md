@@ -127,10 +127,31 @@ number came from when several were analyzed.
 | A lossy recording reports far more new frames than plausible | compression noise is counted as change: raise `--tolerance-pct` (start with 2) or `--pixel-diff` (start with 8) step by step and watch the duplicate count |
 | Small real changes are missed in a mostly static picture | lower them: `--tolerance-pct 0.1`, or `--tolerance-pct 0 --pixel-diff 0` for a lossless source in a lossy container |
 | The container's framerate is wrong | `--source-fps <fps>` |
+| The capture was not in step with the game's output (variable refresh rate output, or recorded with a capture program like OBS) and the summary shows a `note:` about animation errors of one whole interval | `--async-capture` instead of `--motion`, see below |
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |
 | No GPU, a GPU error, or results must not depend on the GPU | `--no-vk` (CPU only), or `--decode ffmpeg` |
 | Several GPUs | `--list-vkdevices`, then `--vkdevice <n>` |
 | Timings look wrong | another program is using the GPU; the results are unaffected, only the speed |
+
+## Captures that are not in step with the game
+
+A capture with its own clock (OBS and similar programs, a variable refresh rate output recorded at a fixed
+rate) records some pictures an interval late and loses others. In the recording that looks like a repeated
+picture, later a step twice as long, and animation errors of exactly one interval (8.3 ms at 120 fps,
+16.7 ms at 60 fps) in both directions - although the game was on time. trdrop++ prints a `note:` after the
+motion line when it sees many of those.
+
+`--async-capture` (implies `--motion`) reads such a recording as what the game showed: display times count
+as known to one interval only, and pictures the capture must have lost are counted in. The motion line then
+ends with `asynchronous capture: N pictures re-timed by an interval, M lost pictures counted in (K of them
+after a repeated picture)`, the CSV has a `vN_lost` column, and `smoothness.py --fps` adds the lost pictures
+to the framerate. The first summary line stays what the recording contains.
+
+Use it only when the capture is known to be out of step - ask the user how the video was recorded if the
+note appears and it isn't clear. A game with bad frame pacing (pictures really shown an interval late) makes
+the same recording, and with the option that is no longer reported; animation errors below one interval
+disappear too. When you use it, say so in the report, give the numbers with and without it, and mention how
+many pictures were counted in: a capture that loses pictures should be fixed rather than corrected.
 
 ## What it can not do
 
@@ -146,4 +167,4 @@ Knowing these keeps the report honest:
   playing inside a still page, a game window on a still desktop), the *pixel based* framerate reads low
   because such frames count as torn. The motion line is the better source then.
 - It measures the recording. Whether unevenness comes from the game or from the capture can not be told from
-  the file alone.
+  the file alone; `--async-capture` is an assumption about the capture, not a measurement of it.

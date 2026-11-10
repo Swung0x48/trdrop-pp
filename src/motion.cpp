@@ -30,6 +30,17 @@ constexpr size_t kMinWindowFrames = 10;
 //! the perceived smoothness needs this many steps and this share of measurable frames in the last second
 constexpr size_t kMinRollingSteps = 6;
 constexpr double kMinRollingMeasurable = 0.5;
+//! asynchronous capture, a picture was lost before a new frame: the previous picture was recorded once, the
+//! step is about twice as long as the usual step (the median of the last kLostUsualSteps) ...
+constexpr double kLostMinRatio = 1.6;
+constexpr double kLostMaxRatio = 2.4;
+constexpr size_t kLostUsualSteps = 9;
+//! ... and the pictures are shown for about one interval or less: a picture that is shown longer is always
+//! recorded, and one that is shown for twice as long is recorded twice
+constexpr double kLostMaxStep = 1.2;
+//! a picture recorded twice before such a step counts as repeated by the capture (and the next one as lost)
+//! if the capture lost at least this many pictures in the last second in the way described above
+constexpr size_t kMinLostEvidence = 3;
 
 //! Framerate of evenly paced motion that looks as smooth as the steps: the new frames per second divided by
 //! 1 + (coefficient of variation of the steps)^2 = fps * sum(step)^2 / (displayed intervals * sum(step^2)).
@@ -162,13 +173,14 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma)
     return field;
 }
 
-MotionAnalyzer::MotionAnalyzer(double fps, double window_ms)
+MotionAnalyzer::MotionAnalyzer(double fps, double window_ms, bool async_capture)
     : _fps(fps)
     , _half_window(static_cast<size_t>(std::max(2.0, std::round((window_ms > 0.0 ? window_ms : kDefaultWindowMs) / 2000.0 * fps))))
     // a given window is used as it is, the automatic one may grow
     , _max_half_window(window_ms > 0.0 ? _half_window
                                        : std::max(_half_window, static_cast<size_t>(std::round(kMaxWindowSeconds / 2.0 * fps))))
     , _rolling_window(static_cast<size_t>(std::max(1.0, std::ceil(fps - 1e-9))))
+    , _async_capture(async_capture)
 { }
 
 void MotionAnalyzer::push(const MotionField & field, bool duplicate, double changed_share)
@@ -216,6 +228,8 @@ void MotionAnalyzer::_reset_chain()
     _chain = false;
     _accumulated_step = 0.0;
     _shown = 0;
+    _band_low = -1.0;
+    _band_high = 0.0;
 }
 
 MotionSample MotionAnalyzer::_finalize(size_t position)
@@ -367,15 +381,79 @@ MotionSample MotionAnalyzer::_finalize(size_t position)
             {
                 _accumulated_step += sample.step;
                 ++_shown;
+                // how far the animation advanced beyond the time the previous picture was recorded, in intervals
+                double error = _accumulated_step - static_cast<double>(_shown);
+                if (_async_capture)
+                {
+                    // The drift moved by `error`. Within the band of one interval that is the capture, beyond it
+                    // the band is pushed along and the rest is the animation error.
+                    const double moved = error;
+                    if (moved > _band_high + 1.0)
+                    {
+                        error = moved - (_band_high + 1.0);
+                        _band_low = _band_high = moved - 1.0;
+                    }
+                    else if (moved < _band_low)
+                    {
+                        error = moved - _band_low;
+                        _band_low = _band_high = moved;
+                    }
+                    else
+                    {
+                        error = 0.0;
+                        _band_low = std::max(_band_low, moved - 1.0);
+                        _band_high = std::min(_band_high, moved);
+                    }
+                    // the drift of this frame is the new origin
+                    _band_low -= moved;
+                    _band_high -= moved;
+                    const double retimed = moved - error;
+                    if (std::fabs(retimed) > 0.5) ++_retimed_frames;
+                    // A lost picture shows as a step twice as long as the steps around it. If the previous picture
+                    // was recorded an interval short of that step, a picture is missing. If it was recorded twice,
+                    // either the capture repeated it and lost the next one, or the game showed it twice: that
+                    // counts as the capture while it demonstrably loses pictures.
+                    while (!_lost_evidence.empty() && _lost_evidence.front() + static_cast<long long>(_rolling_window) <= _finalized)
+                    {
+                        _lost_evidence.pop_front();
+                    }
+                    const bool missing = _shown == 1;
+                    const bool repeated = _shown == 2 && _lost_evidence.size() >= kMinLostEvidence;
+                    if ((missing || repeated) && _rolling_steps.size() >= kMinRollingSteps)
+                    {
+                        // the usual step: of the last few pictures, the scale of the steps drifts if the motion
+                        // speeds up or slows down
+                        _recent_steps.clear();
+                        const size_t count = std::min(_rolling_steps.size(), kLostUsualSteps);
+                        for (size_t k = _rolling_steps.size() - count; k < _rolling_steps.size(); ++k)
+                        {
+                            _recent_steps.push_back(static_cast<float>(_rolling_steps[k].step));
+                        }
+                        const double usual = median(_recent_steps);
+                        if (usual <= kLostMaxStep && _accumulated_step >= kLostMinRatio * usual && _accumulated_step <= kLostMaxRatio * usual)
+                        {
+                            sample.lost = 1;
+                            if (missing) _lost_evidence.push_back(_finalized);
+                            else ++_lost_after_repeat;
+                        }
+                    }
+                }
                 sample.has_error = true;
-                sample.error_ms = (_accumulated_step - static_cast<double>(_shown)) * 1000.0 / _fps;
+                sample.error_ms = error * 1000.0 / _fps;
                 _errors.push_back(static_cast<float>(sample.error_ms));
-                ++_animation_frames;
                 _step_spread.push_back(static_cast<float>(sample.step_spread));
                 _shown_total += _shown;
+                // a lost picture and the one after it share the step
+                const int pictures = 1 + sample.lost;
+                const double step = _accumulated_step / pictures;
+                _lost_frames += sample.lost;
+                _animation_frames += pictures;
                 _step_sum += _accumulated_step;
-                _step_square_sum += _accumulated_step * _accumulated_step;
-                _rolling_steps.push_back({ _finalized, _accumulated_step, static_cast<double>(_shown) });
+                _step_square_sum += pictures * step * step;
+                for (int k = 0; k < pictures; ++k)
+                {
+                    _rolling_steps.push_back({ _finalized, step, static_cast<double>(_shown) / pictures });
+                }
             }
             _chain = true;
             _accumulated_step = 0.0;
@@ -423,6 +501,9 @@ MotionAnalyzer::Summary MotionAnalyzer::summary() const
     result.new_frames = _new_frames;
     result.measurable_new_frames = _measurable_new_frames;
     result.animation_frames = _animation_frames;
+    result.retimed_frames = _retimed_frames;
+    result.lost_frames = _lost_frames;
+    result.lost_after_repeat = _lost_after_repeat;
     if (_shown_total > 0) result.motion_fps = _fps * static_cast<double>(_animation_frames) / static_cast<double>(_shown_total);
     if (_step_square_sum > 0.0 && _shown_total > 0)
     {
@@ -450,6 +531,15 @@ MotionAnalyzer::Summary MotionAnalyzer::summary() const
             sum += absolute[i];
         }
         std::sort(absolute.begin(), absolute.end());
+        const double interval = 1000.0 / _fps;
+        long long too_short = 0, too_long = 0;
+        for (float error : _errors)
+        {
+            if (std::fabs(std::fabs(error) - interval) > 0.25 * interval) continue;
+            ++(error < 0.0f ? too_short : too_long);
+        }
+        result.interval_errors_short = static_cast<double>(too_short) / static_cast<double>(_errors.size());
+        result.interval_errors_long = static_cast<double>(too_long) / static_cast<double>(_errors.size());
         result.mean_abs_error_ms = sum / static_cast<double>(absolute.size());
         result.median_abs_error_ms = absolute[absolute.size() / 2];
         result.p95_abs_error_ms = absolute[std::min(absolute.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(absolute.size())))];

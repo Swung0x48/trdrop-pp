@@ -24,6 +24,16 @@ Only with `--motion` (empty where not available):
 | `vN_anim_error_ms` | new frames only: the animation step since the previous new frame minus the time that frame was displayed, in ms. `0` = the picture advanced exactly as long as the previous one was shown |
 | `vN_perceived_fps` | perceived smoothness over the last second. Needs 6 steps and usable motion in half of that second |
 
+Only with `--async-capture`:
+
+| column | meaning |
+| --- | --- |
+| `vN_lost` | new frames: pictures the capture lost between the previous new frame and this one (`0` or `1`). They count as frames in `vN_perceived_fps`; `vN_diff` and `vN_fps` don't know them |
+
+With `--async-capture`, `vN_anim_error_ms` is what is left after allowing every picture to have been shown up
+to one interval before it was recorded (the drift between animation and recorded time may move within a band
+of one interval, only what pushes the band counts).
+
 The rows of a `--motion` run are written with a delay of up to half a second of video, the content is the same.
 
 ## Tear CSV (`--tears`)
@@ -83,4 +93,6 @@ picture, so for a frametime distribution take it only at rows with `vN_diff > 0`
 
 `<scripts>/make_ball_videos.py <folder>` (in a source checkout: `tools/make_ball_videos.py`) writes short videos of a ball moving at constant speed with known
 pacing (needs numpy, opencv-python and ffmpeg). Expected: `motion_ball_60` 60 / 60 fps (framerate /
-perceived), `_30` 30 / 30, `_15` 15 / 15, `_uneven` 60 / 48, `_stutter` 30 / 24, `_hitch` 54 / 35.3.
+perceived), `_30` 30 / 30, `_15` 15 / 15, `_uneven` 60 / 48, `_stutter` 30 / 24, `_hitch` 54 / 35.3,
+`_capture` (an even 60 fps through a capture that repeats and loses pictures) 50 / 45 as recorded and
+60 / 60 with `--async-capture`.
