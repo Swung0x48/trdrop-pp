@@ -1,4 +1,4 @@
-// trdrop-cli: command line version of trdrop (https://github.com/cirquit/trdrop)
+// trdrop++ (trdrop-pp): command line version of trdrop (https://github.com/cirquit/trdrop)
 // Analyzes raw (uncompressed) captures and writes the per frame framerate / frametime / tear data.
 
 #include <algorithm>
@@ -40,7 +40,7 @@ constexpr const char * kVersion = "1.1.1-cli";
 void print_usage(std::ostream & out)
 {
     out <<
-R"(trdrop-pp - raw video analysis (framerate, frametime and tear detection)
+R"(trdrop++ - raw video analysis (framerate, frametime and tear detection)
 
 usage: trdrop-pp [options] <video> [<video> [<video>]]
 
@@ -202,7 +202,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         }
         else if (arg == "--") { only_inputs = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(std::cout); return false; }
-        else if (arg == "-v" || arg == "--version") { std::cout << "trdrop-pp " << kVersion << "\n"; return false; }
+        else if (arg == "-v" || arg == "--version") { std::cout << "trdrop++ " << kVersion << "\n"; return false; }
         else if (arg == "-o" || arg == "--output") { options.output_path = next(); }
         else if (arg == "--tears") { options.tears_path = next(); }
         else if (arg == "--no-summary") { options.print_summary = false; }

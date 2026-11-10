@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plots the motion analysis of a trdrop-pp CSV written with --motion.
+"""Plots the motion analysis of a trdrop++ CSV written with --motion.
 
 Three charts, all videos overlaid:
   framerate            pixel based framerate (vN_fps) and perceived smoothness (vN_perceived_fps)
@@ -27,7 +27,7 @@ def percentile(sorted_values, p):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot the perceived smoothness and animation error from a trdrop-pp --motion CSV.")
+    parser = argparse.ArgumentParser(description="Plot the perceived smoothness and animation error from a trdrop++ CSV written with --motion.")
     trdrop_csv.add_common_arguments(parser)
     parser.add_argument("--fps", type=trdrop_csv.positive_float, default=None,
                         help="recorded framerate of the capture, shows the x axis in seconds instead of frames")

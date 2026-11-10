@@ -1,4 +1,4 @@
-"""Shared helpers for reading the per frame CSV written by trdrop-pp."""
+"""Shared helpers for reading the per frame CSV written by trdrop++."""
 
 import argparse
 import csv
@@ -40,7 +40,7 @@ def _number(text):
 
 
 def read_analysis(path, labels=None):
-    """Reads a trdrop-pp CSV from a file path, or from stdin if path is None or '-'."""
+    """Reads a trdrop++ CSV from a file path, or from stdin if path is None or '-'."""
     if path in (None, "-"):
         if sys.stdin is None or sys.stdin.isatty():
             raise SystemExit("error: no CSV given - pass a file or pipe trdrop-pp into this script, "
@@ -61,7 +61,7 @@ def _parse(stream, labels, name):
     except StopIteration:
         raise SystemExit(f"error: {name} is empty")
     if not header or header[0] != "frame":
-        raise SystemExit(f"error: {name} doesn't look like a trdrop-pp CSV (first column must be 'frame')")
+        raise SystemExit(f"error: {name} doesn't look like a trdrop++ CSV (first column must be 'frame')")
 
     # column index -> (video number, metric)
     columns = {}
@@ -94,7 +94,7 @@ def _parse(stream, labels, name):
 
 def add_common_arguments(parser):
     parser.add_argument("csv", nargs="?", default="-",
-                        help="CSV written by trdrop-pp (default: read from stdin)")
+                        help="CSV written by trdrop++ (default: read from stdin)")
     parser.add_argument("--labels", type=lambda text: text.split(","), default=None,
                         help="comma separated legend labels per video, e.g. 'PS5,XSX'")
     parser.add_argument("--title", default=None, help="plot title")

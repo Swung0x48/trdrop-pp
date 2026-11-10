@@ -1,6 +1,7 @@
-# trdrop-cli
+# trdrop++
 
 Command line version of [trdrop](https://github.com/cirquit/trdrop), a raw video analysis program.
+The program and the repository are called `trdrop-pp`, `pp` being the `++` that file names and URLs don't like.
 It estimates the *real* framerate and frametime of an uncompressed capture and detects frame tears,
 using the same algorithms as the original GUI, and writes the raw per frame data as CSV.
 
@@ -352,7 +353,7 @@ decoded on the GPU, the Y, U and V planes of every frame are copied on the GPU a
 back, the frames never leave the GPU. Without `USE_VULKAN` only the `ffmpeg` (CPU) mode is available.
 
 It needs the FFmpeg >= 8.0 development files (`libavformat`, `libavcodec`, `libavutil`), linked
-dynamically, so an LGPL build is sufficient and the license of trdrop-pp is not affected. On Windows
+dynamically, so an LGPL build is sufficient and the license of trdrop++ is not affected. On Windows
 e.g. the `ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip` of [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases),
 the DLLs are copied next to `trdrop-pp.exe` (ship them together with FFmpeg's license).
 On Linux pkg-config is used when `FFMPEG_DIR` isn't set.

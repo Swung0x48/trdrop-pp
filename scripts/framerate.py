@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plots the framerate of every video over time from a trdrop-pp CSV.
+"""Plots the framerate of every video over time from a trdrop++ CSV.
 
     python framerate.py analysis.csv
     trdrop-pp capture.avi | python framerate.py --fps 60 -o framerate.png
@@ -12,7 +12,7 @@ import trdrop_csv
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot the framerate over time from a trdrop-pp CSV.")
+    parser = argparse.ArgumentParser(description="Plot the framerate over time from a trdrop++ CSV.")
     trdrop_csv.add_common_arguments(parser)
     parser.add_argument("--fps", type=trdrop_csv.positive_float, default=None,
                         help="recorded framerate of the capture, shows the x axis in seconds instead of frames")

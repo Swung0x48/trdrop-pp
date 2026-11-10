@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
-project(trdrop-cli VERSION 1.1.1 LANGUAGES CXX)
+# trdrop++, spelled trdrop-pp where a "+" is unwelcome: project, target and file names
+project(trdrop-pp VERSION 1.1.1 DESCRIPTION "trdrop++ - raw video analysis (framerate, frametime and tear detection)" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,7 +78,7 @@ if(USE_VULKAN)
         target_include_directories(trdrop-pp PRIVATE ${Vulkan_INCLUDE_DIRS})
     endif()
     target_link_libraries(trdrop-pp PRIVATE ${CMAKE_DL_LIBS})
-    message(STATUS "trdrop-pp: Vulkan backend enabled (glslc: ${Vulkan_GLSLC_EXECUTABLE})")
+    message(STATUS "trdrop++: Vulkan backend enabled (glslc: ${Vulkan_GLSLC_EXECUTABLE})")
 endif()
 
 if(USE_FFMPEG)
@@ -111,9 +112,9 @@ if(USE_FFMPEG)
         trdrop_shader(motion_pyramid _pyramid_shader_inc)
         trdrop_shader(motion_lk _lk_shader_inc)
         target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}" "${_pyramid_shader_inc}" "${_lk_shader_inc}")
-        message(STATUS "trdrop-pp: FFmpeg decoding enabled (with Vulkan Video)")
+        message(STATUS "trdrop++: FFmpeg decoding enabled (with Vulkan Video)")
     else()
-        message(STATUS "trdrop-pp: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")
+        message(STATUS "trdrop++: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")
     endif()
 
     # Windows: copy the FFmpeg DLLs next to the executable

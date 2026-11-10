@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plots a histogram of the frametimes of every video from a trdrop-pp CSV.
+"""Plots a histogram of the frametimes of every video from a trdrop++ CSV.
 
 Every new frame contributes one sample: the time the previous frame was shown
 (vN_frametime_ms at the rows where vN_diff > 0).
@@ -35,7 +35,7 @@ def percentile(sorted_values, p):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot a frametime histogram from a trdrop-pp CSV.")
+    parser = argparse.ArgumentParser(description="Plot a frametime histogram from a trdrop++ CSV.")
     trdrop_csv.add_common_arguments(parser)
     parser.add_argument("--bins", type=int, default=None,
                         help="number of bins (default: one bar per distinct frametime if there are few, else 50)")

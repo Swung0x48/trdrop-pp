@@ -199,9 +199,9 @@ public:
 
         VkApplicationInfo application {};
         application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        application.pApplicationName = "trdrop-pp";
+        application.pApplicationName = "trdrop++";
         application.applicationVersion = 1;
-        application.pEngineName = "trdrop-pp";
+        application.pEngineName = "trdrop++";
         application.apiVersion = VK_API_VERSION_1_0;
 
         // TRDROP_VK_VALIDATION=1 enables the Khronos validation layer if it is installed (debugging)
