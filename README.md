@@ -223,7 +223,8 @@ Limits:
 * Parts of the picture which update at different rates (e.g. a 30 fps animation in a 60 fps camera pan) are
   not separated, the larger part wins.
 * It can't tell whether uneven steps come from the game or from the recording. If the recording is known to be
-  out of step with the game's output, `--async-capture` (below) takes that into account.
+  out of step with the game's output, `--async-capture` (below) takes that into account;
+  [recording at twice the framerate](#recording-at-twice-the-framerate) avoids it.
 * The GPU path needs Vulkan Video decoding (`--decode vulkan`, or `auto`, which prefers it with `--motion`);
   other sources (e.g. lossless RGB) are measured on the CPU.
 * The rows of the CSV are written with a delay of up to half a second (the look ahead of the window).
@@ -314,7 +315,8 @@ pacing: 30 fps shown for 1, 3, 1, 3 intervals) produces exactly the same recordi
 less than one interval peak to peak disappear altogether (`motion_ball_uneven`: 0 instead of 8.3 ms; its
 perceived smoothness stays 48 fps, the steps are still uneven). So the option is a statement about the
 capture which the video can't confirm: use it if you know that the capture is not in step, not to make a
-result look better. Better still, fix the capture - no analysis brings back a picture that was not recorded.
+result look better. Better still, fix the capture ([below](#recording-at-twice-the-framerate)) - no analysis
+brings back a picture that was not recorded.
 
 Measured (`motion_ball_capture` from `tools/make_ball_videos.py`: an even 60 fps, 10 times per second one
 picture recorded twice and another one lost; and a 4K 120 fps recording of a game locked to 120 fps, made
@@ -324,6 +326,42 @@ with a capture program that lost and repeated about 20 pictures per second):
 | --- | --- | --- |
 | `motion_ball_capture` | 50.1 fps, perceived 45.2 fps, animation error avg 5.1 ms | 59.8 fps, perceived 60.0 fps, avg 0.2 ms |
 | game recording, 120 fps | 99.3 fps, perceived 90.4 fps, avg 2.9 ms (31% of the errors are +-8.3 ms) | 119.5 fps, perceived 119.5 fps, avg 0.4 ms |
+
+### Recording at twice the framerate
+
+A recording that needs no such assumption: record at twice the highest framerate of the source or more - a
+120 Hz output at 240 fps, at a lower resolution if the capture card asks for it. Every picture is then shown
+for at least two intervals of the capture and is recorded whatever the two clocks do, also with a variable
+refresh rate. Analyze it as it is, without `--async-capture`.
+
+For example with FFmpeg on Windows, straight from the card (the first line lists the devices). A capture
+program that composes at its own framerate (OBS, ...) would have to run at the doubled rate too; that was not
+tried.
+
+```
+ffmpeg -list_devices true -f dshow -i dummy
+ffmpeg -f dshow -rtbufsize 2G -video_size 1920x1080 -framerate 240 -pixel_format nv12 -i video="<device>" -fps_mode passthrough -enc_time_base 1:1000000 -c:v hevc_nvenc -preset p1 -rc constqp -qp 18 capture.mp4
+```
+
+`-fps_mode passthrough` writes every frame the card delivers once; messages like `real-time buffer too full`
+or `frame dropped` mean that the encoder doesn't keep up and frames are missing.
+
+What to expect and how to check it:
+
+* Every picture is recorded twice or more: `vN_frametime_ms` is never one interval of the capture. If it is,
+  pictures may have been lost as well - the source was faster than assumed or the card delivered fewer
+  frames than it claims. Where the source runs at its highest rate the pictures are recorded exactly twice.
+* The time a picture was shown is known to one interval of the capture, so the animation error carries up to
+  one interval of noise (4.2 ms at 240 fps). The framerate and the perceived smoothness count pictures and
+  compare their steps, they don't have that noise.
+* Don't expect more from the timestamps of the file: the card this was tried with numbers its frames on the
+  240 fps grid whenever they arrive. trdrop++ doesn't read them.
+
+Measured: a console game with variable refresh rate (about 47 - 120 fps, 102 seconds) recorded at 1080p
+240 fps with a USB capture card. Of its 8532 pictures none was recorded once (37% twice, 44% three times,
+15% four times); in the five seconds in which the game is fastest (115 fps) 91% of the pictures are recorded
+twice. 83.7 new frames per second, perceived smoothness 81.9 fps, animation error 1.3 ms on average and
+3.3 ms at the 95th percentile.
 
 ## Plotting
 
