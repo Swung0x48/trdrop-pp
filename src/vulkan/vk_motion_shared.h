@@ -51,7 +51,56 @@ struct LkPush {
     uint32_t grid_y;
     uint32_t iterations;
     float max_residual;
+    uint32_t list;
+    uint32_t list_output;
 };
+
+//! must match motion_select.comp
+struct SelectPush {
+    uint32_t grid_x;
+    uint32_t grid_y;
+    uint32_t cell_points;
+    uint32_t min_cell_points;
+    uint32_t sparse_cells;
+    uint32_t products_groups;
+    uint32_t parts_groups;
+    uint32_t points_groups;
+    float min_texture;
+    float max_back_error;
+    float moving_squared;
+};
+
+//! what motion_select.comp writes: the indirect dispatches of the points added for sparse motion, whether the
+//! frame has it, and per cell whether it shows something static
+struct SparseState {
+    uint32_t commands[9];
+    uint32_t sparse;
+    uint32_t with_motion;
+    uint32_t complete;
+    uint32_t cell_static[kMotionCells];
+};
+
+//! what motion_select.comp keeps of the last frame of a video with motion (starts as zeros)
+struct SparseLatch {
+    uint32_t sparse;
+    uint32_t cell_static[kMotionCells];
+};
+
+//! must match motion_texture.comp
+struct TexturePush {
+    uint32_t mode;
+    uint32_t width;
+    uint32_t height;
+    uint32_t offset;
+    uint32_t level0_width;
+    uint32_t level0_height;
+    uint32_t parts_x;
+    uint32_t parts_y;
+    uint32_t cell_parts;
+    int32_t radius;
+    float minimum;
+};
+constexpr uint32_t kTextureGroupSize = 64; // local_size_x of motion_texture.comp
 
 //! the motion is measured at the grid of points of motion.h (kMotionPoints of them), at its resolution
 constexpr uint32_t kMotionIterations = 20; // at most, per level
@@ -69,6 +118,80 @@ struct MotionLayout {
     uint32_t offset[kMaxMotionLevels] = {};
     uint64_t bytes = 0;
 };
+
+//! the dispatches of a frame with sparse motion (motion.h, kMotionSparseCells), recorded after the tracking of the
+//! regular grid: what the grid found, then - only if it found sparse motion, the dispatches are indirect - the
+//! texture of the previous frame, the point with the most texture per part of a cell and the tracking of those.
+//! Used by both GPU pipelines, which differ in how they call Vulkan: `dispatch(stage)` binds the pipeline and the
+//! set of the stage and dispatches it with the push constants this fills in.
+struct SparseMotionPushes {
+    SelectPush select {};
+    TexturePush products {};
+    TexturePush parts {};
+    LkPush points {};
+};
+
+inline bool sparse_motion_possible(const MotionLayout & layout) { return layout.levels >= 2; }
+
+//! lk: the push constants of the tracking of the regular grid
+inline SparseMotionPushes sparse_motion_pushes(const MotionLayout & layout, const LkPush & lk)
+{
+    SparseMotionPushes pushes;
+    const uint32_t parts_x = static_cast<uint32_t>(layout.grid.cells_x * kMotionTextureParts);
+    const uint32_t parts_y = static_cast<uint32_t>(layout.grid.cells_y * kMotionTextureParts);
+    pushes.select.grid_x = static_cast<uint32_t>(layout.grid.points_x());
+    pushes.select.grid_y = static_cast<uint32_t>(layout.grid.points_y());
+    pushes.select.cell_points = static_cast<uint32_t>(kMotionCellPoints);
+    pushes.select.min_cell_points = static_cast<uint32_t>(kMotionMinCellPoints);
+    pushes.select.sparse_cells = static_cast<uint32_t>(kMotionSparseCells);
+    pushes.select.products_groups = (layout.width[1] * layout.height[1] + kTextureGroupSize - 1) / kTextureGroupSize;
+    pushes.select.parts_groups = (parts_x * parts_y + kTextureGroupSize - 1) / kTextureGroupSize;
+    pushes.select.points_groups = parts_x * parts_y;
+    pushes.select.min_texture = kMotionMinTexture;
+    pushes.select.max_back_error = kMotionMaxBackError;
+    pushes.select.moving_squared = kMotionMovingPoint * kMotionMovingPoint;
+
+    pushes.products.mode = 0;
+    pushes.products.width = layout.width[1];
+    pushes.products.height = layout.height[1];
+    pushes.products.offset = layout.offset[1];
+    pushes.products.level0_width = layout.width[0];
+    pushes.products.level0_height = layout.height[0];
+    pushes.products.parts_x = parts_x;
+    pushes.products.parts_y = parts_y;
+    pushes.products.cell_parts = static_cast<uint32_t>(kMotionTextureParts);
+    pushes.products.radius = kMotionTextureBlock / 2;
+    pushes.products.minimum = kMotionTextureMin;
+    pushes.parts = pushes.products;
+    pushes.parts.mode = 1;
+
+    pushes.points = lk;
+    pushes.points.list = 1;
+    pushes.points.list_output = static_cast<uint32_t>(kMotionPoints);
+    return pushes;
+}
+
+//! bytes of the buffers of a frame: the tracked points (regular grid, then the added ones), the added points as
+//! motion_texture.comp chose them, the gradient products of level 1
+constexpr uint64_t kMotionPointBytes = static_cast<uint64_t>(kMotionPoints + kMotionTexturePoints) * 4 * sizeof(float);
+constexpr uint64_t kMotionCandidateBytes = static_cast<uint64_t>(kMotionTexturePoints) * 4 * sizeof(float);
+inline uint64_t motion_product_bytes(const MotionLayout & layout) { return static_cast<uint64_t>(layout.width[1]) * layout.height[1] * 4 * sizeof(float); }
+
+//! Adds the points of a frame with sparse motion to the cells. state, candidates, points: what the shaders wrote
+//! (points: the whole buffer). add(x, y, dx, dy, texture, returns): a point at (x, y) of the measured resolution
+template <typename Add>
+inline void read_sparse_motion(const SparseState & state, const float * candidates, const float * points, Add && add)
+{
+    if (!state.sparse) return;
+    for (int part = 0; part < kMotionTexturePoints; ++part)
+    {
+        const float * candidate = candidates + 4 * part;
+        if (!(candidate[2] > 0.0f)) continue;
+        const float * point = points + 4 * (kMotionPoints + part);
+        const bool texture = point[2] >= kMotionMinTexture && std::isfinite(point[0]) && std::isfinite(point[1]);
+        add(candidate[0], candidate[1], point[0], point[1], texture, texture && point[3] <= kMotionMaxBackError);
+    }
+}
 
 inline MotionLayout motion_layout(int width, int height)
 {

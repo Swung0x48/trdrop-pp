@@ -132,9 +132,12 @@ if(USE_FFMPEG)
         trdrop_shader(yuv_diff _yuv_shader_inc)
         trdrop_shader(motion_pyramid _pyramid_shader_inc)
         trdrop_shader(motion_lk _lk_shader_inc)
+        trdrop_shader(motion_select _select_shader_inc)
+        trdrop_shader(motion_texture _texture_shader_inc)
         trdrop_shader(overlay_base _overlay_base_shader_inc)
         trdrop_shader(overlay_draw _overlay_draw_shader_inc)
         target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}" "${_pyramid_shader_inc}" "${_lk_shader_inc}"
+                                         "${_select_shader_inc}" "${_texture_shader_inc}"
                                          "${_overlay_base_shader_inc}" "${_overlay_draw_shader_inc}")
         message(STATUS "trdrop++: FFmpeg decoding enabled (with Vulkan Video)")
     else()

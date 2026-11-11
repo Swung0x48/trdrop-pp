@@ -1,0 +1,106 @@
+#version 450
+// Sparse motion (motion.h, kMotionSparseCells): what the regular grid of points found, per cell and for the frame.
+// A point is used if it has texture and tracking it back returns to it; it moved if it did so by at least
+// sqrt(moving_squared) pixels. A cell in which points are used and none moved shows something static. The frame has
+// motion if a cell has min_cell_points points that moved, and sparse motion if fewer than sparse_cells cells do.
+// A frame without motion - a duplicate - is treated like the last frame with motion: that is kept in `latch`, a
+// buffer of the video.
+//
+// One workgroup. For a frame with sparse motion it writes how many workgroups the three dispatches that add
+// points get (motion_texture.comp twice, motion_lk.comp with the list), otherwise 0: they are dispatched indirectly.
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Points { vec4 points[]; };
+// commands: three times the x, y, z of an indirect dispatch
+layout(std430, set = 0, binding = 1) writeonly buffer State {
+    uint commands[9];
+    uint sparse;
+    uint with_motion;
+    uint complete;
+    uint cell_static[];
+} state;
+layout(std430, set = 0, binding = 2) buffer Latch {
+    uint sparse;
+    uint cell_static[];
+} latch;
+
+layout(push_constant) uniform Parameters {
+    uint grid_x;            // points of the regular grid
+    uint grid_y;
+    uint cell_points;       // ... per cell in a direction
+    uint min_cell_points;
+    uint sparse_cells;
+    uint products_groups;
+    uint parts_groups;
+    uint points_groups;
+    float min_texture;
+    float max_back_error;
+    float moving_squared;
+} params;
+
+shared uvec2 partial[256];
+
+// a lane has the cells lane, lane + 256, ...
+const uint kLaneCells = 8u;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint cells_x = params.grid_x / params.cell_points;
+    const uint cells = cells_x * (params.grid_y / params.cell_points);
+    uvec2 count = uvec2(0u); // cells with a point that moved, with min_cell_points of them
+    uint is_static[kLaneCells];
+    uint k = 0u;
+    for (uint cell = lane; cell < cells && k < kLaneCells; cell += gl_WorkGroupSize.x, ++k)
+    {
+        const uint x0 = (cell % cells_x) * params.cell_points;
+        const uint y0 = (cell / cells_x) * params.cell_points;
+        uint used = 0u;
+        uint moving = 0u;
+        for (uint b = 0u; b < params.cell_points; ++b)
+        {
+            for (uint a = 0u; a < params.cell_points; ++a)
+            {
+                // (dx, dy, texture, distance by which the way back misses the point)
+                const vec4 point = points[(y0 + b) * params.grid_x + x0 + a];
+                if (!(point.z >= params.min_texture) || isnan(point.x) || isinf(point.x) || isnan(point.y) || isinf(point.y)
+                    || !(point.w <= params.max_back_error)) continue;
+                used += 1u;
+                if (dot(point.xy, point.xy) >= params.moving_squared) moving += 1u;
+            }
+        }
+        is_static[k] = used > 0u && moving == 0u ? 1u : 0u;
+        if (moving > 0u) count.x += 1u;
+        if (moving >= params.min_cell_points) count.y += 1u;
+    }
+    partial[lane] = count;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride /= 2u)
+    {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    const bool moved = partial[0].y > 0u;
+    k = 0u;
+    for (uint cell = lane; cell < cells && k < kLaneCells; cell += gl_WorkGroupSize.x, ++k)
+    {
+        if (moved) latch.cell_static[cell] = is_static[k];
+        state.cell_static[cell] = moved ? is_static[k] : latch.cell_static[cell];
+    }
+    if (lane == 0u)
+    {
+        const bool is_sparse = moved ? partial[0].y < params.sparse_cells : latch.sparse != 0u;
+        latch.sparse = is_sparse ? 1u : 0u;
+        state.sparse = is_sparse ? 1u : 0u;
+        state.with_motion = partial[0].x;
+        state.complete = partial[0].y;
+        const uint groups[3] = uint[3](params.products_groups, params.parts_groups, params.points_groups);
+        for (uint c = 0u; c < 3u; ++c)
+        {
+            state.commands[3u * c] = is_sparse ? groups[c] : 0u;
+            state.commands[3u * c + 1u] = 1u;
+            state.commands[3u * c + 2u] = 1u;
+        }
+    }
+}

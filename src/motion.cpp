@@ -95,30 +95,73 @@ double weighted_median(std::pair<double, double> * begin, std::pair<double, doub
 
 } // namespace
 
-void MotionCellBinner::add(float x, float y, float dx, float dy)
+int motion_cell(const MotionGrid & grid, float x, float y)
 {
-    const int cell_x = std::min(_grid.cells_x - 1, std::max(0, static_cast<int>(x * static_cast<float>(_grid.cells_x))));
-    const int cell_y = std::min(_grid.cells_y - 1, std::max(0, static_cast<int>(y * static_cast<float>(_grid.cells_y))));
-    _points.push_back({ static_cast<uint16_t>(cell_y * _grid.cells_x + cell_x), dx, dy });
+    const int cell_x = std::min(grid.cells_x - 1, std::max(0, static_cast<int>(x * static_cast<float>(grid.cells_x))));
+    const int cell_y = std::min(grid.cells_y - 1, std::max(0, static_cast<int>(y * static_cast<float>(grid.cells_y))));
+    return cell_y * grid.cells_x + cell_x;
 }
 
-void MotionCellBinner::finish(MotionField & field, size_t min_points, float scale)
+int MotionGridCounts::moving_cells() const
+{
+    int cells = 0;
+    for (const uint8_t points : moving)
+    {
+        if (points >= kMotionMinCellPoints) ++cells;
+    }
+    return cells;
+}
+
+bool MotionGridCounts::sparse() const
+{
+    const int cells = moving_cells();
+    return cells > 0 && cells < kMotionSparseCells;
+}
+
+void MotionCellBinner::add(float x, float y, float dx, float dy)
+{
+    _points.push_back({ static_cast<uint16_t>(motion_cell(_grid, x, y)), dx, dy });
+}
+
+void MotionCellBinner::finish(MotionField & field, size_t min_points, float scale, bool agree)
 {
     std::sort(_points.begin(), _points.end(), [](const Point & a, const Point & b) { return a.cell < b.cell; });
+    // median motion of the points [first, last)
+    auto median_motion = [this](size_t first, size_t last, float & dx, float & dy) {
+        _values.clear();
+        for (size_t k = first; k < last; ++k) _values.push_back(_points[k].dx);
+        dx = median(_values);
+        _values.clear();
+        for (size_t k = first; k < last; ++k) _values.push_back(_points[k].dy);
+        dy = median(_values);
+    };
     for (size_t begin = 0; begin < _points.size();)
     {
         size_t end = begin;
         while (end < _points.size() && _points[end].cell == _points[begin].cell) ++end;
-        if (end - begin >= min_points)
+        const size_t cell = _points[begin].cell;
+        const size_t all = end - begin;
+        size_t count = all;
+        float dx = 0.0f, dy = 0.0f;
+        if (count >= min_points) median_motion(begin, end, dx, dy);
+        if (agree && count >= min_points)
         {
-            const size_t cell = _points[begin].cell;
-            field.points[cell] = static_cast<uint8_t>(std::min<size_t>(end - begin, 255));
-            _values.clear();
-            for (size_t k = begin; k < end; ++k) _values.push_back(_points[k].dx);
-            field.dx[cell] = median(_values) * scale;
-            _values.clear();
-            for (size_t k = begin; k < end; ++k) _values.push_back(_points[k].dy);
-            field.dy[cell] = median(_values) * scale;
+            // the points that moved like the median come first
+            const float tolerance = std::max(kMotionAgreePixels, kMotionAgreeShare * std::sqrt(dx * dx + dy * dy));
+            const auto others = std::partition(_points.begin() + static_cast<std::ptrdiff_t>(begin), _points.begin() + static_cast<std::ptrdiff_t>(end),
+                                               [&](const Point & point) {
+                const float ex = point.dx - dx, ey = point.dy - dy;
+                return ex * ex + ey * ey <= tolerance * tolerance;
+            });
+            count = static_cast<size_t>(others - (_points.begin() + static_cast<std::ptrdiff_t>(begin)));
+            if (2 * count <= all) count = 0;
+            else if (count >= min_points) median_motion(begin, begin + count, dx, dy);
+        }
+        if (count >= min_points)
+        {
+            field.points[cell] = static_cast<uint8_t>(std::min<size_t>(count, 255));
+            field.dx[cell] = dx * scale;
+            field.dy[cell] = dy * scale;
         }
         begin = end;
     }
@@ -177,30 +220,94 @@ MotionField MotionEstimator::estimate(const cv::Mat & luma, std::vector<MotionPo
         const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 20, 0.01);
         // OpenCV's eigenvalue is the one of the gradient matrix per pixel / 1024 (derivatives * 32, sums / 2^20)
         const double min_eigenvalue = kMotionMinTexture / 1024.0;
-        cv::calcOpticalFlowPyrLK(_previous_pyramid, _current_pyramid, _points, _tracked, _status, _error, window, levels, criteria, 0, min_eigenvalue);
-        // ... and back: a correct match returns to its point
-        cv::calcOpticalFlowPyrLK(_current_pyramid, _previous_pyramid, _tracked, _back, _back_status, _error, window, levels, criteria, 0, min_eigenvalue);
         _binner.clear(grid);
-        if (points) points->resize(_points.size());
-        for (size_t p = 0; p < _points.size(); ++p)
-        {
-            const cv::Point2f back = _back[p] - _points[p];
-            const bool returns = _status[p] && _back_status[p]
-                              && back.x * back.x + back.y * back.y <= kMotionMaxBackError * kMotionMaxBackError;
-            if (points)
+        if (points) points->clear();
+        const float width = static_cast<float>(_current.cols), height = static_cast<float>(_current.rows);
+        // tracks the points there and back - a correct match returns to its point - and adds those to their cells
+        auto track = [&](const std::vector<cv::Point2f> & from, MotionGridCounts * counts) {
+            if (from.empty()) return;
+            cv::calcOpticalFlowPyrLK(_previous_pyramid, _current_pyramid, from, _tracked, _status, _error, window, levels, criteria, 0, min_eigenvalue);
+            cv::calcOpticalFlowPyrLK(_current_pyramid, _previous_pyramid, _tracked, _back, _back_status, _error, window, levels, criteria, 0, min_eigenvalue);
+            for (size_t p = 0; p < from.size(); ++p)
             {
-                (*points)[p] = { _points[p].x, _points[p].y, _tracked[p].x - _points[p].x, _tracked[p].y - _points[p].y,
-                                 returns ? MotionPoint::Used : _status[p] ? MotionPoint::Rejected : MotionPoint::NoTexture };
+                const cv::Point2f back = _back[p] - from[p];
+                const cv::Point2f motion = _tracked[p] - from[p];
+                const bool returns = _status[p] && _back_status[p]
+                                  && back.x * back.x + back.y * back.y <= kMotionMaxBackError * kMotionMaxBackError;
+                if (points)
+                {
+                    points->push_back({ from[p].x, from[p].y, motion.x, motion.y,
+                                        returns ? MotionPoint::Used : _status[p] ? MotionPoint::Rejected : MotionPoint::NoTexture });
+                }
+                if (!returns) continue;
+                const float x = (from[p].x + 0.5f) / width, y = (from[p].y + 0.5f) / height;
+                _binner.add(x, y, motion.x, motion.y);
+                if (counts) counts->add(motion_cell(grid, x, y), motion.x, motion.y);
             }
-            if (!returns) continue;
-            _binner.add((_points[p].x + 0.5f) / static_cast<float>(_current.cols), (_points[p].y + 0.5f) / static_cast<float>(_current.rows),
-                        _tracked[p].x - _points[p].x, _tracked[p].y - _points[p].y);
+        };
+        MotionGridCounts counts;
+        track(_points, &counts);
+        // a frame without motion is treated like the last one with motion
+        if (counts.moved())
+        {
+            _moved_counts = counts;
+            _sparse = counts.sparse();
         }
-        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);
+        const bool added = _sparse && levels >= 1;
+        if (added)
+        {
+            _texture_points(grid, _moved_counts);
+            track(_extra, nullptr);
+        }
+        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale, added);
+    }
+    else
+    {
+        _sparse = false;
     }
     _previous_size = _current.size();
     std::swap(_previous_pyramid, _current_pyramid);
     return field;
+}
+
+void MotionEstimator::_texture_points(const MotionGrid & grid, const MotionGridCounts & counts)
+{
+    // the previous frame at half the resolution: level 1 of its pyramid (with its border, so a view of it)
+    const cv::Mat & image = _previous_pyramid[2];
+    // OpenCV sums the squares of the Sobel responses, scaled by 1 / (4 * block * 255), over the block
+    cv::cornerMinEigenVal(image, _texture, kMotionTextureBlock, 3);
+    const double sobel_scale = 8.0 / (4.0 * kMotionTextureBlock * 255.0);
+    const float minimum = static_cast<float>(kMotionTextureMin * kMotionTextureBlock * kMotionTextureBlock * sobel_scale * sobel_scale);
+
+    const int parts_x = grid.cells_x * kMotionTextureParts, parts_y = grid.cells_y * kMotionTextureParts;
+    const size_t parts = static_cast<size_t>(parts_x) * static_cast<size_t>(parts_y);
+    _part_texture.assign(parts, 0.0f);
+    _part_points.resize(parts);
+    for (int y = 0; y < image.rows; ++y)
+    {
+        const float * texture = _texture.ptr<float>(y);
+        // the position at the measured resolution: a pixel of level 1 covers two of them
+        // (the pixel belongs to the part floor((2 p + 1) * parts / size), as in motion_texture.comp)
+        const int part_y = std::min(parts_y - 1, (2 * y + 1) * parts_y / _current.rows);
+        for (int x = 0; x < image.cols; ++x)
+        {
+            if (texture[x] < minimum) continue;
+            const int part_x = std::min(parts_x - 1, (2 * x + 1) * parts_x / _current.cols);
+            const size_t part = static_cast<size_t>(part_y) * static_cast<size_t>(parts_x) + static_cast<size_t>(part_x);
+            if (texture[x] <= _part_texture[part]) continue;
+            _part_texture[part] = texture[x];
+            _part_points[part] = cv::Point2f(2.0f * static_cast<float>(x) + 0.5f, 2.0f * static_cast<float>(y) + 0.5f);
+        }
+    }
+    _extra.clear();
+    for (size_t part = 0; part < parts; ++part)
+    {
+        if (_part_texture[part] <= 0.0f) continue;
+        const int cell = static_cast<int>(part / static_cast<size_t>(parts_x)) / kMotionTextureParts * grid.cells_x
+                       + static_cast<int>(part % static_cast<size_t>(parts_x)) / kMotionTextureParts;
+        if (counts.is_static(cell)) continue;
+        _extra.push_back(_part_points[part]);
+    }
 }
 
 MotionAnalyzer::MotionAnalyzer(double fps, double window_ms, bool async_capture)

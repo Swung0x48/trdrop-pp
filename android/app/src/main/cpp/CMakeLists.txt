@@ -36,7 +36,7 @@ if(NOT TRDROP_GLSLC)
     message(FATAL_ERROR "glslc not found in ${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}")
 endif()
 set(_shaders "")
-foreach(_name yuv_diff motion_pyramid motion_lk overlay_base overlay_draw ahb_import nv12_to_rgba)
+foreach(_name yuv_diff motion_pyramid motion_lk motion_select motion_texture overlay_base overlay_draw ahb_import nv12_to_rgba)
     set(_src "${TRDROP_ROOT}/src/vulkan/${_name}.comp")
     set(_inc "${_shader_dir}/${_name}.spv.inc")
     add_custom_command(

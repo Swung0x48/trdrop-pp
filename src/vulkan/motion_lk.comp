@@ -12,12 +12,16 @@
 // Level L + 1 is the 2x2 box filtered level L, so a position p of level 0 is (p + 0.5) / 2^L - 0.5 at level L.
 // Output per point: d in pixels of level 0, the smaller eigenvalue of G / N at level 0 (texture), the
 // distance in pixels by which the way back misses the point (huge if the frames don't match after the tracking).
+//
+// The points are those of the regular grid, or - list != 0, for frames with sparse motion - the ones of a list:
+// (x, y at level 0, texture, 0), no point where the texture is 0. Their output follows the one of the grid.
 
 layout(local_size_x = 256) in;
 
 layout(std430, set = 0, binding = 0) readonly  buffer Previous { float previous[]; };
 layout(std430, set = 0, binding = 1) readonly  buffer Current  { float current[]; };
 layout(std430, set = 0, binding = 2) writeonly buffer Points   { vec4 points[]; };
+layout(std430, set = 0, binding = 3) readonly  buffer List     { vec4 list[]; };
 
 layout(push_constant) uniform Parameters {
     uvec4 level_width;
@@ -28,6 +32,8 @@ layout(push_constant) uniform Parameters {
     uint grid_y;
     uint iterations;
     float max_residual;
+    uint list;        // 0: the regular grid, otherwise the points of the list
+    uint list_output; // where the output of the list starts
 } params;
 
 const int kRadius = 7;
@@ -69,6 +75,18 @@ void main()
     // center of the point at level 0
     const vec2 grid = vec2(float(point % params.grid_x), float(point / params.grid_x));
     vec2 start = (grid + 0.5) * vec2(params.level_width[0], params.level_height[0]) / vec2(params.grid_x, params.grid_y) - 0.5;
+    uint output_index = point;
+    if (params.list != 0u)
+    {
+        output_index = params.list_output + point;
+        // the same for the whole group
+        if (list[point].z <= 0.0)
+        {
+            if (lane == 0u) points[output_index] = vec4(0.0, 0.0, 0.0, 1e30);
+            return;
+        }
+        start = list[point].xy;
+    }
 
     float texture_strength = 0.0;
     float residual = 0.0;
@@ -155,6 +173,6 @@ void main()
     if (lane == 0u)
     {
         const float back_error = residual <= params.max_residual ? length(forward_flow + flow) : 1e30;
-        points[point] = vec4(forward_flow, texture_strength, back_error);
+        points[output_index] = vec4(forward_flow, texture_strength, back_error);
     }
 }

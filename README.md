@@ -160,7 +160,7 @@ detected reliably in lossy recordings.
 
 The framerate only counts new frames. `--motion` also measures how evenly the animation advances,
 i.e. whether the video looks smooth. It needs motion it can track - a moving camera, scrolling, driving,
-or moving objects which cover at least 2% of the picture; the rest may be static.
+or moving objects in at least 2% of the picture (12 of its 640 cells); the rest may be static.
 
 ```
 trdrop-pp capture.mkv --motion -o capture.csv
@@ -178,6 +178,19 @@ How it works:
    * GPU (with Vulkan Video decoding): compute shaders (`src/vulkan/motion_pyramid.comp`, `motion_lk.comp`),
      the frames stay on the GPU and only the tracked points are read back.
    * CPU (`--decode ffmpeg` / `opencv`): OpenCV.
+
+   Sparse motion: a camera that follows a car over plain asphalt leaves a kerb and a few markings to track,
+   and the grid misses most of what lies between its points. If the grid finds motion - a cell with 2 points
+   that moved by 0.5 pixels - in fewer than 12 cells, points are added where the previous frame has texture:
+   every cell is cut into 8x8 parts, and of each part the point with the most texture is tracked as well
+   (texture: the smaller eigenvalue of the gradient matrix over 7x7 pixels at half the resolution, at least
+   0.5 per pixel). Cells whose points of the grid were tracked and didn't move - the car - get none. A frame
+   without motion, a duplicate, is treated like the last frame with motion, so the cells that measure the
+   motion have their points in it too. In such a frame the points of a cell have to agree: the cell counts if
+   most of its points, and at least 2, moved like their median (within 20% of it or half a pixel), and those
+   points are the cell - wrong matches rarely agree, and many more points bring many more of them. Frames with
+   motion in 12 cells or more are measured by the grid alone, as before. (GPU: `motion_select.comp` decides,
+   `motion_texture.comp` picks the points; both only run for such frames.)
 2. Animation step of a frame: the common scale of its motion field relative to the average motion field
    in a window around it (triangular weights): `m_cell = step * v_cell`. Every cell with motion (at least
    0.5 pixels per frame on average) has one vote, `m.v / |v|^2`, and the weighted median of the votes is the
@@ -227,9 +240,10 @@ Accuracy with known answers (H.264 versions of the [fixtures](#tests); GPU and C
 | new frame every 2nd frame | 30 fps, error 0 | 30.00 fps, avg 0.2 ms |
 | steps 0.5 / 1.5 | 48 fps, error 8.33 ms | 48.0 fps, avg 8.3 ms |
 | the same, but only a window of 5% of the picture moves | 48 fps, error 8.33 ms | 47.9 fps, avg 8.4 ms |
+| sparse motion: ten balls of 8 pixels radius pass a large one that stands still, a new frame every 2nd frame which advances by 1 / 3 (`motion_ball_sparse`, see `tools/make_ball_videos.py`) | 24 fps, errors of 16.7 ms | after its first second (in which the duplicates are measured, see [lossy recordings](#lossy-recordings)): 24.3 fps (CPU) / 24.1 fps (GPU), median 16.4 / 16.5 ms. The grid alone measures 22% (CPU) / none (GPU) of the new frames |
 | freeze of 5 frames, time lost | one error of -83.3 ms | -75.8 ms |
 | new frame every 4th frame, steps of 3 / 4 / 5 intervals, fast pan / forward motion | 14.55 fps, errors -16.7 / 0 / +16.7 ms | 14.66 fps, the errors are off by 3.2 ms on average |
-| real footage: a 4K 60 fps game recording re-timed to a new frame every 4th frame which advances by 3 / 4 / 5 source frames (truth: the steps the 60 fps source itself shows) | 13.3 fps, errors of 17.5 ms on average | 13.5 fps (CPU) / 13.8 fps (GPU), the errors are off by 10 - 11 ms on average (median 7 ms) and 3.5 ms too positive |
+| real footage: a 4K 60 fps game recording re-timed to a new frame every 4th frame which advances by 3 / 4 / 5 source frames (truth: the steps the 60 fps source itself shows) | 13.3 fps, errors of 17.5 ms on average | 13.4 fps (CPU) / 13.8 fps (GPU), the errors are off by 11 ms on average (median 8 ms) and 3 ms too positive |
 
 Speed with the motion analysis (decoding + comparison + motion, RTX 4070 SUPER / i7-14700KF):
 
@@ -237,6 +251,11 @@ Speed with the motion analysis (decoding + comparison + motion, RTX 4070 SUPER /
 | --- | --- | --- |
 | 4K H.264 recordings | 127 - 174 fps | 236 - 244 fps |
 | 1440p HEVC capture | 236 fps | 807 fps |
+
+Frames with sparse motion take longer, on the CPU mostly for the texture of the frame: a 1080p240 capture with
+9 seconds of them in 95 runs at 840 instead of 940 fps on the GPU and at 220 instead of 260 fps on the CPU; a
+recording of a phone's screen at 550 instead of 730 fps (GPU); a 4K recording that consists of such frames (a
+static camera, a character, a fire) at 78 instead of 170 fps on the CPU, on the GPU as before (235 fps).
 
 Limits:
 
@@ -247,12 +266,29 @@ Limits:
   by about 10 ms, which is also what the spread of the votes says there (9 - 10 ms; 0.1 ms for the rigid
   fixtures). The spread doesn't contain the first limit. The perceived smoothness averages over many steps
   and doesn't depend on their scale; it was within 1 - 3% of the truth.
-* On a 4K driving recording (15 - 17 fps content in a 60 fps video) 91% (GPU) / 92% (CPU) of the new frames
-  are measured, both agree on the perceived smoothness within 1% (14.6 / 14.4 fps) and on the steps of the
-  frames both measure (correlation 0.98).
+* On a 4K driving recording (15 - 17 fps content in a 60 fps video, with a menu at 60 fps) 88% (GPU) / 90%
+  (CPU) of the new frames are measured, both agree on the perceived smoothness within 1% (14.5 / 14.4 fps) and
+  on the steps of the frames both measure (correlation 0.91).
 * Only what can be tracked counts as motion: the camera, characters, vehicles. Flames, particles, water and
-  the like can't. In a recording with a static camera, a walking character and a fire, 17% of the new
-  frames are measured - those in which the character covers enough of the picture.
+  the like can't. In a recording with a static camera, a walking character and a fire, 17% (GPU) / 20% (CPU)
+  of the new frames are measured - those in which the character covers enough of the picture. There GPU and
+  CPU agree on the perceived smoothness (57.5 / 57.0 fps), less on the single steps (correlation 0.66).
+* Sparse motion: on a 1080p240 capture of a replay, 5 seconds follow a car head on over plain asphalt, with a
+  kerb and a few markings passing by. Of the 592 new frames of that shot the grid alone measures 0 (GPU) / 5
+  (CPU), with the points added where the picture has texture 577 (GPU) / 411 (CPU): perceived smoothness 119
+  fps at 120 fps, animation errors of 0.4 ms (median). What is added are corners: a straight line has no
+  texture along itself, and the frames in which only such lines or nothing at all passes by stay unmeasured.
+  Nothing helps where nothing moves by half a pixel per frame (a static camera with distant cars).
+  The added points change other frames with little motion as well. Against the known answer of the re-timed
+  recording above the errors are off by 11.9 instead of 11.7 ms on the GPU and by 10.7 instead of 10.6 ms on
+  the CPU. On eight other recordings the perceived smoothness moved by up to 0.3 fps (GPU) / 0.4 fps (CPU).
+  Single steps move more next to a cut into a shot that only the added points measure: the frames of the 0.2
+  seconds before it are compared with an average motion that now includes that shot (in one recording the
+  steps of 20 frames changed by more than 0.2 intervals, some to half their value).
+* Motion blurred repeating texture (grass, gravel passing by) gives matches that stay where they are and
+  still return when tracked back: in one shot 29% of the used points, with any density of points. Cells with
+  such points pull the step of a frame; the more of them a frame has, the less its step is worth - the spread
+  of the votes shows it.
 * Parts of the picture which update at different rates (e.g. a 30 fps animation in a 60 fps camera pan) are
   not separated, the larger part wins.
 * It can't tell whether uneven steps come from the game or from the recording. If the recording is known to be
@@ -410,8 +446,8 @@ capture would; a real capture at 144 fps wasn't tried).
 
 | video | new frames per second | perceived smoothness (10% low) | animation error, average / 95th percentile | the error with `--async-capture` |
 | --- | --- | --- | --- | --- |
-| recorded at 240 fps | 83.7 | 81.9 fps (57.2) | 1.3 ms / 3.3 ms | 0.14 ms / 0.8 ms |
-| resampled to 144 fps | 83.8 | 82.0 fps (57.4) | 2.7 ms / 5.8 ms | 0.19 ms / 1.4 ms |
+| recorded at 240 fps | 83.7 | 81.9 fps (57.5) | 1.3 ms / 3.3 ms | 0.15 ms / 0.8 ms |
+| resampled to 144 fps | 83.8 | 82.0 fps (57.6) | 2.7 ms / 5.8 ms | 0.20 ms / 1.4 ms |
 
 The other values are the same with `--async-capture`, no picture counts as lost in either video.
 

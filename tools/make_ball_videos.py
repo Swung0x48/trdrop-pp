@@ -34,6 +34,13 @@ enough (the automatic tolerance, see "Lossy recordings" in the README). A keyfra
   motion_ball_small    a new frame every 3rd frame, advancing by 3             20 fps after the first half second,
                                                                                in which the duplicates are measured
 
+Sparse motion: the large ball stands still in the middle, ten balls of a radius of 8 pixels move past it. The
+regular grid of points catches too few of them (the animation of a fifth of the new frames is measured, and
+wrongly); the points added where a picture with sparse motion has texture measure all of them
+
+  motion_ball_sparse   like motion_ball_stutter                                30 fps, perceived 24 after the first
+                                                                               second (in which the duplicates are measured)
+
 Needs numpy, opencv-python and an ffmpeg with the chosen encoder.
 """
 
@@ -53,7 +60,8 @@ BACKGROUND = (52, 44, 40)  # BGR
 
 def videos():
     """name -> (animation time of every frame in display intervals, speed of the ball relative to VELOCITY[,
-    size of the ball relative to RADIUS, frames whose number modulo 30 are this are keyframes])"""
+    size of the ball relative to RADIUS, frames whose number modulo 30 are this are keyframes (None: as the
+    encoder likes)[, columns and rows of balls that move, a ball of full size stands still in the middle]])"""
     frames = np.arange(FRAMES)
     hitch = frames.astype(float)
     for second in range(FRAMES // 60):
@@ -79,6 +87,7 @@ def videos():
         "change": (np.cumsum(steps), 0.5),
         # frames 10, 40, 70, ... are duplicates
         "small": ((frames // 3 * 3).astype(float), 1.0, 0.2, 10),
+        "sparse": ((frames // 4 * 4 + (frames // 2 % 2)).astype(float), 0.5, 0.07, None, (5, 2)),
     }
 
 
@@ -106,14 +115,23 @@ def ball_sprite():
     return sprite, coverage
 
 
-def render(sprite, coverage, time, speed):
-    """the frame at animation time `time`, the ball placed with sub pixel accuracy"""
-    x = START[0] + VELOCITY[0] * speed * time - sprite.shape[1] / 2.0
-    y = START[1] + VELOCITY[1] * speed * time - sprite.shape[0] / 2.0
-    matrix = np.float64([[1, 0, x], [0, 1, y]])
+def place(frame, sprite, coverage, x, y):
+    """the frame (float) with the ball centered at (x, y), placed with sub pixel accuracy"""
+    matrix = np.float64([[1, 0, x - sprite.shape[1] / 2.0], [0, 1, y - sprite.shape[0] / 2.0]])
     ball = cv2.warpAffine(sprite, matrix, (WIDTH, HEIGHT), flags=cv2.INTER_CUBIC)
     alpha = np.clip(cv2.warpAffine(coverage, matrix, (WIDTH, HEIGHT), flags=cv2.INTER_CUBIC), 0, 1)[..., None]
-    frame = np.float32(BACKGROUND) * (1 - alpha) + ball * alpha
+    return frame * (1 - alpha) + ball * alpha
+
+
+def render(sprite, coverage, time, speed, starts=(START,), still=None):
+    """the frame at animation time `time`: a ball from every start, and the balls `still` (sprite, coverage, x, y)
+    in front of them"""
+    frame = np.empty((HEIGHT, WIDTH, 3), np.float32)
+    frame[:] = np.float32(BACKGROUND)
+    for x, y in starts:
+        frame = place(frame, sprite, coverage, x + VELOCITY[0] * speed * time, y + VELOCITY[1] * speed * time)
+    for ball in still or ():
+        frame = place(frame, *ball)
     return np.clip(frame + 0.5, 0, 255).astype(np.uint8)
 
 
@@ -128,19 +146,25 @@ def main():
     sprite, coverage = ball_sprite()
     for name, (times, speed, *more) in videos().items():
         path = os.path.join(args.output, f"motion_ball_{name}.mkv")
-        ball, ball_coverage, keyframes = sprite, coverage, []
+        ball, ball_coverage, keyframes, starts, still = sprite, coverage, [], (START,), None
         if more:
-            size, keyframe = more
+            size, keyframe, *swarm = more
             ball = cv2.resize(sprite, None, fx=size, fy=size, interpolation=cv2.INTER_AREA)
             ball_coverage = cv2.resize(coverage, None, fx=size, fy=size, interpolation=cv2.INTER_AREA)
-            keyframes = ["-g", "600", "-force_key_frames", f"expr:eq(mod(n,30),{keyframe})"]
+            if keyframe is not None: keyframes = ["-g", "600", "-force_key_frames", f"expr:eq(mod(n,30),{keyframe})"]
+            if swarm:
+                columns, rows = swarm[0]
+                # spread over the left of the picture, every second column a little lower; they stay in the picture
+                starts = [(60.0 + column * 700.0 / max(1, columns - 1), 50.0 + row * 480.0 / max(1, rows - 1) + column % 2 * 30.0)
+                          for row in range(rows) for column in range(columns)]
+                still = [(sprite, coverage, WIDTH / 2.0, HEIGHT / 2.0)]
         encoder = subprocess.Popen([args.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                                     "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", "-", "-c:v", args.encoder, "-b:v", args.bitrate,
                                     *keyframes, "-pix_fmt", "yuv420p", path], stdin=subprocess.PIPE)
         cache = {}
         for time in times:
             if time not in cache:
-                cache = {time: render(ball, ball_coverage, time, speed).tobytes()}  # duplicates are the identical picture
+                cache = {time: render(ball, ball_coverage, time, speed, starts, still).tobytes()}  # duplicates are the identical picture
             encoder.stdin.write(cache[time])
         encoder.stdin.close()
         if encoder.wait() != 0:

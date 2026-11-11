@@ -63,6 +63,12 @@ const uint32_t kMotionPyramidSpirv[] = {
 const uint32_t kMotionLkSpirv[] = {
 #include "motion_lk.spv.inc"
 };
+const uint32_t kMotionSelectSpirv[] = {
+#include "motion_select.spv.inc"
+};
+const uint32_t kMotionTextureSpirv[] = {
+#include "motion_texture.spv.inc"
+};
 const uint32_t kOverlayBaseSpirv[] = {
 #include "overlay_base.spv.inc"
 };
@@ -129,7 +135,9 @@ public:
             _create_device();
             _diff = _create_compute(kYuvDiffSpirv, sizeof(kYuvDiffSpirv), 5, sizeof(PushConstants), VK_NULL_HANDLE);
             _pyramid = _create_compute(kMotionPyramidSpirv, sizeof(kMotionPyramidSpirv), 2, sizeof(PyramidPush), VK_NULL_HANDLE);
-            _lk = _create_compute(kMotionLkSpirv, sizeof(kMotionLkSpirv), 3, sizeof(LkPush), VK_NULL_HANDLE);
+            _lk = _create_compute(kMotionLkSpirv, sizeof(kMotionLkSpirv), 4, sizeof(LkPush), VK_NULL_HANDLE);
+            _select = _create_compute(kMotionSelectSpirv, sizeof(kMotionSelectSpirv), 3, sizeof(SelectPush), VK_NULL_HANDLE);
+            _texture = _create_compute(kMotionTextureSpirv, sizeof(kMotionTextureSpirv), 4, sizeof(TexturePush), VK_NULL_HANDLE);
             _overlay_base = _create_compute(kOverlayBaseSpirv, sizeof(kOverlayBaseSpirv), 3, sizeof(OverlayBasePush), VK_NULL_HANDLE);
             _overlay_draw = _create_compute(kOverlayDrawSpirv, sizeof(kOverlayDrawSpirv), 5, sizeof(OverlayDrawPush), VK_NULL_HANDLE);
             _rgba = _create_compute(kNv12ToRgbaSpirv, sizeof(kNv12ToRgbaSpirv), 2, sizeof(RgbaPush), VK_NULL_HANDLE);
@@ -301,15 +309,22 @@ private:
         ImportPush import_push {};
         Buffer row_counts;
         Buffer motion_points;
+        //! sparse motion: the points added (as motion_texture.comp chose them) and what motion_select.comp found
+        Buffer candidates;
+        Buffer sparse_state;
         VkDescriptorSet import_set = VK_NULL_HANDLE;
         VkDescriptorSet diff_set = VK_NULL_HANDLE;
         VkDescriptorSet pyramid_set = VK_NULL_HANDLE;
         VkDescriptorSet lk_set = VK_NULL_HANDLE;
+        VkDescriptorSet select_set = VK_NULL_HANDLE;
+        VkDescriptorSet texture_set = VK_NULL_HANDLE;
         VkDescriptorSet base_set = VK_NULL_HANDLE;
         int width = 0;
         int height = 0;
         bool compared = false;
         bool motion_estimated = false;
+        //! the dispatches for sparse motion were recorded
+        bool sparse_possible = false;
         //! as far as the decoder tells (see ffmpeg::frame_coding)
         FrameCoding coding = FrameCoding::Unknown;
         MotionLayout motion;
@@ -380,6 +395,10 @@ private:
         Buffer luma[2];
         Buffer chroma[2];
         Buffer pyramid[2];
+        //! sparse motion: gradient products of the previous frame at level 1 (motion_texture.comp), and what
+        //! motion_select.comp keeps of the last frame in which a point moved (SparseLatch)
+        Buffer products;
+        Buffer sparse_latch;
         int current = 0;
         int width = 0;
         int height = 0;
@@ -518,16 +537,17 @@ private:
     {
         const uint32_t frames = static_cast<uint32_t>(kSlots * _videos.size());
         const uint32_t draws = static_cast<uint32_t>(kDrawSlots);
-        // per frame of a slot: the import (an image and 2 buffers), the comparison, the pyramid, the tracking
-        // and the picture; per picture being drawn: the drawing and the conversion
+        // per frame of a slot: the import (an image and 2 buffers), the comparison, the pyramid, the tracking,
+        // sparse motion (what the grid found, the texture) and the picture; per picture being drawn: the drawing
+        // and the conversion
         const VkDescriptorPoolSize sizes[2] = {
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (2 + 5 + 2 + 3 + 3) * frames + (5 + 2) * draws },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (2 + 5 + 2 + 4 + 3 + 4 + 3) * frames + (5 + 2) * draws },
             // an image with several planes may count as several descriptors
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * frames },
         };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        pool_info.maxSets = 5 * frames + 2 * draws;
+        pool_info.maxSets = 7 * frames + 2 * draws;
         pool_info.poolSizeCount = 2;
         pool_info.pPoolSizes = sizes;
         check(vkCreateDescriptorPool(_device, &pool_info, nullptr, &_descriptor_pool), "vkCreateDescriptorPool");
@@ -544,6 +564,8 @@ private:
                 frame.diff_set = _allocate_set(_diff);
                 frame.pyramid_set = _allocate_set(_pyramid);
                 frame.lk_set = _allocate_set(_lk);
+                frame.select_set = _allocate_set(_select);
+                frame.texture_set = _allocate_set(_texture);
                 frame.base_set = _allocate_set(_overlay_base);
             }
         }
@@ -922,11 +944,24 @@ private:
             if (_motion) _ensure_buffer(video.pyramid[b], frame.motion.bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, true);
         }
         _ensure_buffer(frame.row_counts, static_cast<VkDeviceSize>(height) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        if (_motion) _ensure_buffer(frame.motion_points, kMotionPoints * 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        if (_motion)
+        {
+            _ensure_buffer(frame.motion_points, kMotionPointBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+            _ensure_buffer(frame.candidates, kMotionCandidateBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+            _ensure_buffer(frame.sparse_state, sizeof(SparseState), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, true);
+            _ensure_buffer(video.products, motion_product_bytes(frame.motion), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, true);
+            if (!video.sparse_latch.buffer)
+            {
+                // starts with "not sparse"
+                _ensure_buffer(video.sparse_latch, sizeof(SparseLatch), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+                std::memset(video.sparse_latch.mapped, 0, sizeof(SparseLatch));
+            }
+        }
         const int current = video.current;
         const int previous = 1 - current;
         frame.compared = video.has_previous;
         frame.motion_estimated = _motion && video.has_previous;
+        frame.sparse_possible = frame.motion_estimated && sparse_motion_possible(frame.motion);
 
         // the hardware buffer becomes readable for this queue
         VkImageMemoryBarrier acquire { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -1036,7 +1071,7 @@ private:
         }
         _profile_step(command_buffer, 3);
         if (!frame.motion_estimated) return;
-        _write_set(frame.lk_set, 0, { video.pyramid[previous].buffer, video.pyramid[current].buffer, frame.motion_points.buffer });
+        _write_set(frame.lk_set, 0, { video.pyramid[previous].buffer, video.pyramid[current].buffer, frame.motion_points.buffer, frame.candidates.buffer });
         LkPush push {};
         for (uint32_t level = 0; level < layout.levels; ++level)
         {
@@ -1053,6 +1088,38 @@ private:
         vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.layout, 0, 1, &frame.lk_set, 0, nullptr);
         vkCmdPushConstants(command_buffer, _lk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(command_buffer, kMotionPoints, 1, 1);
+        if (frame.sparse_possible)
+        {
+            // Sparse motion (motion.h, kMotionSparseCells): what the regular grid found, then - dispatched indirectly,
+            // with no workgroups unless the frame has sparse motion - the texture of the previous frame, the points with
+            // the most of it and their tracking
+            _write_set(frame.select_set, 0, { frame.motion_points.buffer, frame.sparse_state.buffer, video.sparse_latch.buffer });
+            _write_set(frame.texture_set, 0, { video.pyramid[previous].buffer, video.products.buffer, frame.sparse_state.buffer, frame.candidates.buffer });
+            const SparseMotionPushes pushes = sparse_motion_pushes(layout, push);
+            _barrier(command_buffer);
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _select.pipeline);
+            vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _select.layout, 0, 1, &frame.select_set, 0, nullptr);
+            vkCmdPushConstants(command_buffer, _select.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushes.select), &pushes.select);
+            vkCmdDispatch(command_buffer, 1, 1, 1);
+            // the dispatches read how many workgroups they get
+            VkMemoryBarrier decided { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            decided.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            decided.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+            vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                 0, 1, &decided, 0, nullptr, 0, nullptr);
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _texture.pipeline);
+            vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _texture.layout, 0, 1, &frame.texture_set, 0, nullptr);
+            vkCmdPushConstants(command_buffer, _texture.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushes.products), &pushes.products);
+            vkCmdDispatchIndirect(command_buffer, frame.sparse_state.buffer, 0);
+            _barrier(command_buffer);
+            vkCmdPushConstants(command_buffer, _texture.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushes.parts), &pushes.parts);
+            vkCmdDispatchIndirect(command_buffer, frame.sparse_state.buffer, 3 * sizeof(uint32_t));
+            _barrier(command_buffer);
+            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.pipeline);
+            vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lk.layout, 0, 1, &frame.lk_set, 0, nullptr);
+            vkCmdPushConstants(command_buffer, _lk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushes.points), &pushes.points);
+            vkCmdDispatchIndirect(command_buffer, frame.sparse_state.buffer, 6 * sizeof(uint32_t));
+        }
         _profile_step(command_buffer, 4);
     }
 
@@ -1116,7 +1183,29 @@ private:
                 _binner.add((static_cast<float>(x) + 0.5f) / points_x, (static_cast<float>(y) + 0.5f) / points_y, point[0], point[1]);
             }
         }
-        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale);
+        // sparse motion: the points added where the previous frame has texture
+        if (frame.sparse_possible)
+        {
+            const float width = static_cast<float>(frame.motion.width[0]), height = static_cast<float>(frame.motion.height[0]);
+            read_sparse_motion(*static_cast<const SparseState *>(frame.sparse_state.mapped), static_cast<const float *>(frame.candidates.mapped), points,
+                               [&](float x, float y, float dx, float dy, bool texture, bool returns) {
+                if (detail)
+                {
+                    MotionPoint tracked;
+                    tracked.x = x;
+                    tracked.y = y;
+                    tracked.state = returns ? MotionPoint::Used : texture ? MotionPoint::Rejected : MotionPoint::NoTexture;
+                    if (texture)
+                    {
+                        tracked.dx = dx;
+                        tracked.dy = dy;
+                    }
+                    detail->push_back(tracked);
+                }
+                if (returns) _binner.add((x + 0.5f) / width, (y + 0.5f) / height, dx, dy);
+            });
+        }
+        _binner.finish(field, kMotionMinCellPoints, field.pixel_scale, frame.sparse_possible && static_cast<const SparseState *>(frame.sparse_state.mapped)->sparse != 0);
     }
 
     // ---- motion video
@@ -1444,6 +1533,8 @@ private:
                     _drop_frame(frame);
                     _destroy_buffer(frame.row_counts);
                     _destroy_buffer(frame.motion_points);
+                    _destroy_buffer(frame.candidates);
+                    _destroy_buffer(frame.sparse_state);
                 }
                 else if (frame.image)
                 {
@@ -1472,7 +1563,8 @@ private:
                 if (video.conversion) _fn.vkDestroySamplerYcbcrConversion(_device, video.conversion, nullptr);
                 video.sampler = VK_NULL_HANDLE;
                 video.conversion = VK_NULL_HANDLE;
-                for (Buffer * buffer : { &video.luma[0], &video.luma[1], &video.chroma[0], &video.chroma[1], &video.pyramid[0], &video.pyramid[1] })
+                for (Buffer * buffer : { &video.luma[0], &video.luma[1], &video.chroma[0], &video.chroma[1], &video.pyramid[0], &video.pyramid[1],
+                                         &video.products, &video.sparse_latch })
                 {
                     _destroy_buffer(*buffer);
                 }
@@ -1486,7 +1578,7 @@ private:
         }
         if (_device)
         {
-            for (Compute * compute : { &_diff, &_pyramid, &_lk, &_overlay_base, &_overlay_draw, &_rgba }) _destroy_compute(*compute);
+            for (Compute * compute : { &_diff, &_pyramid, &_lk, &_select, &_texture, &_overlay_base, &_overlay_draw, &_rgba }) _destroy_compute(*compute);
             if (_descriptor_pool) vkDestroyDescriptorPool(_device, _descriptor_pool, nullptr);
             if (_profile_fence) vkDestroyFence(_device, _profile_fence, nullptr);
             if (_command_pool) vkDestroyCommandPool(_device, _command_pool, nullptr);
@@ -1516,6 +1608,8 @@ private:
     Compute _diff;
     Compute _pyramid;
     Compute _lk;
+    Compute _select;
+    Compute _texture;
     Compute _overlay_base;
     Compute _overlay_draw;
     Compute _rgba;

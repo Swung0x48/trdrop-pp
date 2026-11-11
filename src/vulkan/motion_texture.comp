@@ -1,0 +1,98 @@
+#version 450
+// Sparse motion (motion.h, kMotionTextureParts): where the previous frame has texture, at half the resolution the
+// motion is measured at - level 1 of its pyramid. Dispatched for frames with sparse motion only (motion_select.comp).
+//
+// mode 0, one invocation per pixel: the products of its Sobel gradients (per pixel: the Sobel response / 8).
+// mode 1, one invocation per part of a cell: the pixel of the part with the most texture, which is the smaller
+//         eigenvalue of the gradient matrix averaged over the block around it, if that is at least `minimum`:
+//         (x, y at level 0, texture, 0). (0, 0, 0, 0) if the part has none or its cell shows something static.
+// A pixel p of level 1 is at 2 p + 0.5 of level 0 and belongs to the part floor((2 p + 1) * parts / size of level 0).
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Pyramid    { float pyramid[]; };
+layout(std430, set = 0, binding = 1)           buffer Products   { vec4 products[]; };
+layout(std430, set = 0, binding = 2) readonly  buffer State {
+    uint commands[9];
+    uint sparse;
+    uint with_motion;
+    uint complete;
+    uint cell_static[];
+} state;
+layout(std430, set = 0, binding = 3) writeonly buffer Candidates { vec4 candidates[]; };
+
+layout(push_constant) uniform Parameters {
+    uint mode;
+    uint width;             // of level 1
+    uint height;
+    uint offset;            // of level 1 in the pyramid
+    uint level0_width;
+    uint level0_height;
+    uint parts_x;
+    uint parts_y;
+    uint cell_parts;        // parts per cell in a direction
+    int radius;             // of the block
+    float minimum;
+} params;
+
+float pixel(ivec2 p)
+{
+    p = clamp(p, ivec2(0), ivec2(params.width, params.height) - 1);
+    return pyramid[params.offset + uint(p.y) * params.width + uint(p.x)];
+}
+
+//! first pixel of a part in one direction, and the part of a pixel
+uint part_begin(uint part, uint parts, uint size)
+{
+    const int numerator = int(part * size) - int(parts);
+    return numerator <= 0 ? 0u : uint(numerator + 2 * int(parts) - 1) / (2u * parts);
+}
+uint part_of(uint p, uint parts, uint size) { return min(parts - 1u, (2u * p + 1u) * parts / size); }
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    if (params.mode == 0u)
+    {
+        if (index >= params.width * params.height) return;
+        const ivec2 p = ivec2(int(index % params.width), int(index / params.width));
+        const float gx = (pixel(p + ivec2(1, -1)) + 2.0 * pixel(p + ivec2(1, 0)) + pixel(p + ivec2(1, 1))
+                        - pixel(p + ivec2(-1, -1)) - 2.0 * pixel(p + ivec2(-1, 0)) - pixel(p + ivec2(-1, 1))) / 8.0;
+        const float gy = (pixel(p + ivec2(-1, 1)) + 2.0 * pixel(p + ivec2(0, 1)) + pixel(p + ivec2(1, 1))
+                        - pixel(p + ivec2(-1, -1)) - 2.0 * pixel(p + ivec2(0, -1)) - pixel(p + ivec2(1, -1))) / 8.0;
+        products[index] = vec4(gx * gx, gx * gy, gy * gy, 0.0);
+        return;
+    }
+
+    if (index >= params.parts_x * params.parts_y) return;
+    const uint part_x = index % params.parts_x;
+    const uint part_y = index / params.parts_x;
+    vec4 best = vec4(0.0);
+    if (state.cell_static[(part_y / params.cell_parts) * (params.parts_x / params.cell_parts) + part_x / params.cell_parts] == 0u)
+    {
+        const ivec2 size = ivec2(params.width, params.height);
+        const float samples = float((2 * params.radius + 1) * (2 * params.radius + 1));
+        for (uint y = part_begin(part_y, params.parts_y, params.level0_height); y < params.height && part_of(y, params.parts_y, params.level0_height) == part_y; ++y)
+        {
+            for (uint x = part_begin(part_x, params.parts_x, params.level0_width); x < params.width && part_of(x, params.parts_x, params.level0_width) == part_x; ++x)
+            {
+                vec3 sum = vec3(0.0);
+                for (int dy = -params.radius; dy <= params.radius; ++dy)
+                {
+                    for (int dx = -params.radius; dx <= params.radius; ++dx)
+                    {
+                        const ivec2 q = clamp(ivec2(int(x) + dx, int(y) + dy), ivec2(0), size - 1);
+                        sum += products[uint(q.y) * params.width + uint(q.x)].xyz;
+                    }
+                }
+                sum /= samples;
+                const float texture_strength = 0.5 * (sum.x + sum.z - sqrt((sum.x - sum.z) * (sum.x - sum.z) + 4.0 * sum.y * sum.y));
+                if (texture_strength >= params.minimum && texture_strength > best.z)
+                {
+                    best = vec4(2.0 * float(x) + 0.5, 2.0 * float(y) + 0.5, texture_strength, 0.0);
+                }
+            }
+        }
+    }
+    candidates[index] = best;
+}

@@ -25,6 +25,30 @@ constexpr int kMotionPoints = kMotionCellPoints * kMotionCellPoints * kMotionCel
 constexpr float kMotionMinTexture = 1.0f; // smaller eigenvalue of the gradient matrix per pixel of the window
 constexpr float kMotionMaxBackError = 1.0f;
 constexpr size_t kMotionMinCellPoints = 2;
+//! Sparse motion - a camera that follows a car over plain asphalt, with a kerb and a few markings passing by: the
+//! regular grid misses what lies between its points, too few cells get kMotionMinCellPoints points. If the grid
+//! finds motion - a cell with kMotionMinCellPoints used points that moved by at least kMotionMovingPoint pixels of
+//! the measured resolution - but fewer than kMotionSparseCells such cells, points are added where the picture
+//! has texture: every cell is cut into kMotionTextureParts x kMotionTextureParts parts, and of every part the
+//! point with the most texture is tracked as well. Texture is measured at half the measured resolution: the
+//! smaller eigenvalue of the gradient matrix (Sobel gradients per pixel) averaged over a block of
+//! kMotionTextureBlock pixels, at least kMotionTextureMin. Cells in which the regular grid tracked points and none
+//! of them moved show something static and get none. A frame in which the grid finds no motion - a duplicate; single
+//! points move in those as well, by noise - is treated like the last frame in which it did, so that the cells which
+//! measure the motion have their points in it as well. Other frames are not touched: the regular grid measures them.
+constexpr float kMotionMovingPoint = 0.5f;
+constexpr int kMotionSparseCells = 12;
+constexpr int kMotionTextureParts = 8;
+constexpr int kMotionTextureBlock = 7;
+constexpr float kMotionTextureMin = 0.5f;
+//! Where points were added, the points of a cell have to agree: a cell counts if most of its points - and at least
+//! kMotionMinCellPoints - moved like their median, within kMotionAgreeShare of its length or kMotionAgreePixels
+//! pixels. The points that do are the cell. Wrong matches that survive the way back (a cut, flames, motion blurred
+//! grass) rarely agree with each other, and many more points per cell bring many more of them
+constexpr float kMotionAgreeShare = 0.2f;
+constexpr float kMotionAgreePixels = 0.5f;
+//! the most points that can be added (every part of every cell)
+constexpr int kMotionTexturePoints = kMotionTextureParts * kMotionTextureParts * kMotionCells;
 
 //! motion from the previous frame to a frame: one vector per grid cell
 struct MotionField {
@@ -48,6 +72,28 @@ struct MotionGrid {
     int points_y() const { return kMotionCellPoints * cells_y; }
 };
 MotionGrid motion_grid(int width, int height);
+//! the cell of a position relative to the frame (0 - 1)
+int motion_cell(const MotionGrid & grid, float x, float y);
+
+//! what the regular grid found in the cells of a frame: its used points, and those of them which moved by at least
+//! kMotionMovingPoint
+struct MotionGridCounts {
+    std::array<uint8_t, kMotionCells> used {};
+    std::array<uint8_t, kMotionCells> moving {};
+    void add(int cell, float dx, float dy)
+    {
+        if (used[static_cast<size_t>(cell)] < 255) ++used[static_cast<size_t>(cell)];
+        if (dx * dx + dy * dy >= kMotionMovingPoint * kMotionMovingPoint && moving[static_cast<size_t>(cell)] < 255) ++moving[static_cast<size_t>(cell)];
+    }
+    //! cells with kMotionMinCellPoints points that moved
+    int moving_cells() const;
+    //! there is motion: such a cell
+    bool moved() const { return moving_cells() > 0; }
+    //! ... but too few of them: points are added where the frame has texture (kMotionSparseCells)
+    bool sparse() const;
+    //! ... but not in this cell: the grid tracked points there and none of them moved
+    bool is_static(int cell) const { return used[static_cast<size_t>(cell)] > 0 && moving[static_cast<size_t>(cell)] == 0; }
+};
 
 //! collects the motion of tracked points and reduces it to the median per cell
 class MotionCellBinner {
@@ -60,8 +106,9 @@ public:
     }
     //! x, y: position of the point relative to the frame (0 - 1), dx, dy: its motion
     void add(float x, float y, float dx, float dy);
-    //! sets the cells with at least min_points points, their motion multiplied by scale
-    void finish(MotionField & field, size_t min_points, float scale);
+    //! sets the cells with at least min_points points, their motion multiplied by scale.
+    //! agree: the points of a cell have to agree (see kMotionAgreeShare), for frames to which points were added
+    void finish(MotionField & field, size_t min_points, float scale, bool agree = false);
 
 private:
     struct Point {
@@ -114,6 +161,10 @@ public:
     MotionField estimate(const cv::Mat & luma, std::vector<MotionPoint> * points = nullptr);
 
 private:
+    //! sparse motion: fills _extra with the points of the previous frame that have the most texture (see
+    //! kMotionTextureParts), counts: what the regular grid found
+    void _texture_points(const MotionGrid & grid, const MotionGridCounts & counts);
+
     cv::Mat _current;
     cv::Size _previous_size;
     std::vector<cv::Mat> _previous_pyramid;
@@ -125,6 +176,14 @@ private:
     std::vector<unsigned char> _status;
     std::vector<unsigned char> _back_status;
     std::vector<float> _error;
+    //! sparse motion: the texture of the previous frame and the points added where it has some
+    cv::Mat _texture;
+    std::vector<float> _part_texture;
+    std::vector<cv::Point2f> _part_points;
+    std::vector<cv::Point2f> _extra;
+    //! what the regular grid found in the last frame with motion, and whether that was sparse
+    MotionGridCounts _moved_counts;
+    bool _sparse = false;
     MotionCellBinner _binner;
 };
 
