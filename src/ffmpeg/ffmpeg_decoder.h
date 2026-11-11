@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "options.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -46,6 +48,9 @@ struct Probe {
 Probe probe(const std::string & path);
 
 std::string format_name(AVPixelFormat format);
+
+//! how the decoded frame is coded, Unknown if the decoder doesn't tell the picture type (some hardware decoders)
+FrameCoding frame_coding(const AVFrame * frame);
 
 //! cheap check from the container / codec parameters (no device, no decoding):
 //! empty if the video may be decodable with Vulkan Video into an 8-bit YUV format, otherwise the reason

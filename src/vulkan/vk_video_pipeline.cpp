@@ -600,6 +600,7 @@ public:
             RowCounts & result = out[i];
             result.compared = slot_video.compared;
             result.cols = slot_video.width;
+            result.coding = ffmpeg::frame_coding(slot_video.frame);
             result.counts.clear();
             if (slot_video.compared)
             {

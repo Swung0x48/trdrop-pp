@@ -44,7 +44,8 @@ number `video`.
 ## Definitions
 
 - **New frame**: lossless source - any pixel differs. Lossy source - more than the tolerance (automatic: at
-  least 0.5% of the pixels, and 5% of what new frames changed recently) differ by more than `--pixel-diff`.
+  least 0.5% of the pixels - down to 0.05% where the duplicates of the recording change less -, and 5% of what
+  new frames changed recently) differ by more than `--pixel-diff`.
 - **Framerate**: sum of `diff` over the last second. A torn frame counts partly, two complementing torn
   frames count as one new frame.
 - **Animation step**: every part of the picture that moves compares its motion in this frame with its

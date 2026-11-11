@@ -63,6 +63,8 @@ private:
     std::vector<double> _last_changed_shares;
     //! per video: changed shares of the last 2 seconds, for the automatic tolerance
     std::vector<std::deque<double>> _share_history;
+    //! per video: changed shares of the last duplicates (2 seconds of them, no keyframes), the noise of the recording
+    std::vector<std::deque<double>> _noise_history;
     std::vector<double> _sorted_shares;
     bool _received_first_frames = false;
     bool _has_difference = false;

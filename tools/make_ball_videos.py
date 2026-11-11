@@ -27,6 +27,13 @@ one picture is recorded twice and another one is lost
   motion_ball_capture  as recorded                                             50 fps, perceived 45
                        with --async-capture                                    60 fps, perceived 60
 
+For the framerate alone (too small for --motion): a ball a fifth of the size, which changes 0.2% of the picture.
+That is less than the 0.5% a frame of a lossy recording has to change, unless its duplicates show that less is
+enough (the automatic tolerance, see "Lossy recordings" in the README). A keyframe every 30 frames, on duplicates
+
+  motion_ball_small    a new frame every 3rd frame, advancing by 3             20 fps after the first half second,
+                                                                               in which the duplicates are measured
+
 Needs numpy, opencv-python and an ffmpeg with the chosen encoder.
 """
 
@@ -45,7 +52,8 @@ BACKGROUND = (52, 44, 40)  # BGR
 
 
 def videos():
-    """name -> (animation time of every frame in display intervals, speed of the ball relative to VELOCITY)"""
+    """name -> (animation time of every frame in display intervals, speed of the ball relative to VELOCITY[,
+    size of the ball relative to RADIUS, frames whose number modulo 30 are this are keyframes])"""
     frames = np.arange(FRAMES)
     hitch = frames.astype(float)
     for second in range(FRAMES // 60):
@@ -69,6 +77,8 @@ def videos():
         "stutter": ((frames // 4 * 4 + (frames // 2 % 2)).astype(float), 1.0),
         "hitch": (hitch, 1.0),
         "change": (np.cumsum(steps), 0.5),
+        # frames 10, 40, 70, ... are duplicates
+        "small": ((frames // 3 * 3).astype(float), 1.0, 0.2, 10),
     }
 
 
@@ -116,15 +126,21 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
     sprite, coverage = ball_sprite()
-    for name, (times, speed) in videos().items():
+    for name, (times, speed, *more) in videos().items():
         path = os.path.join(args.output, f"motion_ball_{name}.mkv")
+        ball, ball_coverage, keyframes = sprite, coverage, []
+        if more:
+            size, keyframe = more
+            ball = cv2.resize(sprite, None, fx=size, fy=size, interpolation=cv2.INTER_AREA)
+            ball_coverage = cv2.resize(coverage, None, fx=size, fy=size, interpolation=cv2.INTER_AREA)
+            keyframes = ["-g", "600", "-force_key_frames", f"expr:eq(mod(n,30),{keyframe})"]
         encoder = subprocess.Popen([args.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                                     "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", "-", "-c:v", args.encoder, "-b:v", args.bitrate,
-                                    "-pix_fmt", "yuv420p", path], stdin=subprocess.PIPE)
+                                    *keyframes, "-pix_fmt", "yuv420p", path], stdin=subprocess.PIPE)
         cache = {}
         for time in times:
             if time not in cache:
-                cache = {time: render(sprite, coverage, time, speed).tobytes()}  # duplicates are the identical picture
+                cache = {time: render(ball, ball_coverage, time, speed).tobytes()}  # duplicates are the identical picture
             encoder.stdin.write(cache[time])
         encoder.stdin.close()
         if encoder.wait() != 0:

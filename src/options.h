@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -16,6 +17,28 @@ constexpr int kLossyPixelDifference = 4;
 //! changed pixels per frame over the last 2 seconds). Encoders predict duplicate frames partly from the next
 //! frame, which leaks a few percent of it into them
 constexpr double kAutoToleranceRelative = 0.05;
+//! automatic tolerance: kLossyTolerancePct is what the duplicates of a poor recording need. Where the recording is
+//! cleaner the minimum for frames follows its noise, so that small changes (a static camera with a few distant
+//! objects, a menu) still count: kAutoToleranceNoiseFactor times what the recent duplicates changed, between
+//! kAutoToleranceMinPct and kLossyTolerancePct. "What they changed" is the value a third of them stay below - frames
+//! with a small change count as duplicates until the minimum is lower, and up to two thirds of them don't move it -,
+//! taken from the last 2 seconds of duplicate frames once there are kAutoToleranceNoiseSamples of them.
+//! Measured on a 1080p240 capture and five re-encodes of it: that third is 0.0001 - 0.001% of the picture (99% of
+//! the duplicates: below 0.02%) with a constant quality at 19 - 37 Mbit/s, 0.004 - 0.016% (99%: 0.3 - 0.8%) at 2 - 6
+//! Mbit/s. Not for keyframes, which encoders code anew: a duplicate changes 0.1 - 10% of the picture there.
+//! Where the minimum is lower, kAutoToleranceRelative looks at the last second only
+constexpr double kAutoToleranceNoiseFactor = 45.0;
+constexpr double kAutoToleranceMinPct = 0.05;
+constexpr size_t kAutoToleranceNoiseSamples = 30;
+
+//! how a frame is coded, as far as the decoder tells
+enum class FrameCoding {
+    Unknown,
+    //! a keyframe / intra coded picture
+    Intra,
+    //! predicted from other frames
+    Predicted,
+};
 
 //! per video analysis options (pixel difference from FramerateOptions, dismiss percentage from TearOptions)
 struct VideoOptions {

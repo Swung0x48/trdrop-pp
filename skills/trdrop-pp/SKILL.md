@@ -138,7 +138,7 @@ number came from when several were analyzed.
 | H.264 / HEVC / AV1 recording (OBS, capture software) | nothing: lossy codecs are detected and compared with a tolerance. The log says `tolerance-pct auto` |
 | Lossless capture (FFV1, MagicYUV, Ut Video, raw) | nothing: every different pixel counts |
 | A lossy recording reports far more new frames than plausible | compression noise is counted as change: raise `--tolerance-pct` (start with 2) or `--pixel-diff` (start with 8) step by step and watch the duplicate count |
-| Small real changes are missed in a mostly static picture | lower them: `--tolerance-pct 0.1`, or `--tolerance-pct 0 --pixel-diff 0` for a lossless source in a lossy container |
+| Small real changes are missed in a mostly static picture (a static camera, a menu) | the automatic tolerance allows for them only where the recording has duplicates that change little (recorded above the framerate, a good bitrate). Otherwise lower it: `--tolerance-pct 0.1`, or `--tolerance-pct 0 --pixel-diff 0` for a lossless source in a lossy container |
 | The container's framerate is wrong | `--source-fps <fps>` |
 | The capture was not in step with the game's output (variable refresh rate output, or recorded with a capture program like OBS) and the summary shows a `note:` about animation errors of one whole interval | `--async-capture` instead of `--motion`, see below |
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |

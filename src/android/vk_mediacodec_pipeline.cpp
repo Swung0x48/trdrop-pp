@@ -246,6 +246,7 @@ public:
             RowCounts & result = out[i];
             result.compared = frame.compared;
             result.cols = frame.width;
+            result.coding = frame.coding;
             result.counts.clear();
             if (frame.compared)
             {
@@ -309,6 +310,8 @@ private:
         int height = 0;
         bool compared = false;
         bool motion_estimated = false;
+        //! as far as the decoder tells (see ffmpeg::frame_coding)
+        FrameCoding coding = FrameCoding::Unknown;
         MotionLayout motion;
         //! motion video: the picture of the frame (index into Encoder::pictures, -1: none)
         int picture = -1;
@@ -750,6 +753,7 @@ private:
         const Timer timer(_decode_ms);
         if (!video.decoder->next(video.frame)) return false;
         if (video.frame->format != AV_PIX_FMT_MEDIACODEC || !video.frame->data[3]) throw std::runtime_error("the decoder returned no hardware frame");
+        frame.coding = ffmpeg::frame_coding(video.frame);
         // the frame goes to the window of the reader, where it arrives a moment later
         const int rendered = av_mediacodec_release_buffer(reinterpret_cast<AVMediaCodecBuffer *>(video.frame->data[3]), 1);
         av_frame_unref(video.frame);

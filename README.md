@@ -118,10 +118,43 @@ Without the option the codec decides (printed in the `vN:` line):
   Checked against a lossless capture with 271 duplicates in 899 frames (41.9 fps): its 100 Mbit/s HEVC
   version gives 281 duplicates (41.1 fps) - and 0 duplicates (60 fps) without the tolerance.
 
+  0.5% is what the duplicates of a poor recording need, but it hides small real changes: a static camera
+  with a few distant cars, a menu with a blinking cursor. Where the duplicates of the recording change
+  less, the minimum is therefore lower - 45 times what the calmer third of the recent duplicates changed,
+  between 0.05% and 0.5% - and the relative part looks at the last second only. That needs:
+
+  * duplicates to measure, i.e. a recording at more than the framerate
+    ([twice the framerate](#recording-at-twice-the-framerate) is enough): 30 of them, until then it is 0.5%
+  * a decoder that tells which frames are keyframes. FFmpeg decoding does (`--decode vulkan` and `ffmpeg`),
+    `--decode opencv` doesn't and stays at 0.5% - that is also what a video without an 8-bit YUV format
+    (10-bit, HDR) is decoded with; the Android app was not checked. Keyframes are coded anew, a duplicate
+    changes 0.1 - 10% of the picture there, so they keep 0.5% (as does a recording that consists of keyframes
+    only, e.g. MJPEG): a small change that falls on a keyframe is missed, and a duplicate on one may count
+    as a new frame (as before)
+
+  Measured on a 1080p240 capture of a replay with 9211 new frames in 22849 - among them 58 from 0.6 seconds
+  of a static camera with distant cars, which change 0.2 - 0.4% of the picture - and on re-encodes of it.
+  Which frames are new was told from the capture itself (the 0.5% rule, plus every frame in which more than
+  0.005% of the pixels change by more than 12: every picture is then recorded 2 to 5 times):
+
+  | recording | 0.5% throughout: missed / wrongly new | lower minimum: missed / wrongly new |
+  | --- | --- | --- |
+  | as captured: HEVC, constant quality, 37 Mbit/s | 58 / 0 | 0 / 0 |
+  | H.264 with 2 B-frames, constant quality, 23 Mbit/s | 60 / 31 | 0 / 31 |
+  | HEVC with 3 B-frames, constant quality, 19 Mbit/s | 63 / 28 | 0 / 28 |
+  | HEVC, 6 Mbit/s | 69 / 51 | 24 / 55 |
+  | HEVC, 2 Mbit/s | 86 / 107 | 69 / 116 |
+  | H.264 with 2 B-frames, 3 Mbit/s | 211 / 4066 | 211 / 4052 |
+
+  In the constant quality re-encodes all wrongly new frames are duplicates on keyframes. `motion_ball_small`
+  (`tools/make_ball_videos.py`: 20 fps in 60, the ball changes 0.2% of the picture) reads 20 fps after its
+  first half second, and 0 fps with 0.5% throughout.
+
 H.264 / HEVC / AV1 are always treated as lossy, also if they were encoded in a lossless mode
 (pass `--tolerance-pct 0 --pixel-diff 0` then). The automatic values are heuristics: after fast motion
-small real changes may count as duplicates for up to 2 seconds, and tears can't be detected reliably
-in lossy recordings.
+small real changes may count as duplicates for up to 2 seconds (1 second where the minimum is lower), a
+picture without any duplicates around it (recorded at the framerate) keeps the 0.5%, and tears can't be
+detected reliably in lossy recordings.
 
 ## Motion analysis (`--motion`)
 

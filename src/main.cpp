@@ -61,8 +61,9 @@ analysis (single value for all videos, or comma separated per video, e.g. 0,5,0)
                                by compression noise: a frame only counts as new if more than
                                this percentage of its pixels is different, a row with at most
                                this percentage counts as unchanged
-                               (default: 0; lossy codecs: automatic, at least 0.5 and 5% of
-                               what new frames changed in the last 2 seconds)
+                               (default: 0; lossy codecs: automatic, at least 0.5 - less, down
+                               to 0.05, where the duplicates of the recording change less -
+                               and 5% of what new frames changed in the last 2 seconds)
       --dismiss-tear-pct <%>   tears smaller than this percentage of the frame height are
                                dismissed (default: 10)
       --source-fps <fps>       override the recorded framerate of the container

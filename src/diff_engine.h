@@ -19,6 +19,8 @@ struct RowCounts {
     int cols = 0;
     //! per row: amount of pixels whose grayscale difference is > pixel_difference
     std::vector<uint32_t> counts;
+    //! how the frame is coded (FFmpeg decoders), the automatic tolerance of lossy codecs depends on it
+    FrameCoding coding = FrameCoding::Unknown;
     //! motion from the previous frame, only if the pipeline measures it (FramePipeline::enable_motion)
     MotionField motion;
     //! the picture and the tracked points for the motion video (FramePipeline::enable_motion_detail)

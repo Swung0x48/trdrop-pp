@@ -150,6 +150,7 @@ public:
             const AVFrame * previous = _videos[i].previous;
             RowCounts & result = _results[i];
             result.cols = current->width;
+            result.coding = ffmpeg::frame_coding(current);
             result.compared = previous->data[0] && previous->width == current->width && previous->height == current->height
                            && previous->format == current->format;
             if (result.compared) compare_yuv(current, previous, std::max(0, video_options[i].pixel_difference), result.counts);

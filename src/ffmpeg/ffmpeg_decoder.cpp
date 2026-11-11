@@ -127,6 +127,15 @@ std::string format_name(AVPixelFormat format)
     return name ? name : "unknown";
 }
 
+FrameCoding frame_coding(const AVFrame * frame)
+{
+#ifdef AV_FRAME_FLAG_KEY
+    if (frame->flags & AV_FRAME_FLAG_KEY) return FrameCoding::Intra;
+#endif
+    if (frame->pict_type == AV_PICTURE_TYPE_I) return FrameCoding::Intra;
+    return frame->pict_type == AV_PICTURE_TYPE_NONE ? FrameCoding::Unknown : FrameCoding::Predicted;
+}
+
 std::string vulkan_decode_blocker(const std::string & path)
 {
     const Probe result = probe(path);

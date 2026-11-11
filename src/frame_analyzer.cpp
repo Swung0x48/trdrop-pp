@@ -75,6 +75,7 @@ FrameAnalyzer::FrameAnalyzer(const std::vector<int> & recorded_framerates)
     _last_differences.assign(kMaxVideoCount, 0.0);
     _last_changed_shares.assign(kMaxVideoCount, 0.0);
     _share_history.resize(kMaxVideoCount);
+    _noise_history.resize(kMaxVideoCount);
 }
 
 void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std::vector<VideoOptions> & video_options)
@@ -121,20 +122,45 @@ void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std
         // (and for the tear detection every row) only counts as changed above the tolerance
         const double row_tolerance = std::max(0.0, video_options[i].tolerance_pct) / 100.0;
         double tolerance = row_tolerance;
+        bool frame_changed = true;
         if (video_options[i].tolerance_auto)
         {
-            // relative to what a new frame changed recently: 90th percentile of the last 2 seconds
+            const size_t window = std::max<size_t>(2, 2 * _frame_diff_lists[i].size());
+            // where the duplicates of the recording change less, less counts as a new frame. Not for keyframes,
+            // which are coded anew (and not if the decoder doesn't tell which frames those are)
+            std::deque<double> & noise = _noise_history[i];
+            const bool predicted = counts.coding == FrameCoding::Predicted;
+            if (predicted && noise.size() >= kAutoToleranceNoiseSamples)
+            {
+                _sorted_shares.assign(noise.begin(), noise.end());
+                const auto third = _sorted_shares.begin() + static_cast<std::ptrdiff_t>(_sorted_shares.size() / 3);
+                std::nth_element(_sorted_shares.begin(), third, _sorted_shares.end());
+                tolerance = std::min(tolerance, std::max(kAutoToleranceMinPct / 100.0, kAutoToleranceNoiseFactor * *third));
+            }
+            // relative to what a new frame changed recently: 90th percentile of the last 2 seconds - of the last
+            // second where less counts as a new frame, small changes after larger ones are what that is for
             std::deque<double> & history = _share_history[i];
             history.push_back(_last_changed_shares[i]);
-            if (history.size() > std::max<size_t>(2, 2 * _frame_diff_lists[i].size())) history.pop_front();
-            _sorted_shares.assign(history.begin(), history.end());
+            if (history.size() > window) history.pop_front();
+            const size_t recent = tolerance < row_tolerance ? std::min(history.size(), std::max<size_t>(1, window / 2)) : history.size();
+            _sorted_shares.assign(history.end() - static_cast<std::ptrdiff_t>(recent), history.end());
             const auto reference = _sorted_shares.begin() + static_cast<std::ptrdiff_t>(0.9 * static_cast<double>(_sorted_shares.size() - 1));
             std::nth_element(_sorted_shares.begin(), reference, _sorted_shares.end());
             tolerance = std::max(tolerance, kAutoToleranceRelative * *reference);
+
+            frame_changed = _last_changed_shares[i] > tolerance;
+            if (predicted && !frame_changed)
+            {
+                noise.push_back(_last_changed_shares[i]);
+                if (noise.size() > window) noise.pop_front();
+            }
+        }
+        else if (tolerance > 0.0)
+        {
+            frame_changed = _last_changed_shares[i] > tolerance;
         }
         if (tolerance > 0.0)
         {
-            const bool frame_changed = _last_changed_shares[i] > tolerance;
             for (double & row_difference : _row_differences)
             {
                 if (!frame_changed || row_difference <= row_tolerance) row_difference = 0.0;
@@ -142,7 +168,9 @@ void FrameAnalyzer::process(const std::vector<RowCounts> & row_counts, const std
         }
 
         const double dismiss_tear_percentage = video_options[i].dismiss_tear_percentage / 100.0;
-        const double difference = _frame_difference(_row_differences, dismiss_tear_percentage, i, rows, tears_per_video[i]);
+        double difference = _frame_difference(_row_differences, dismiss_tear_percentage, i, rows, tears_per_video[i]);
+        // a change below the tolerance of the rows (a few pixels in every row) is a new frame all the same
+        if (tolerance > 0.0 && frame_changed && difference == 0.0) difference = 1.0;
         _frame_diff_lists[i][_current_framecount[i]] = difference;
         _last_differences[i] = difference;
     }
