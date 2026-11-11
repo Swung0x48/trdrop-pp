@@ -332,7 +332,7 @@ with a capture program that lost and repeated about 20 pictures per second):
 A recording that needs no such assumption: record at twice the highest framerate of the source or more - a
 120 Hz output at 240 fps, at a lower resolution if the capture card asks for it. Every picture is then shown
 for at least two intervals of the capture and is recorded whatever the two clocks do, also with a variable
-refresh rate. Analyze it as it is, without `--async-capture`.
+refresh rate. Analyze it as it is; `--async-capture` isn't needed (what it changes: below).
 
 For example with FFmpeg on Windows, straight from the card (the first line lists the devices). A capture
 program that composes at its own framerate (OBS, ...) would have to run at the doubled rate too; that was not
@@ -354,14 +354,33 @@ What to expect and how to check it:
 * The time a picture was shown is known to one interval of the capture, so the animation error carries up to
   one interval of noise (4.2 ms at 240 fps). The framerate and the perceived smoothness count pictures and
   compare their steps, they don't have that noise.
+* `--async-capture` changes only the animation error of such a recording. No picture is recorded once, so
+  none counts as lost, and the framerate and the perceived smoothness stay as they are. Its band of one
+  interval takes the noise of the capture out of the error - and real errors of less than an interval with
+  it. The error without the option is an upper bound, the one with it a lower bound.
 * Don't expect more from the timestamps of the file: the card this was tried with numbers its frames on the
   240 fps grid whenever they arrive. trdrop++ doesn't read them.
+
+Twice is not a threshold. No picture is lost as long as an interval of the capture is shorter than the
+shortest time a picture is shown, so 144 fps would do for a 120 Hz output. What the factor buys:
+
+* The check above. At 1.2 times the rate a picture that is recorded once is normal (38% of the pictures
+  below), a lost one doesn't stand out.
+* Time resolution: an interval of 6.9 ms instead of 4.2 ms, the noise in the animation error doubles.
+* Margin: the source and the capture don't run at exactly the rates they name.
 
 Measured: a console game with variable refresh rate (about 47 - 120 fps, 102 seconds) recorded at 1080p
 240 fps with a USB capture card. Of its 8532 pictures none was recorded once (37% twice, 44% three times,
 15% four times); in the five seconds in which the game is fastest (115 fps) 91% of the pictures are recorded
-twice. 83.7 new frames per second, perceived smoothness 81.9 fps, animation error 1.3 ms on average and
-3.3 ms at the 95th percentile.
+twice. For the second row the recording was resampled to 144 fps (every tick takes the latest picture, as a
+capture would; a real capture at 144 fps wasn't tried).
+
+| video | new frames per second | perceived smoothness (10% low) | animation error, average / 95th percentile | the error with `--async-capture` |
+| --- | --- | --- | --- | --- |
+| recorded at 240 fps | 83.7 | 81.9 fps (57.2) | 1.3 ms / 3.3 ms | 0.14 ms / 0.8 ms |
+| resampled to 144 fps | 83.8 | 82.0 fps (57.4) | 2.7 ms / 5.8 ms | 0.19 ms / 1.4 ms |
+
+The other values are the same with `--async-capture`, no picture counts as lost in either video.
 
 ## Plotting
 
