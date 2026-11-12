@@ -56,6 +56,10 @@ struct VideoOptions {
     double dismiss_tear_percentage = 10.0;
     //! overrides the recorded framerate of the source (0 = read from the container)
     double source_fps_override = 0.0;
+    //! --resolution: the part of the height (percent, from the top) whose edge columns are measured in a pan.
+    //! Where a HUD touches the left or the right edge differs from game to game
+    double resolution_rows_from = 9.0;
+    double resolution_rows_to = 74.0;
 };
 
 struct Options {

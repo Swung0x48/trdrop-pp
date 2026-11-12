@@ -46,10 +46,13 @@ struct ResolutionLayout {
     int height = 0;
     //! the pixel grid uses the rows [0, lattice_rows): not the bottom of the picture, where overlays tend to be
     int lattice_rows = 0;
-    //! columns per edge, and the rows of their spectra: `segments` segments starting at row0
+    //! columns per edge, and the rows of their spectra: `segments` segments starting at row0 (0: too few rows)
     int edge = 0;
     int row0 = 0;
     int segments = 0;
+    //! ... as they were asked for, percent of the height
+    double rows_from = 0.0;
+    double rows_to = 0.0;
 
     bool operator==(const ResolutionLayout & other) const
     {
@@ -57,7 +60,9 @@ struct ResolutionLayout {
             && row0 == other.row0 && segments == other.segments;
     }
 };
-ResolutionLayout resolution_layout(int width, int height);
+//! rows_from, rows_to: the part of the height (percent, from the top) whose edge columns are measured
+//! (VideoOptions::resolution_rows_from / _to)
+ResolutionLayout resolution_layout(int width, int height, double rows_from, double rows_to);
 
 //! what is measured of one frame
 struct ResolutionFrame {
@@ -73,9 +78,9 @@ struct ResolutionFrame {
     std::vector<float> edge_power;
 };
 
-//! measures a frame on the CPU. luma: 8-bit single channel. edges: also the spectra of the edge columns
-//! (they are only used for frames of a pan, see resolution_pan)
-void measure_resolution(const cv::Mat & luma, bool edges, ResolutionFrame & out);
+//! measures a frame on the CPU. luma: 8-bit single channel, layout: the one of its size. edges: also the spectra
+//! of the edge columns (they are only used for frames of a pan, see resolution_pan)
+void measure_resolution(const cv::Mat & luma, const ResolutionLayout & layout, bool edges, ResolutionFrame & out);
 
 //! the horizontal pan of a frame, from its motion field
 struct ResolutionPan {
@@ -115,6 +120,9 @@ public:
         double codec_strength = 0.0;
 
         // picture entering at the edge of a pan
+        //! the part of the height that was measured, percent
+        double rows_from = 0.0;
+        double rows_to = 0.0;
         //! frames used, picture moving to the right / to the left
         long long pan_frames_right = 0;
         long long pan_frames_left = 0;

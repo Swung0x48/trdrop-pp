@@ -515,7 +515,7 @@ public:
             if (_resolution)
             {
                 if (static_cast<uint32_t>(frame->width) > _max_workgroups) throw std::runtime_error("frame width exceeds the device limit");
-                const ResolutionLayout layout = resolution_layout(frame->width, frame->height);
+                const ResolutionLayout layout = resolution_layout(frame->width, frame->height, video_options[i].resolution_rows_from, video_options[i].resolution_rows_to);
                 slot_video.resolution = layout;
                 if (layout.width > 0)
                 {

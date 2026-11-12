@@ -32,6 +32,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--arrow-scale <x>` | draw the arrows of the motion video x times longer (default `1`) |
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
 | `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) of an upscaled picture |
+| `--resolution-rows <a-b>` | `--resolution`, and the part of the height (percent, from the top) whose edge columns are measured in a pan (default `9-74`) |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
@@ -39,7 +40,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--list-vkdevices` | list the Vulkan devices with their `--vkdevice` index and exit. Vulkan builds only |
 | `--decode <mode>` | `auto` (default: the fastest), `vulkan`, `ffmpeg` or `opencv`, see [GPU decoding](#ffmpeg--vulkan-video-gpu-decoding). FFmpeg builds only |
 
-`--pixel-diff`, `--tolerance-pct`, `--dismiss-tear-pct` and `--source-fps` take a single value for all videos or
+`--pixel-diff`, `--tolerance-pct`, `--dismiss-tear-pct`, `--source-fps` and `--resolution-rows` take a single value for all videos or
 comma separated values per video, e.g. `--pixel-diff 0,5,0`.
 
 Only the CSV is written to stdout, progress / input info / summary go to stderr, so the output
@@ -466,7 +467,7 @@ trdrop-pp capture.mkv --resolution -o capture.csv
 
 ```
 v1 resolution: pixel grid at 0.3333 cycles/pixel (13.1x / 8.6x the background in the columns / rows): rendered at 33.3% or 66.7% of the output
-v1 resolution: picture entering at the edge of a pan, 1401 + 786 frames (moving right + left): contrast against the picture that leaves down to 0.31 (at 0.266 cycles/pixel), one half at 0.165 cycles/pixel; 1.13 for what entered 8 - 15 frames ago: a single frame resolves about 33% of the output, the rest builds up over the frames (temporal upscaling)
+v1 resolution: picture entering at the edge of a pan, 1401 + 786 frames (moving right + left), rows 9 - 74% of the height: contrast against the picture that leaves down to 0.31 (at 0.266 cycles/pixel), one half at 0.165 cycles/pixel; 1.13 for what entered 8 - 15 frames ago: a single frame resolves about 33% of the output, the rest builds up over the frames (temporal upscaling)
 v1 resolution: estimate 1280x720 (33.3% of 3840x2160): the scale of the pixel grid that fits the pan, not 2560x1440 (66.7%)
 ```
 
@@ -484,7 +485,8 @@ The CSV is the same with and without the option.
    enters at one edge while the camera pans: it is what a single rendered frame holds, nothing finer than the
    render resolution. The vertical spectrum (the motion blur of a horizontal pan is horizontal) of up to 256
    columns next to that edge is compared with the same columns of the other edge, where the picture leaves
-   after it crossed the screen. The columns are grouped by when they entered - the summed motion of the
+   after it crossed the screen. The columns are measured between 9% and 74% of the height - a guess at where a
+   HUD doesn't touch the left and the right edge, made for one game; `--resolution-rows 20-60` sets another part. The columns are grouped by when they entered - the summed motion of the
    frames before reaches them - and the contrast of each group is the root of the ratio of the two spectra,
    with the coarsest detail (0.047 cycles per pixel) as 1. Where the contrast of the newest columns (the outer
    half of what entered with the frame) is down to one half is read as what a single frame resolves: half its
@@ -557,7 +559,10 @@ Limits:
 * A pixel grid says that the picture was scaled, not by whom: the game, the console's output or the capture
   (a capture program that scales its source to a larger canvas) all leave the same one.
 * One scale for the whole video: a render scale that changes with the load smears the peak.
-* Overlays that are drawn at the output resolution (a HUD) are part of the picture that is measured.
+* Overlays that are drawn at the output resolution (a HUD) are part of the picture that is measured. For the
+  pan, `--resolution-rows` keeps them out if they touch the left or the right edge; nothing finds them by
+  itself. How much the part matters was only tried on the first recording: one half at 0.165 for the default
+  9-74 in its first 1500 frames, 0.168 for 20-60 and for 0-100, 0.175 for 78-98 (its lowest fifth).
 * The pan needs a horizontal pan the motion analysis can follow; ages are counted in recorded frames, so a
   game that runs faster than the recording has more than one of its frames in the newest columns.
 

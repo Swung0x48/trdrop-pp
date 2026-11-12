@@ -84,7 +84,8 @@ public:
                 {
                     // the edge columns are only used for frames of a pan
                     resolutions[i] = std::make_shared<ResolutionFrame>();
-                    measure_resolution(_gray, resolution_pan_usable(resolution_pan(fields[i], _gray.cols, _gray.rows)), *resolutions[i]);
+                    const ResolutionLayout layout = resolution_layout(_gray.cols, _gray.rows, video_options[i].resolution_rows_from, video_options[i].resolution_rows_to);
+                    measure_resolution(_gray, layout, resolution_pan_usable(resolution_pan(fields[i], _gray.cols, _gray.rows)), *resolutions[i]);
                 }
             }
             _motion_queue.push_back(std::move(fields));

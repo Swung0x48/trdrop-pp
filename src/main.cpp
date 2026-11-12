@@ -116,6 +116,11 @@ resolution (render resolution of an upscaled picture):
                                constant quality (QP 16 or better). Checked against one known
                                answer only (DLSS at 33%); a scale that changes is not handled.
                                On the GPU with Vulkan Video decoding, otherwise on the CPU
+      --resolution-rows <a-b>  --resolution, and the part of the height, in percent from the top,
+                               whose edge columns are measured in a pan (default: 9-74; one
+                               value for all videos or comma separated per video). It should
+                               hold no HUD that touches the left or the right edge - that is
+                               drawn at the output resolution and doesn't move with the picture
 
 backend:
       --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
@@ -232,6 +237,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
     PerVideoValue dismiss    { "--dismiss-tear-pct", {} };
     PerVideoValue tolerance  { "--tolerance-pct", {} };
     PerVideoValue source_fps { "--source-fps", {} };
+    PerVideoValue resolution_rows { "--resolution-rows", {} };
 
     bool only_inputs = false;
     for (int i = 1; i < argc; ++i)
@@ -260,6 +266,12 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--motion") { options.motion = true; }
         else if (arg == "--async-capture") { options.motion = true; options.async_capture = true; }
         else if (arg == "--resolution") { options.motion = true; options.resolution = true; }
+        else if (arg == "--resolution-rows")
+        {
+            options.motion = true;
+            options.resolution = true;
+            resolution_rows.values = split(next(), ',');
+        }
         else if (arg == "--motion-video") { options.motion = true; options.motion_videos = split(next(), ','); }
         else if (arg == "--arrow-scale")
         {
@@ -359,6 +371,15 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         if (value <= 0.0) throw std::invalid_argument("--source-fps must be > 0");
         v.source_fps_override = value;
     });
+    apply_per_video(resolution_rows, options.videos, [](VideoOptions & v, const std::string & text) {
+        const size_t dash = text.find('-');
+        if (dash == std::string::npos || dash == 0) throw std::invalid_argument("--resolution-rows expects <from>-<to> in percent of the height, e.g. 9-74");
+        const double from = parse_double(text.substr(0, dash), "--resolution-rows");
+        const double to = parse_double(text.substr(dash + 1), "--resolution-rows");
+        if (from < 0.0 || to > 100.0 || to - from < 5.0) throw std::invalid_argument("--resolution-rows: 0 <= from < to <= 100, at least 5 apart");
+        v.resolution_rows_from = from;
+        v.resolution_rows_to = to;
+    });
     return true;
 }
 
@@ -422,9 +443,10 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
     }
     else
     {
-        std::fprintf(stderr, "%spicture entering at the edge of a pan, %lld + %lld frames (moving right + left): contrast against the picture that leaves"
-                             " down to %.2f (at %.3f %s)"
-                   , prefix.c_str(), r.pan_frames_right, r.pan_frames_left, r.lowest_contrast, r.lowest_contrast_frequency, unit);
+        std::fprintf(stderr, "%spicture entering at the edge of a pan, %lld + %lld frames (moving right + left), rows %s - %s%% of the height:"
+                             " contrast against the picture that leaves down to %.2f (at %.3f %s)"
+                   , prefix.c_str(), r.pan_frames_right, r.pan_frames_left, format_number(r.rows_from).c_str(), format_number(r.rows_to).c_str()
+                   , r.lowest_contrast, r.lowest_contrast_frequency, unit);
         if (r.half_contrast_frequency > 0.0) std::fprintf(stderr, ", one half at %.3f %s", r.half_contrast_frequency, unit);
         if (r.recovered_age > 0) std::fprintf(stderr, "; %.2f for what entered %s", r.recovered_contrast, kResolutionAgeNames[r.recovered_age]);
         if (r.half_contrast_frequency > 0.0)

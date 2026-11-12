@@ -82,7 +82,7 @@ const SegmentBasis & segment_basis()
 
 } // namespace
 
-ResolutionLayout resolution_layout(int width, int height)
+ResolutionLayout resolution_layout(int width, int height, double rows_from, double rows_to)
 {
     ResolutionLayout layout;
     if (width < 8 * kResolutionSegment || height < 4 * kResolutionSegment) return layout;
@@ -90,16 +90,19 @@ ResolutionLayout resolution_layout(int width, int height)
     layout.height = height;
     layout.lattice_rows = height * 88 / 100;
     layout.edge = std::min(kResolutionEdgeColumns, width / 8);
-    layout.row0 = (height * 9 + 50) / 100;
-    const int row1 = (height * 74 + 50) / 100;
-    layout.segments = (row1 - layout.row0 - kResolutionSegment) / kResolutionHop + 1;
+    layout.rows_from = rows_from;
+    layout.rows_to = rows_to;
+    layout.row0 = std::min(height, std::max(0, static_cast<int>(std::lround(height * rows_from / 100.0))));
+    const int row1 = std::min(height, std::max(0, static_cast<int>(std::lround(height * rows_to / 100.0))));
+    // a part that is too short for one segment: no spectra
+    if (row1 - layout.row0 >= kResolutionSegment) layout.segments = (row1 - layout.row0 - kResolutionSegment) / kResolutionHop + 1;
     return layout;
 }
 
-void measure_resolution(const cv::Mat & luma, bool edges, ResolutionFrame & out)
+void measure_resolution(const cv::Mat & luma, const ResolutionLayout & layout, bool edges, ResolutionFrame & out)
 {
     CV_Assert(luma.type() == CV_8UC1);
-    const ResolutionLayout layout = resolution_layout(luma.cols, luma.rows);
+    CV_Assert(layout.width == 0 || (layout.width == luma.cols && layout.height == luma.rows));
     out.layout = layout;
     out.edges = false;
     out.column_sums.clear();
@@ -336,6 +339,8 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
     result.width = _layout.width;
     result.height = _layout.height;
     result.frames = _frames;
+    result.rows_from = _layout.rows_from;
+    result.rows_to = _layout.rows_to;
 
     // ---- pixel grid: peaks relative to the background around them
     if (_lattice_frames > 0 && !_spectrum_x.empty() && !_spectrum_y.empty())

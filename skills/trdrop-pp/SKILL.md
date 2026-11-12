@@ -145,7 +145,7 @@ number came from when several were analyzed.
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |
 | No GPU, a GPU error, or results must not depend on the GPU | `--no-vk` (CPU only), or `--decode ffmpeg` |
 | Several GPUs | `--list-vkdevices`, then `--vkdevice <n>` |
-| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan tells which - and an estimate. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera |
+| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan tells which - and an estimate. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera. If a HUD touches the left or right edge between 9% and 74% of the height, move the measured part with `--resolution-rows <from>-<to>` (percent of the height) |
 | Timings look wrong | another program is using the GPU; the results are unaffected, only the speed |
 
 ## Captures that are not in step with the game
