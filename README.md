@@ -3,6 +3,8 @@
 Analyzes captured game video. It estimates the *real* framerate and frametime of a capture, detects frame
 tears and, from the motion between the frames, measures how evenly the animation advances
 ([perceived smoothness](#motion-analysis---motion)). The per frame data is written as CSV.
+With `--resolution` it also estimates the resolution an upscaled picture was
+[rendered at](#render-resolution---resolution).
 The program and the repository are called `trdrop-pp`, `pp` being the `++` that file names and URLs don't like.
 
 The only required dependency is OpenCV (`core`, `imgproc`, `videoio`, `video`).
@@ -29,6 +31,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--motion-video <file>` | `--motion`, and write a [copy of the video with the motion drawn on it](#motion-video---motion-video) (`.mp4`, `.mkv`, `.mov`; one file per input video, comma separated) |
 | `--arrow-scale <x>` | draw the arrows of the motion video x times longer (default `1`) |
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
+| `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) of an upscaled picture |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
@@ -450,6 +453,113 @@ capture would; a real capture at 144 fps wasn't tried).
 | resampled to 144 fps | 83.8 | 82.0 fps (57.6) | 2.7 ms / 5.8 ms | 0.20 ms / 1.4 ms |
 
 The other values are the same with `--async-capture`, no picture counts as lost in either video.
+
+## Render resolution (`--resolution`)
+
+Games render fewer pixels than they put out and scale the picture up - with a plain filter, or with a temporal
+upscaler (DLSS, FSR 2 and later, XeSS, TSR, PSSR) that builds its detail from many frames. `--resolution`
+(it implies `--motion`) looks for two traces of that and prints what it found:
+
+```
+trdrop-pp capture.mkv --resolution -o capture.csv
+```
+
+```
+v1 resolution: pixel grid at 0.3333 cycles/pixel (13.1x / 8.6x the background in the columns / rows): rendered at 33.3% or 66.7% of the output
+v1 resolution: picture entering at the edge of a pan, 1401 + 786 frames (moving right + left): contrast against the picture that leaves down to 0.31 (at 0.266 cycles/pixel), one half at 0.165 cycles/pixel; 1.13 for what entered 8 - 15 frames ago: a single frame resolves about 33% of the output, the rest builds up over the frames (temporal upscaling)
+v1 resolution: estimate 1280x720 (33.3% of 3840x2160): the scale of the pixel grid that fits the pan, not 2560x1440 (66.7%)
+```
+
+The CSV is the same with and without the option.
+
+1. Pixel grid. In a picture that was scaled up, how much a pixel differs from its neighbours depends on where it
+   lies between two source pixels, and that repeats with the source sampling rate. Per frame the mean
+   `|p[x-1] - 2 p[x] + p[x+1]|` of every column (and the same of every row; without the lowest 12% of the
+   picture, where overlays tend to be) is taken, the slow variation removed, and the spectra of these profiles
+   are added up over the video. A picture rendered at r times the output resolution has a peak at r cycles per
+   pixel, folded into 0 - 0.5: 33% and 67% both give 0.333, 59% and 41% give 0.41. It counts if the columns
+   and the rows both have it 3 times above the background around it. The position is sharp - 1 / 3840 of a
+   cycle for a 4K picture - so a scale of 67% (0.33) is told from one of two thirds (0.3333).
+2. The picture that enters at the edge of a pan. A temporal upscaler has no earlier frames for the picture that
+   enters at one edge while the camera pans: it is what a single rendered frame holds, nothing finer than the
+   render resolution. The vertical spectrum (the motion blur of a horizontal pan is horizontal) of up to 256
+   columns next to that edge is compared with the same columns of the other edge, where the picture leaves
+   after it crossed the screen. The columns are grouped by when they entered - the summed motion of the
+   frames before reaches them - and the contrast of each group is the root of the ratio of the two spectra,
+   with the coarsest detail (0.047 cycles per pixel) as 1. Where the contrast of the newest columns (the outer
+   half of what entered with the frame) is down to one half is read as what a single frame resolves: half its
+   sampling rate, so twice that frequency is the render scale. Of the two scales the pixel grid allows, the one
+   nearer to it is the estimate.
+   A frame counts if the picture moves by 4 - 64 pixels (where it enters; a camera that turns moves the edges
+   up to twice as fast as the middle) with little vertical motion, and if no frame of the last 20 moved the
+   other way and 15 of them moved this way - then what leaves at the other edge has been on the screen for a
+   while. 30 such frames are needed.
+
+Where it is computed follows the decoder, like the motion: with Vulkan Video decoding two compute shaders
+(`src/vulkan/resolution_lattice.comp`, `resolution_edge.comp`) read the luma on the GPU and 80 kB per frame
+come back; otherwise the CPU does the same. The sums of the pixel grid are integers and identical on both
+(checked on 1561 frames), the spectra agree to 0.001%.
+
+Measured (4K recordings; RTX 4070 SUPER / i7-14700KF):
+
+| recording | pixel grid | pan | estimate |
+| --- | --- | --- | --- |
+| DLSS at 33% (ultra performance), 4K60 HEVC with a constant QP of 1, 80 seconds with gamepad pans | 0.3333, 13.1x / 8.6x | 1401 + 786 frames, one half at 0.165 | 1280x720 - right |
+| the same, 26 seconds of it: GPU / CPU (`--decode ffmpeg`) | 0.3333, 16.5x / 13.8x on both | 824 + 336 frames, 0.162 / 756 + 336 frames, 0.161 | 1280x720 on both |
+| DLSS at 33%, another recording of 46 seconds with a slow pan | 0.3333, 9.6x / 6.6x | 349 frames, one half at 0.165 | 1280x720 - right |
+| DLSS at 50% (performance), three H.264 recordings at 40 - 80 Mbit/s | none (2.1x - 2.2x) | 5 - 7 frames: none | none - as expected, see below |
+| DLSS at 33%, two H.264 recordings of a still scene at 2 - 5 Mbit/s | none (2.5x at 0.3333; 2.3x elsewhere) | none | none - missed |
+| console game, 4K120 recording whose picture was scaled from 1440p (the game, the console or the capture) | 0.3333, 6.4x / 5.6x | no pan in it | 1280x720 or 2560x1440 |
+| the same game, a replay with trackside cameras | 0.3333, 4.1x / 5.9x | 75 frames, the contrast stays above 0.81 | 1280x720 or 2560x1440: the pan doesn't tell |
+| the same game recorded at 1080p | none (1.1x) | | none: the console scales its picture down |
+
+Speed: the 4K60 recording runs at 111 frames per second on the GPU with and without the option, at 52 instead
+of 58 on the CPU.
+
+Recording for it:
+
+* at the resolution the game puts out, without any scaling on the way. A console set to 1080p scales its
+  picture down, nothing of the render resolution is left then - record it apart from a recording at
+  [twice the framerate](#recording-at-twice-the-framerate).
+* with a constant quality, not a constant bitrate. 10 seconds of the first recording, re-encoded with HEVC
+  (NVENC) at a constant QP:
+
+  | QP | bitrate | pixel grid, columns / rows | one half at |
+  | --- | --- | --- | --- |
+  | 1 (as recorded) | 891 Mbit/s | 17.8x / 13.7x | 0.170 |
+  | 8 | 417 Mbit/s | 13.3x / 9.8x | 0.167 |
+  | 12 | 228 Mbit/s | 10.7x / 7.6x | 0.167 |
+  | 16 | 129 Mbit/s | 8.4x / 5.6x | 0.169 |
+  | 20 | 66 Mbit/s | 4.4x / 4.1x | 0.178 |
+  | 24 | 37 Mbit/s | 3.7x / 3.2x | 0.200 |
+
+  The estimate was 1280x720 for all of them, but at QP 20 and above the peak is close to what counts and its
+  position is off by half a bin, and the pan reads higher. QP 12 - 16 is a good choice; QP 1 gives files of
+  800 Mbit/s for nothing.
+* in the game: stand still and turn the camera sideways at an even speed, a full turn in about 10 seconds
+  (20 - 30 pixels per frame at 4K), in both directions; motion blur, depth of field, film grain, sharpening
+  and frame generation off; a scene with fine horizontal structure (roof tiles, brickwork, steps).
+
+Limits:
+
+* It was checked against one known answer - DLSS at 33%, two recordings of the same place. Whether the pan
+  measurement follows the render scale, and what FSR, XeSS or an engine's own upscaler leave, is not known
+  yet: read the lines with the measurements, the estimate is their interpretation.
+* A render scale of exactly 50% leaves no pixel grid (both pixel positions between two source pixels are
+  alike). 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: the
+  summary says so instead of guessing. Native resolution leaves none either, so "no pixel grid" says little.
+* The pixel grid can't tell r from 1 - r. The pan can if the two are far apart, but not above a render scale
+  of about 70%: a single frame then resolves detail that the picture hardly has.
+* A pan in which the entering picture keeps its contrast doesn't rule out a temporal upscaler. In three
+  recordings of DLSS at 50% (H.264 at 40 - 80 Mbit/s) an earlier version of the measurement found no loss at
+  any frequency in 34 - 122 pan frames; with the rules above only 5 - 7 of their frames count, so the program
+  reports no pan for them. Whether that is the recordings or the method is open.
+* A pixel grid says that the picture was scaled, not by whom: the game, the console's output or the capture
+  (a capture program that scales its source to a larger canvas) all leave the same one.
+* One scale for the whole video: a render scale that changes with the load smears the peak.
+* Overlays that are drawn at the output resolution (a HUD) are part of the picture that is measured.
+* The pan needs a horizontal pan the motion analysis can follow; ages are counted in recorded frames, so a
+  game that runs faster than the recording has more than one of its frames in the newest columns.
 
 ## Plotting
 

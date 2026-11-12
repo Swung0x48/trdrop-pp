@@ -101,6 +101,22 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
                                A game that really shows a picture an interval late looks the
                                same: use it only if you know the capture is not in step
 
+resolution (render resolution of an upscaled picture):
+      --resolution             --motion, and estimate the resolution the picture was rendered at
+                               before it was scaled up, from two traces:
+                               the pixel grid - a scaled picture repeats with the source sampling
+                               rate: a peak at r cycles per pixel for a render scale of r or
+                               1 - r (exactly 50% leaves none; 25% and 75% fall on the block
+                               grid of video encoders and can't be told from it);
+                               the picture that enters at the edge of a horizontal pan - a
+                               temporal upscaler (DLSS, FSR 2+, XeSS, TSR) has no earlier frames
+                               for it, so it shows what a single rendered frame resolves. That
+                               needs a steady pan of 4 - 64 pixels per frame.
+                               The recording has to have the resolution the game put out and a
+                               constant quality (QP 16 or better). Checked against one known
+                               answer only (DLSS at 33%); a scale that changes is not handled.
+                               On the GPU with Vulkan Video decoding, otherwise on the CPU
+
 backend:
       --vkdevice <n>           Vulkan device used for the per pixel work (default: the first
                                discrete GPU, otherwise device 0)
@@ -243,6 +259,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--no-vk") { options.use_vulkan = false; }
         else if (arg == "--motion") { options.motion = true; }
         else if (arg == "--async-capture") { options.motion = true; options.async_capture = true; }
+        else if (arg == "--resolution") { options.motion = true; options.resolution = true; }
         else if (arg == "--motion-video") { options.motion = true; options.motion_videos = split(next(), ','); }
         else if (arg == "--arrow-scale")
         {
@@ -369,6 +386,83 @@ struct VideoStats {
     double frametime_sum = 0.0;
     double frametime_max = 0.0;
 };
+
+//! --resolution: what was measured, then the estimate
+void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
+{
+    const char * const unit = "cycles/pixel";
+    const std::string prefix = "v" + std::to_string(index + 1) + " resolution: ";
+    if (r.width == 0)
+    {
+        std::fprintf(stderr, "%snot measured (the frames are too small)\n", prefix.c_str());
+        return;
+    }
+    if (r.lattice)
+    {
+        std::fprintf(stderr, "%spixel grid at %.4f %s (%.1fx / %.1fx the background in the columns / rows): rendered at %.1f%% or %.1f%% of the output\n"
+                   , prefix.c_str(), r.lattice_frequency, unit, r.lattice_strength_x, r.lattice_strength_y
+                   , 100.0 * r.lattice_frequency, 100.0 * (1.0 - r.lattice_frequency));
+    }
+    else
+    {
+        std::fprintf(stderr, "%sno pixel grid (strongest peak %.1fx the background at %.4f %s; a render scale of exactly 50%% leaves none)"
+                   , prefix.c_str(), std::min(r.lattice_strength_x, r.lattice_strength_y), r.lattice_frequency, unit);
+        if (r.lattice_on_codec_grid)
+        {
+            std::fprintf(stderr, ". The peak at %.4f %s (%.1fx) lies on the block grid of video encoders: a render scale of %.1f%% or %.1f%% can't be told from it"
+                       , r.codec_frequency, unit, r.codec_strength, 100.0 * r.codec_frequency, 100.0 * (1.0 - r.codec_frequency));
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    const long long pan_frames = r.pan_frames_right + r.pan_frames_left;
+    if (r.contrast[0].empty())
+    {
+        std::fprintf(stderr, "%sno pan to measure (%lld frames of a steady horizontal pan of 4 - 64 pixels per frame, 30 needed)\n", prefix.c_str(), pan_frames);
+    }
+    else
+    {
+        std::fprintf(stderr, "%spicture entering at the edge of a pan, %lld + %lld frames (moving right + left): contrast against the picture that leaves"
+                             " down to %.2f (at %.3f %s)"
+                   , prefix.c_str(), r.pan_frames_right, r.pan_frames_left, r.lowest_contrast, r.lowest_contrast_frequency, unit);
+        if (r.half_contrast_frequency > 0.0) std::fprintf(stderr, ", one half at %.3f %s", r.half_contrast_frequency, unit);
+        if (r.recovered_age > 0) std::fprintf(stderr, "; %.2f for what entered %s", r.recovered_contrast, kResolutionAgeNames[r.recovered_age]);
+        if (r.half_contrast_frequency > 0.0)
+        {
+            std::fprintf(stderr, ": a single frame resolves about %.0f%% of the output, the rest builds up over the frames (temporal upscaling)\n"
+                       , 100.0 * std::min(1.0, 2.0 * r.half_contrast_frequency));
+        }
+        else
+        {
+            std::fprintf(stderr, ": the entering picture keeps more than half of its contrast, that tells nothing about the render scale\n");
+        }
+    }
+
+    // render resolutions are even
+    auto size = [&r](double scale) {
+        return std::to_string(2 * std::llround(scale * r.width / 2.0)) + "x" + std::to_string(2 * std::llround(scale * r.height / 2.0));
+    };
+    switch (r.source)
+    {
+    case ResolutionAnalyzer::Summary::LatticeAndPan:
+        std::fprintf(stderr, "%sestimate %s (%.1f%% of %dx%d): the scale of the pixel grid that fits the pan, not %s (%.1f%%)\n"
+                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height, size(r.other_scale).c_str(), 100.0 * r.other_scale);
+        break;
+    case ResolutionAnalyzer::Summary::Lattice:
+        std::fprintf(stderr, "%sestimate %s (%.1f%% of %dx%d) or %s (%.1f%%): the pixel grid alone can't tell which%s\n"
+                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height, size(r.other_scale).c_str(), 100.0 * r.other_scale
+                   , r.contrast[0].empty() ? ", a pan would" : ", and the picture entering in the pan lost too little contrast to");
+        break;
+    case ResolutionAnalyzer::Summary::Pan:
+        std::fprintf(stderr, "%sestimate about %s (%.0f%% of %dx%d), from the pan alone: rough, and without a pixel grid to confirm it\n"
+                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height);
+        break;
+    case ResolutionAnalyzer::Summary::None:
+        std::fprintf(stderr, "%sno estimate: no trace of upscaling found (native resolution, a render scale of 50%%, an upscaler that leaves neither trace,"
+                             " or a recording too compressed to keep one)\n", prefix.c_str());
+        break;
+    }
+}
 
 class ProgressPrinter {
 public:
@@ -506,6 +600,7 @@ int run(const Options & options)
     FramePipeline & pipeline = *pipeline_owner;
     if (options.motion) pipeline.enable_motion();
     if (!options.motion_videos.empty()) pipeline.enable_motion_detail();
+    if (options.resolution) pipeline.enable_resolution();
     const FramePipeline & sources = pipeline;
     const size_t video_count = sources.count();
 
@@ -639,6 +734,7 @@ int run(const Options & options)
             motion_analyzers.emplace_back(recorded_framerates[i], options.motion_window_ms, options.async_capture);
         }
     }
+    std::vector<ResolutionAnalyzer> resolution_analyzers(options.resolution ? video_count : 0);
     auto write_ready_rows = [&]() {
         while (!pending_rows.empty())
         {
@@ -733,6 +829,7 @@ int run(const Options & options)
                 motion_analyzers[i].push(row_counts[i].motion, analyzer.has_difference() && differences[i] == 0.0
                                        , analyzer.has_difference() ? analyzer.last_changed_shares()[i] : 1.0);
             }
+            if (options.resolution) resolution_analyzers[i].push(row_counts[i].resolution.get(), row_counts[i].motion);
 
             if (!analyzer.has_difference()) continue;
             VideoStats & s = stats[i];
@@ -865,6 +962,7 @@ int run(const Options & options)
             }
             std::fprintf(stderr, "\n");
         }
+        for (size_t i = 0; i < resolution_analyzers.size(); ++i) print_resolution(i, resolution_analyzers[i].summary());
     }
     return 0;
 }

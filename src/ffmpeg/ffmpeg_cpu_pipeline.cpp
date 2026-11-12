@@ -156,6 +156,7 @@ public:
             if (result.compared) compare_yuv(current, previous, std::max(0, video_options[i].pixel_difference), result.counts);
             else result.counts.clear();
             result.detail.reset();
+            result.resolution.reset();
             if (!_motion.empty())
             {
                 const cv::Mat luma(current->height, current->width, CV_8UC1, current->data[0], static_cast<size_t>(current->linesize[0]));
@@ -165,6 +166,12 @@ public:
                     ffmpeg::motion_picture(ffmpeg::yuv_planes(current), result.detail->picture, _scratch);
                 }
                 result.motion = _motion[i].estimate(luma, _motion_detail ? &result.detail->points : nullptr);
+                if (_resolution)
+                {
+                    // the edge columns are only used for frames of a pan
+                    result.resolution = std::make_shared<ResolutionFrame>();
+                    measure_resolution(luma, resolution_pan_usable(resolution_pan(result.motion, luma.cols, luma.rows)), *result.resolution);
+                }
             }
         }
         _analysis += Clock::now() - start;
@@ -184,6 +191,11 @@ public:
 
     void enable_motion() override { _motion.resize(_videos.size()); }
     void enable_motion_detail() override { _motion_detail = true; }
+    void enable_resolution() override
+    {
+        if (_motion.empty()) throw std::logic_error("the resolution analysis needs the motion analysis");
+        _resolution = true;
+    }
 
     double analysis_seconds() const override { return std::chrono::duration<double>(_analysis).count(); }
 
@@ -232,6 +244,7 @@ private:
     std::vector<RowCounts> _results;
     std::vector<MotionEstimator> _motion;
     bool _motion_detail = false;
+    bool _resolution = false;
     cv::Mat _scratch;
     bool _first_frames_ready = false;
     size_t _pending = 0;

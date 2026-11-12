@@ -34,6 +34,9 @@ public:
     //! also keep the picture and the tracked points of every frame (RowCounts::detail), after enable_motion().
     //! throws std::runtime_error if the pipeline can't do it
     virtual void enable_motion_detail();
+    //! also measure what the render resolution is estimated from (RowCounts::resolution), after enable_motion()
+    //! and before the first submit_next(). throws std::runtime_error if the pipeline can't do it
+    virtual void enable_resolution();
     //! The motion video of video `index`, drawn and encoded by the pipeline itself where the frames are (on
     //! the GPU): its frames get MotionDetail::gpu_picture instead of a picture. nullptr if the pipeline doesn't
     //! do that or can't here, `reason` then says why (empty: it never does). Before the first submit_next()

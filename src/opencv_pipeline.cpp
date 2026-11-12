@@ -34,6 +34,11 @@ std::unique_ptr<MotionVideoTarget> FramePipeline::start_motion_video(size_t, con
     return nullptr;
 }
 
+void FramePipeline::enable_resolution()
+{
+    throw std::runtime_error("the resolution analysis is not available with " + description());
+}
+
 void FramePipeline::enable_motion_detail()
 {
     throw std::runtime_error("the motion video is not available with " + description());
@@ -60,6 +65,7 @@ public:
         {
             std::vector<MotionField> fields(frames.size());
             std::vector<std::shared_ptr<MotionDetail>> details(frames.size());
+            std::vector<std::shared_ptr<ResolutionFrame>> resolutions(frames.size());
             for (size_t i = 0; i < frames.size(); ++i)
             {
                 cv::cvtColor(frames[i], _gray, cv::COLOR_BGR2GRAY);
@@ -74,8 +80,15 @@ public:
                     cv::cvtColor(source(cv::Rect(0, 0, size.width, size.height)), details[i]->picture, cv::COLOR_BGR2YUV_I420);
                 }
                 fields[i] = _motion[i].estimate(_gray, _motion_detail ? &details[i]->points : nullptr);
+                if (_resolution)
+                {
+                    // the edge columns are only used for frames of a pan
+                    resolutions[i] = std::make_shared<ResolutionFrame>();
+                    measure_resolution(_gray, resolution_pan_usable(resolution_pan(fields[i], _gray.cols, _gray.rows)), *resolutions[i]);
+                }
             }
             _motion_queue.push_back(std::move(fields));
+            _resolution_queue.push_back(std::move(resolutions));
             _detail_queue.push_back(std::move(details));
         }
         _engine->submit(video_options);
@@ -96,8 +109,10 @@ public:
             {
                 out[i].motion = _motion_queue.front()[i];
                 out[i].detail = std::move(_detail_queue.front()[i]);
+                out[i].resolution = std::move(_resolution_queue.front()[i]);
             }
             _motion_queue.pop_front();
+            _resolution_queue.pop_front();
             _detail_queue.pop_front();
         }
         _analysis += Clock::now() - start;
@@ -105,6 +120,11 @@ public:
 
     void enable_motion() override { _motion.resize(_sources.count()); }
     void enable_motion_detail() override { _motion_detail = true; }
+    void enable_resolution() override
+    {
+        if (_motion.empty()) throw std::logic_error("the resolution analysis needs the motion analysis");
+        _resolution = true;
+    }
 
     double analysis_seconds() const override { return std::chrono::duration<double>(_analysis).count(); }
 
@@ -125,6 +145,8 @@ private:
     std::deque<std::vector<MotionField>> _motion_queue;
     bool _motion_detail = false;
     std::deque<std::vector<std::shared_ptr<MotionDetail>>> _detail_queue;
+    bool _resolution = false;
+    std::deque<std::vector<std::shared_ptr<ResolutionFrame>>> _resolution_queue;
     cv::Mat _gray;
     cv::Mat _small;
     Clock::duration _analysis {};

@@ -60,6 +60,7 @@ add_library(trdrop SHARED
     ${TRDROP_ROOT}/src/opencv_pipeline.cpp
     ${TRDROP_ROOT}/src/motion.cpp
     ${TRDROP_ROOT}/src/motion_video.cpp
+    ${TRDROP_ROOT}/src/resolution.cpp
     ${TRDROP_ROOT}/src/video_writer.cpp
     ${TRDROP_ROOT}/src/ffmpeg/ffmpeg_decoder.cpp
     ${TRDROP_ROOT}/src/ffmpeg/ffmpeg_cpu_pipeline.cpp

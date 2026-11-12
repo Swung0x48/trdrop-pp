@@ -72,6 +72,32 @@ const uint32_t kOverlayDrawSpirv[] = {
 #include "overlay_draw.spv.inc"
 };
 
+const uint32_t kResolutionLatticeSpirv[] = {
+#include "resolution_lattice.spv.inc"
+};
+
+const uint32_t kResolutionEdgeSpirv[] = {
+#include "resolution_edge.spv.inc"
+};
+
+//! must match resolution_lattice.comp
+struct LatticePush {
+    uint32_t width;
+    uint32_t luma_row_words;
+    uint32_t rows;
+    uint32_t mode;
+    uint32_t offset;
+};
+
+//! must match resolution_edge.comp
+struct EdgePush {
+    uint32_t width;
+    uint32_t luma_row_words;
+    uint32_t row0;
+    uint32_t segments;
+    uint32_t edge;
+};
+
 //! motion video frames being drawn at the same time
 constexpr size_t kDrawSlots = 3;
 
@@ -139,6 +165,8 @@ public:
             _texture = _create_compute(kMotionTextureSpirv, sizeof(kMotionTextureSpirv), 4, sizeof(TexturePush));
             _overlay_base = _create_compute(kOverlayBaseSpirv, sizeof(kOverlayBaseSpirv), 3, sizeof(OverlayBasePush));
             _overlay_draw = _create_compute(kOverlayDrawSpirv, sizeof(kOverlayDrawSpirv), 5, sizeof(OverlayDrawPush));
+            _lattice = _create_compute(kResolutionLatticeSpirv, sizeof(kResolutionLatticeSpirv), 2, sizeof(LatticePush));
+            _edge = _create_compute(kResolutionEdgeSpirv, sizeof(kResolutionEdgeSpirv), 2, sizeof(EdgePush));
             _gpu_videos.resize(paths.size());
             _create_slots();
             for (size_t i = 0; i < paths.size(); ++i)
@@ -170,7 +198,7 @@ public:
     std::string description() const override
     {
         return "vulkan video decode + analysis (" + _device_name + ", device " + std::to_string(_device_index) + "), yuv"
-             + (_motion ? ", motion on the GPU" : "");
+             + (_motion ? ", motion on the GPU" : "") + (_resolution ? ", resolution on the GPU" : "");
     }
 
     void enable_motion() override
@@ -184,6 +212,12 @@ public:
     }
 
     void enable_motion_detail() override { _motion_detail = true; }
+
+    void enable_resolution() override
+    {
+        if (!_motion) throw std::logic_error("the resolution analysis needs the motion analysis");
+        _resolution = true;
+    }
 
     std::unique_ptr<MotionVideoTarget> start_motion_video(size_t index, const std::string & path, double fps, std::string & reason) override
     {
@@ -476,6 +510,49 @@ public:
                 write(slot_video.texture_set, texture_buffers, 4);
                 _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(motion_writes.size()), motion_writes.data(), 0, nullptr);
             }
+
+            slot_video.resolution = ResolutionLayout();
+            if (_resolution)
+            {
+                if (static_cast<uint32_t>(frame->width) > _max_workgroups) throw std::runtime_error("frame width exceeds the device limit");
+                const ResolutionLayout layout = resolution_layout(frame->width, frame->height);
+                slot_video.resolution = layout;
+                if (layout.width > 0)
+                {
+                    // read back: the sums per column and per row, the spectra of the edge columns
+                    const VkDeviceSize sums_bytes = static_cast<VkDeviceSize>(layout.width + layout.lattice_rows) * sizeof(uint32_t);
+                    const VkDeviceSize power_bytes = static_cast<VkDeviceSize>(2 * layout.edge) * kResolutionBins * sizeof(float);
+                    const std::pair<Buffer *, VkDeviceSize> read_back[2] = { { &slot_video.lattice_sums, sums_bytes }, { &slot_video.edge_power, power_bytes } };
+                    for (const auto & [buffer, bytes] : read_back)
+                    {
+                        if (buffer->size >= bytes) continue;
+                        _destroy_buffer(*buffer);
+                        *buffer = _create_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, {
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                        });
+                    }
+                    const VkDescriptorBufferInfo resolution_buffers[4] = {
+                        { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                        { slot_video.lattice_sums.buffer, 0, VK_WHOLE_SIZE },
+                        { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                        { slot_video.edge_power.buffer, 0, VK_WHOLE_SIZE },
+                    };
+                    std::array<VkWriteDescriptorSet, 4> resolution_writes {};
+                    for (uint32_t b = 0; b < 4; ++b)
+                    {
+                        resolution_writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        resolution_writes[b].dstSet = b < 2 ? slot_video.lattice_set : slot_video.edge_set;
+                        resolution_writes[b].dstBinding = b % 2;
+                        resolution_writes[b].descriptorCount = 1;
+                        resolution_writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        resolution_writes[b].pBufferInfo = &resolution_buffers[b];
+                    }
+                    _fn.vkUpdateDescriptorSets(_device, static_cast<uint32_t>(resolution_writes.size()), resolution_writes.data(), 0, nullptr);
+                }
+            }
         }
 
         // lock the decoded images while their state is read and updated
@@ -560,6 +637,8 @@ public:
             _fn.vkCmdPushConstants(slot.command_buffer, _pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &parameters[i]);
             _fn.vkCmdDispatch(slot.command_buffer, static_cast<uint32_t>(slot.videos[i].height), 1, 1);
         }
+
+        if (_resolution) _record_resolution(slot);
 
         // motion video on the GPU: the pictures of the frames
         bool base_bound = false;
@@ -685,6 +764,8 @@ public:
                 else _read_picture(slot_video, result.detail->picture);
             }
             if (_motion) _read_motion(slot_video, result.motion, _motion_detail ? &result.detail->points : nullptr);
+            result.resolution.reset();
+            if (_resolution && slot_video.resolution.width > 0) result.resolution = _read_resolution(slot_video);
             // the decoded image can be reused by the decoder
             av_frame_unref(slot_video.frame);
         }
@@ -769,6 +850,12 @@ private:
         VkDescriptorSet select_set = VK_NULL_HANDLE;
         VkDescriptorSet texture_set = VK_NULL_HANDLE;
         MotionLayout motion;
+        // resolution: the sums of the pixel grid and the spectra of the edge columns are read back
+        Buffer lattice_sums;
+        Buffer edge_power;
+        VkDescriptorSet lattice_set = VK_NULL_HANDLE;
+        VkDescriptorSet edge_set = VK_NULL_HANDLE;
+        ResolutionLayout resolution;
         bool motion_estimated = false;
         //! the dispatches for sparse motion were recorded
         bool sparse_possible = false;
@@ -880,6 +967,70 @@ private:
             copy(1, chroma, 0, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
             copy(2, chroma, plan.v_offset, plan.chroma_width, plan.chroma_width, plan.chroma_height, sx, sy);
         }
+    }
+
+    //! --resolution: the sums for the pixel grid and the spectra of the edge columns of the frames of the slot
+    void _record_resolution(Slot & slot)
+    {
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lattice.pipeline);
+        for (const SlotVideo & slot_video : slot.videos)
+        {
+            const ResolutionLayout & layout = slot_video.resolution;
+            if (layout.width == 0) continue;
+            _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _lattice.layout, 0, 1, &slot_video.lattice_set, 0, nullptr);
+            // per column, then per row
+            LatticePush push {};
+            push.width = static_cast<uint32_t>(layout.width);
+            push.luma_row_words = slot_video.plan.luma_row_words;
+            push.rows = static_cast<uint32_t>(layout.lattice_rows);
+            _fn.vkCmdPushConstants(slot.command_buffer, _lattice.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, push.width, 1, 1);
+            push.mode = 1;
+            push.offset = push.width;
+            _fn.vkCmdPushConstants(slot.command_buffer, _lattice.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, push.rows, 1, 1);
+        }
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _edge.pipeline);
+        for (const SlotVideo & slot_video : slot.videos)
+        {
+            const ResolutionLayout & layout = slot_video.resolution;
+            if (layout.width == 0 || layout.segments < 1) continue;
+            EdgePush push {};
+            push.width = static_cast<uint32_t>(layout.width);
+            push.luma_row_words = slot_video.plan.luma_row_words;
+            push.row0 = static_cast<uint32_t>(layout.row0);
+            push.segments = static_cast<uint32_t>(layout.segments);
+            push.edge = static_cast<uint32_t>(layout.edge);
+            _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _edge.layout, 0, 1, &slot_video.edge_set, 0, nullptr);
+            _fn.vkCmdPushConstants(slot.command_buffer, _edge.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, 2 * push.edge, 1, 1);
+        }
+    }
+
+    //! what --resolution measured of the frame of a slot
+    std::shared_ptr<ResolutionFrame> _read_resolution(const SlotVideo & slot_video)
+    {
+        const ResolutionLayout & layout = slot_video.resolution;
+        std::shared_ptr<ResolutionFrame> frame = std::make_shared<ResolutionFrame>();
+        frame->layout = layout;
+        for (const Buffer * buffer : { &slot_video.lattice_sums, &slot_video.edge_power })
+        {
+            if (buffer->coherent) continue;
+            VkMappedMemoryRange range { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            range.memory = buffer->memory;
+            range.size = VK_WHOLE_SIZE;
+            check(_fn.vkInvalidateMappedMemoryRanges(_device, 1, &range), "vkInvalidateMappedMemoryRanges");
+        }
+        const uint32_t * sums = static_cast<const uint32_t *>(slot_video.lattice_sums.mapped);
+        frame->column_sums.assign(sums, sums + layout.width);
+        frame->row_sums.assign(sums + layout.width, sums + layout.width + layout.lattice_rows);
+        if (layout.segments >= 1)
+        {
+            const float * power = static_cast<const float *>(slot_video.edge_power.mapped);
+            frame->edge_power.assign(power, power + static_cast<size_t>(2 * layout.edge) * kResolutionBins);
+            frame->edges = true;
+        }
+        return frame;
     }
 
     //! builds the luma pyramids of the frames of the slot and tracks the points from the previous frames
@@ -1512,9 +1663,10 @@ private:
         const uint32_t set_count = static_cast<uint32_t>(kSlots * _videos.size());
         // ... and the picture of the motion video; a set per motion video frame being drawn
         // ... and for sparse motion what the grid found and the texture
-        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 4 + 3 + 3 + 4) * set_count + 5 * static_cast<uint32_t>(kDrawSlots) };
+        // ... and for the resolution the pixel grid and the edge columns
+        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 4 + 3 + 3 + 4 + 2 + 2) * set_count + 5 * static_cast<uint32_t>(kDrawSlots) };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pool_info.maxSets = 6 * set_count + static_cast<uint32_t>(kDrawSlots);
+        pool_info.maxSets = 8 * set_count + static_cast<uint32_t>(kDrawSlots);
         pool_info.poolSizeCount = 1;
         pool_info.pPoolSizes = &pool_size;
         check(_fn.vkCreateDescriptorPool(_device, &pool_info, nullptr, &_descriptor_pool), "vkCreateDescriptorPool");
@@ -1553,6 +1705,10 @@ private:
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.texture_set), "vkAllocateDescriptorSets");
                 set_info.pSetLayouts = &_overlay_base.set_layout;
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.base_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_lattice.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.lattice_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_edge.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.edge_set), "vkAllocateDescriptorSets");
             }
         }
         for (DrawSlot & slot : _draw_slots)
@@ -1662,6 +1818,8 @@ private:
                     _destroy_buffer(video.sparse_state);
                     _destroy_buffer(video.picture_luma);
                     _destroy_buffer(video.picture_chroma);
+                    _destroy_buffer(video.lattice_sums);
+                    _destroy_buffer(video.edge_power);
                 }
                 if (slot.fence) _fn.vkDestroyFence(_device, slot.fence, nullptr);
                 slot.fence = VK_NULL_HANDLE;
@@ -1678,6 +1836,8 @@ private:
             _destroy_compute(_lk);
             _destroy_compute(_select);
             _destroy_compute(_texture);
+            _destroy_compute(_lattice);
+            _destroy_compute(_edge);
             if (_command_pool) _fn.vkDestroyCommandPool(_device, _command_pool, nullptr);
             if (_descriptor_pool) _fn.vkDestroyDescriptorPool(_device, _descriptor_pool, nullptr);
             if (_pipeline) _fn.vkDestroyPipeline(_device, _pipeline, nullptr);
@@ -1737,6 +1897,10 @@ private:
     Compute _select;
     Compute _texture;
     MotionCellBinner _binner;
+    // resolution: the pixel grid and the edge columns
+    bool _resolution = false;
+    Compute _lattice;
+    Compute _edge;
 
     VkDescriptorSetLayout _set_layout = VK_NULL_HANDLE;
     VkPipelineLayout _pipeline_layout = VK_NULL_HANDLE;

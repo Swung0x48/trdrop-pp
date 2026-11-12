@@ -1,0 +1,86 @@
+#version 450
+// --resolution, picture entering at the edge of a pan (resolution.h): the vertical spectrum of the columns next
+// to the left and the right edge. One workgroup per column: the columns 0 ... edge - 1 from the left edge, then
+// those from the right edge, the outermost first. Per column the mean power of `segments` segments of 64 rows
+// (Hann window, every 32 rows, starting at row0) in the bins 3 ... 30 of their DFT.
+// The same numbers as measure_resolution() on the CPU, up to the rounding of the sums.
+//
+// luma: 4 pixels per word, luma_row_words words per row
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Luma  { uint luma[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Power { float power[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint luma_row_words;
+    uint row0;
+    uint segments;
+    uint edge;
+} params;
+
+const uint kSegment = 64u;
+const uint kHop = 32u;
+const uint kFirstBin = 3u;
+const uint kBins = 28u;
+
+shared float partial_power[64 * 28];
+
+float pixel(uint x, uint y)
+{
+    return float((luma[y * params.luma_row_words + (x >> 2u)] >> ((x & 3u) * 8u)) & 0xFFu);
+}
+
+void main()
+{
+    const uint column = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint x = column < params.edge ? column : params.width - 1u - (column - params.edge);
+
+    // cos / sin of 2 pi j / 64
+    float table_cos[64];
+    float table_sin[64];
+    for (uint j = 0u; j < kSegment; ++j)
+    {
+        const float angle = 6.28318530717958647692 * float(j) / float(kSegment);
+        table_cos[j] = cos(angle);
+        table_sin[j] = sin(angle);
+    }
+
+    float sum[28];
+    for (uint b = 0u; b < kBins; ++b) sum[b] = 0.0;
+    // the lanes share the segments
+    for (uint segment = lane; segment < params.segments; segment += gl_WorkGroupSize.x)
+    {
+        float re[28];
+        float im[28];
+        for (uint b = 0u; b < kBins; ++b)
+        {
+            re[b] = 0.0;
+            im[b] = 0.0;
+        }
+        const uint y0 = params.row0 + segment * kHop;
+        for (uint n = 0u; n < kSegment; ++n)
+        {
+            const float value = pixel(x, y0 + n) * (0.5 - 0.5 * table_cos[n]);
+            for (uint b = 0u; b < kBins; ++b)
+            {
+                const uint j = ((kFirstBin + b) * n) & (kSegment - 1u);
+                re[b] += value * table_cos[j];
+                im[b] -= value * table_sin[j];
+            }
+        }
+        for (uint b = 0u; b < kBins; ++b) sum[b] += re[b] * re[b] + im[b] * im[b];
+    }
+    for (uint b = 0u; b < kBins; ++b) partial_power[lane * kBins + b] = sum[b];
+    barrier();
+
+    // lane b adds up bin b
+    if (lane < kBins)
+    {
+        float total = 0.0;
+        for (uint other = 0u; other < gl_WorkGroupSize.x; ++other) total += partial_power[other * kBins + lane];
+        power[column * kBins + lane] = total / float(params.segments);
+    }
+}

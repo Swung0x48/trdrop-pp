@@ -83,6 +83,8 @@ struct Options {
     //! the capture didn't run in step with what it recorded: a picture may have been recorded up to one
     //! interval late and pictures may be missing (see MotionAnalyzer)
     bool async_capture = false;
+    //! estimate the render resolution of an upscaled picture (ResolutionAnalyzer), needs the motion
+    bool resolution = false;
     //! per input video: file for a copy of the video with its motion drawn on it (empty: none)
     std::vector<std::string> motion_videos;
     //! the arrows of the motion video are drawn this many times longer than the motion

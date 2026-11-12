@@ -9,6 +9,7 @@
 
 #include "motion.h"
 #include "options.h"
+#include "resolution.h"
 
 namespace trdrop {
 
@@ -25,6 +26,8 @@ struct RowCounts {
     MotionField motion;
     //! the picture and the tracked points for the motion video (FramePipeline::enable_motion_detail)
     std::shared_ptr<MotionDetail> detail;
+    //! what the render resolution is estimated from, only if the pipeline measures it (FramePipeline::enable_resolution)
+    std::shared_ptr<ResolutionFrame> resolution;
 };
 
 //! Computes the per pixel part of the analysis: grayscale conversion, the difference to the

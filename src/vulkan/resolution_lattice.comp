@@ -1,0 +1,61 @@
+#version 450
+// --resolution, pixel grid (resolution.h): sums of |second difference| of the luma.
+// mode 0: one workgroup per column x, sum over the rows < rows of |p[x-1] - 2 p[x] + p[x+1]|
+// mode 1: one workgroup per row y < rows, sum over the columns of |p[y-1] - 2 p[y] + p[y+1]|
+// The first and the last column / row get 0. Integers: the same sums as measure_resolution() on the CPU.
+//
+// luma: 4 pixels per word, luma_row_words words per row
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Luma { uint luma[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Sums { uint sums[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint luma_row_words;
+    uint rows;      // the rows [0, rows) are used
+    uint mode;
+    uint offset;    // of this mode's sums in the buffer
+} params;
+
+shared uint partial_sums[64];
+
+int pixel(uint x, uint y)
+{
+    return int((luma[y * params.luma_row_words + (x >> 2u)] >> ((x & 3u) * 8u)) & 0xFFu);
+}
+
+void main()
+{
+    const uint id = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+
+    uint sum = 0u;
+    if (params.mode == 0u)
+    {
+        if (id >= 1u && id + 1u < params.width)
+        {
+            for (uint y = lane; y < params.rows; y += gl_WorkGroupSize.x)
+            {
+                sum += uint(abs(pixel(id - 1u, y) - 2 * pixel(id, y) + pixel(id + 1u, y)));
+            }
+        }
+    }
+    else if (id >= 1u && id + 1u < params.rows)
+    {
+        for (uint x = lane; x < params.width; x += gl_WorkGroupSize.x)
+        {
+            sum += uint(abs(pixel(x, id - 1u) - 2 * pixel(x, id) + pixel(x, id + 1u)));
+        }
+    }
+
+    partial_sums[lane] = sum;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride /= 2u)
+    {
+        if (lane < stride) partial_sums[lane] += partial_sums[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) sums[params.offset + id] = partial_sums[0];
+}

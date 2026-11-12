@@ -14,6 +14,7 @@ really shows, independent of what an on-screen counter claims:
 | How long does a picture stay on screen? | frametime (`vN_frametime_ms`) |
 | Are there torn frames? | tears (`vN_tears`, `--tears`) |
 | Does the motion advance evenly, i.e. does it *look* smooth? | `--motion`: animation error, perceived smoothness |
+| At which resolution was an upscaled picture rendered? | `--resolution`: the `vN resolution:` lines of the summary |
 
 The last one is the reason to prefer this tool over counting frames: 60 new frames per second whose
 animation advances by 0.5, 1.5, 0.5, 1.5 ... intervals has a perfect framerate and frametime graph, but
@@ -144,6 +145,7 @@ number came from when several were analyzed.
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |
 | No GPU, a GPU error, or results must not depend on the GPU | `--no-vk` (CPU only), or `--decode ffmpeg` |
 | Several GPUs | `--list-vkdevices`, then `--vkdevice <n>` |
+| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan tells which - and an estimate. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera |
 | Timings look wrong | another program is using the GPU; the results are unaffected, only the speed |
 
 ## Captures that are not in step with the game
@@ -181,3 +183,7 @@ Knowing these keeps the report honest:
   because such frames count as torn. The motion line is the better source then.
 - It measures the recording. Whether unevenness comes from the game or from the capture can not be told from
   the file alone; `--async-capture` is an assumption about the capture, not a measurement of it.
+- `--resolution` was checked against one known answer only (DLSS at 33% of 4K). Report its measurements and
+  call the resolution an estimate. "No pixel grid" does not mean native resolution: a render scale of exactly
+  50% leaves none, 25% and 75% hide behind the encoder's own grid, and a strongly compressed recording loses
+  it. A pixel grid also appears when the console or the capture program scaled the picture.
