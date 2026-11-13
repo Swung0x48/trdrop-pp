@@ -477,7 +477,7 @@ v1 resolution: candidate 2: 2560x1440 (66.7% of 3840x2160) - low confidence: the
 
 The CSV is the same with and without the option.
 
-The confidence is a level of the rules below, not a probability - 25 recordings with a known setting are too
+The confidence is a level of the rules below, not a probability - 29 recordings with a known setting are too
 few to count one:
 
 | confidence | what was found |
@@ -518,10 +518,12 @@ few to count one:
    half of what entered with the frame) is down to one half is read as what a single frame resolves: half its
    sampling rate, so twice that frequency is the render scale. Of the two scales the pixel grid allows, the one
    nearer to it gets the high confidence. That held for DLSS at 33%, which smooths what has no history.
-   TSR, FSR 3 and "NXSR" show it as it was rendered, aliased: there the newest columns have more contrast than
-   the leaving picture (1.3 to 2.4 times) and lose it as they age - an upward fan. It counts if the newest
-   columns reach 1.25 at some frequency, the oldest columns measured (2 - 3 frames old at least) are back to
-   half of that excess there, and both directions of the pan have frames. Its shape doesn't give the scale -
+   TSR, FSR 2.1, FSR 3, "NXSR" and DLSS 4.5 at 50% show it as it was rendered, aliased: there the newest
+   columns have more contrast than the leaving picture (1.3 to 2.4 times) and lose it as they age - an upward
+   fan. So the direction of the fan doesn't tell whose upscaler it is: DLSS at 33% gave a downward one, DLSS 4
+   at 50% neither, DLSS 4.5 at 50% an upward one. The upward fan counts if the newest columns reach 1.25 at
+   some frequency, the oldest columns measured (2 - 3 frames old at least) are back to half of that excess
+   there, and both directions of the pan have frames. Its shape doesn't give the scale -
    where it peaks follows the scale within recordings of one place (0.40 times the scale in one, 0.60 in
    another) - but in all four recordings with such a fan and a pixel grid the larger scale of the grid was
    the true one, so that one goes first, with medium confidence.
@@ -530,9 +532,9 @@ few to count one:
    other way and 15 of them moved this way - then what leaves at the other edge has been on the screen for a
    while. 30 such frames are needed.
 3. The stair steps of that entering picture. An edge that is nearly level climbs one pixel at a time when it
-   is rendered. An upscaler that shows what has no history as it was rendered (XeSS, FSR 3, TSR, "NXSR") shows
-   those steps, one rendered pixel high: 1 / r output pixels, 3 at a render scale of 33%, 2 at 50%. A few
-   frames later they are smoothed away. In the columns that entered within about 3 frames (at least 32) and in
+   is rendered. An upscaler that shows what has no history as it was rendered (XeSS, FSR 2.1, FSR 3, TSR,
+   "NXSR"; DLSS 4.5 in part) shows those steps, one rendered pixel high: 1 / r output pixels, 3 at a render
+   scale of 33%, 2 at 50%. A few frames later they are smoothed away. In the columns that entered within about 3 frames (at least 32) and in
    as many columns of the leaving edge, the row of the strongest step from one row to the next is taken per
    column, in bands of 48 rows every 24 rows of the part of the height that the pan uses. Where those rows form
    one edge that stays inside the band (a median step of 10 grey levels, neighbouring columns at most 3 rows
@@ -612,6 +614,27 @@ steps in the entering picture, 76% of them 2 pixels or higher (55% are 3 pixels)
 20697 in the leaving picture, 89% of them 1 pixel - 1280x720 high, 2560x1440 low. The driving recording has
 no pan and stays at the pair.
 
+A fourth round of four 4K60 recordings, recorded lossless (HEVC; the encoder's peak at 0.25 is 0.9 - 1.5x
+there, against 3 - 7x in the rounds before), was analyzed with the program as it is now, before the settings
+were known - the first test of the current rules. All four were set to 50%. The stair steps are the share of 2
+pixels or higher in the entering / the leaving picture.
+
+| setting | pixel grid; peak at 0.5 (columns / rows) | pan: contrast of the entering picture | stair steps | candidates |
+| --- | --- | --- | --- | --- |
+| FSR 3 at 50% | none (1.6x); 6.7x / 7.0x | upward fan: up to 1.38 (at 0.20), 0.72 at 0.47 | 34: 56% / 21% (too few) | 1920x1080, low - right |
+| DLSS 4 performance (50%) | none (1.6x); 22.0x / 17.7x | 0.87 - 1.04: neither | 40: 82% / 8% (too few) | 1920x1080, low - right |
+| DLSS 4.5 performance (50%) | none (1.2x); 1.8x / 2.7x | upward fan: up to 1.46 (at 0.44) | 9588: 40% / 8% | none - missed |
+| FSR 2.1 performance (50%) | none (1.4x); 7.7x / 11.8x | upward fan: up to 2.07 (at 0.28) | 5266: 90% / 16% | 1920x1080, medium - right |
+
+The recording of FSR 3 has the fan of those of the third round at 50% and below (they peak at 0.203 - 0.206).
+DLSS 4 at 50% leaves a strong peak at 0.5 when it is recorded lossless; the six compressed recordings of DLSS
+at 50% above had none. DLSS 4.5 left almost none, and its stair steps are in between: a third of them 2
+pixels high in the entering picture against 4% in the leaving one - the high ones 2.1 pixels on average,
+which would read 48% - but not the 60% that count. Such a mix of 1 and 2 pixels doesn't tell a picture at
+50% that was smoothed in part from one above 50% shown as it was rendered, which has steps of 1 and 2 pixels
+by itself (FSR 3 at 66%: 29% of 99 steps). Read by eye before the setting was known, this recording was
+taken for about 67%: wrong.
+
 Where a grid was found, in all rounds, it was at the true scale. Of its two scales the larger one was the
 true one in six recordings, the smaller one in four: the two of DLSS and the two of XeSS at 33%.
 
@@ -640,6 +663,9 @@ Recording for it:
   files of 800 Mbit/s for nothing. (Another 12 seconds of it at QP 20 / 24 / 28 - 63 / 34 / 18 Mbit/s: 8.0x /
   6.5x, 6.2x / 4.7x, 4.2x / 3.2x, one half at 0.170 / 0.188 / 0.201, 1280x720 first in all three, and neither
   a peak of one axis nor one at 0.5.)
+
+  Or lossless: the four recordings of the fourth round have no block grid of the encoder left (0.9 - 1.5x
+  at 0.25), so a peak at 0.25 would be the render scale's. They are large - 3 to 8 GB for 25 - 45 seconds.
 * in the game: stand still and turn the camera sideways at an even speed, a full turn in about 10 seconds
   (20 - 30 pixels per frame at 4K), in both directions; motion blur, depth of field, film grain, sharpening
   and frame generation off; a scene with fine, irregular texture in every direction around (foliage, bushes,
@@ -649,17 +675,20 @@ Recording for it:
 
 Limits:
 
-* It was checked against 25 recordings with a known setting (the tables above), and none of them is a test
-  of the rules as they are now: the rule for a peak of one axis was made from the seven of the second round,
-  those for the peak at 0.5 and for the upward fan from the second and the third, the threshold of 10 spreads
-  so that the short recordings of a still scene stay silent, the rule for the skirt of an encoder's peak
-  from two of those, and the numbers of the stair steps from one recording of XeSS. The third round was a
-  test of the rules before it: the grids were right, the recording at 50% was missed. Read the lines with
+* It was checked against 29 recordings with a known setting (the tables above). Only the four of the fourth
+  round are a test of the rules as they are now - three right, one missed, all at 50%: the rule for a peak
+  of one axis was made from the seven of the second round, those for the peak at 0.5 and for the upward fan
+  from the second and the third, the threshold of 10 spreads so that the short recordings of a still scene
+  stay silent, the rule for the skirt of an encoder's peak from two of those, and the numbers of the stair
+  steps from one recording of XeSS. The third round was a test of the rules before it: the grids were right,
+  the recording at 50% was missed. Read the lines with
   the measurements, the candidates are their interpretation - and
   [look at the data](#judging-a-recording-yourself---resolution-data) when the program finds nothing.
 * 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: no
-  recording that was surely rendered at one of them has been tried. 50% is only found if its peak at 0.5 is not small against the encoder's at 0.25 - two of the
-  eight recordings at 50%; the six that were missed are short, strongly compressed recordings of DLSS. A game
+  recording that was surely rendered at one of them has been tried. 50% is only found if its peak at 0.5 is
+  not small against the encoder's at 0.25 - five of the twelve recordings at 50%; six that were missed are
+  short, strongly compressed recordings of DLSS, the seventh is DLSS 4.5, which left 1.8x / 2.7x there even
+  recorded lossless. A game
   that doesn't take a setting gives the candidate of what it rendered (the third round). Native resolution
   leaves no trace either, so "no candidate" says little.
 * The stair steps need straight edges that are nearly level - a road, buildings; a courtyard with trees gave
@@ -667,8 +696,9 @@ Limits:
   DLSS at 33% had 49% of high steps and stayed below what counts, where the pan tells. They say nothing above
   a render scale of about 60%. Two recordings fell short of the 60% that count: 47% high steps for "NXSR" at
   50% and 42% for the one set to TSR at 25% - whose high steps are 2 pixels (2.1 on average of 628 steps), not
-  4, so it looks rendered at 50% like the FSR 3 recordings set below 50%. One recording was decided with the
-  steps, one more agrees.
+  4, so it looks rendered at 50% like the FSR 3 recordings set below 50%. DLSS 4.5 at 50% had 40% (9588
+  steps) and was missed. A mix of steps of 1 and 2 pixels gives no scale: it is what a partly smoothed
+  picture at 50% and a picture above 50% both show. One recording was decided with the steps, two more agree.
 * A grid that only one axis has is a weak trace. Why DLSS 4 left none in the columns of those two recordings
   is not known (they are driving scenes; motion blur along the motion is a guess). A HUD or a pattern that
   stays in the picture gives such a peak too.
@@ -676,8 +706,9 @@ Limits:
   picture loses detail. With TSR at 72%, "NXSR" at 50% and FSR 3 the entering picture had up to 2.4 times
   the contrast of the leaving one - aliased, not blurred: the upward fan, which puts the larger scale first
   because it was the true one four times out of four, not because of a reason that is understood. With XeSS
-  at 33% the newest columns were neither, and in the recording set to TSR at 25% the two were alike. So a pan
-  that says nothing doesn't rule out a temporal upscaler.
+  at 33% the newest columns were neither, and in the recordings set to TSR at 25% and DLSS 4 at 50% the two
+  were alike. So a pan that says nothing doesn't rule out a temporal upscaler, and the direction of the fan
+  doesn't name one: DLSS 4.5 at 50% gave an upward fan.
 * A pixel grid says that the picture was scaled, not by whom: the game, the console's output or the capture
   (a capture program that scales its source to a larger canvas) all leave the same one.
 * One scale for the whole video: a render scale that changes with the load smears the peak.

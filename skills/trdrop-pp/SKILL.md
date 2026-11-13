@@ -183,11 +183,13 @@ Knowing these keeps the report honest:
   because such frames count as torn. The motion line is the better source then.
 - It measures the recording. Whether unevenness comes from the game or from the capture can not be told from
   the file alone; `--async-capture` is an assumption about the capture, not a measurement of it.
-- `--resolution` was checked against 25 recordings with a known setting. Where it found a pixel grid the
+- `--resolution` was checked against 29 recordings with a known setting; the last four, at 50% and recorded
+  lossless, were the first test of the current rules: three right, DLSS 4.5 missed. Where it found a pixel grid the
   scale was right. Which of the two scales (r or 1 - r) the pan told for DLSS at 33% and the stair steps of
   the entering picture for XeSS at 33% (the `stair steps` line: it needs straight, nearly level edges in the
   picture and a pan); with an "upward fan" (the summary says so) the larger scale goes first, which was right
-  four times out of four but is not understood. It missed TSR at 25% and most recordings at 50%, and it reports what the game rendered, not
+  four times out of four but is not understood; the direction of the fan doesn't name the upscaler (DLSS 4.5
+  showed an upward one). It missed TSR at 25% and most recordings at 50%, and it reports what the game rendered, not
   what was set (FSR 3 set to 25% and 33% looked exactly like 50%). Report its measurements and call the
   resolutions candidates. "No candidate" does not mean native resolution: 25% and 75% hide behind the
   encoder's own grid, 50% shows only if its peak is not small against it, and a strongly compressed

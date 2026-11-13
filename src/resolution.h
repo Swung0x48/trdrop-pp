@@ -30,8 +30,8 @@ namespace trdrop {
 //! The vertical spectrum of the columns next to that edge is compared with the same columns of the other edge,
 //! where the picture leaves after it crossed the screen: where the contrast of the entering picture falls
 //! tells how fine a single frame resolves. Vertical, because the motion blur of a horizontal pan is horizontal.
-//! That held for DLSS at 33% (two recordings); with TSR at 72%, FSR 3 and others the entering picture had as much
-//! contrast as the leaving one or more, and the pan says nothing.
+//! That held for DLSS at 33% (two recordings); with TSR at 72%, FSR 3, DLSS 4 and 4.5 at 50% and others the
+//! entering picture had as much contrast as the leaving one or more, and the pan says nothing.
 //!
 //! Stair steps. An upscaler that shows what has no history as it was rendered shows the stair steps of the
 //! rendering there: an edge that is nearly level climbs one rendered pixel at a time, 1 / r output pixels. In the
@@ -209,7 +209,7 @@ public:
 
         //! an upward fan: the entering picture has more contrast than the leaving one and loses it with its age, in
         //! both directions of the pan. A temporal upscaler that shows the pixels without history as they were
-        //! rendered - aliased - where DLSS smooths them (TSR, FSR 3, "NXSR" did)
+        //! rendered - aliased - where DLSS at 33% smoothed them (TSR, FSR 2.1, FSR 3, "NXSR", DLSS 4.5 at 50% did)
         bool fan_up = false;
         //! the contrast of the oldest columns measured at that frequency (0: none), and their age
         double recovered_contrast = 0.0;

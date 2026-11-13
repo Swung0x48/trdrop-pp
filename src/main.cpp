@@ -111,10 +111,10 @@ resolution (render resolution of an upscaled picture):
                                the picture that enters at the edge of a horizontal pan - a
                                temporal upscaler has no earlier frames for it. With DLSS at
                                33% it showed what a single rendered frame resolves and picked
-                               the right scale of the two; with TSR, FSR 3 and others it said
-                               nothing. That needs a steady pan of 4 - 64 pixels per frame;
+                               the right scale of the two; with TSR, FSR, DLSS 4.5 and others
+                               not. That needs a steady pan of 4 - 64 pixels per frame;
                                the stair steps of that entering picture - an upscaler that
-                               shows new pixels as they were rendered (XeSS, FSR 3, TSR) shows
+                               shows new pixels as they were rendered (XeSS, FSR, TSR) shows
                                nearly level edges climbing one rendered pixel at a time: steps
                                of 3 output pixels are a render scale of 33%. Needs straight
                                edges in the picture, and says nothing above about 60%.
