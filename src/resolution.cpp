@@ -92,6 +92,14 @@ constexpr double kFanMinContrast = 1.25;
 constexpr double kFanSettled = 0.5;
 //! video encoders work in blocks of 4 - 64 pixels: peaks at multiples of 1 / 32 are theirs
 constexpr double kCodecGrid = 32.0;
+//! recorded lossless: the second harmonic of a grid picks one of its two scales. A picture enlarged by a whole
+//! factor k (25%: 4) is straight between the rendered pixels and bends at them, its mean second difference is a row
+//! of spikes every k pixels, whose harmonic is as strong as the grid; above 50% the rendered pixels are less than 2
+//! output pixels apart and the profile is near a sine. The harmonic at this share of the grid's strength or more in
+//! both axes: the smaller scale; at kHarmonicLarge or less in both: the larger one. Measured: 25% 0.56 / 1.0
+//! (columns / rows), 75% 0.12 / 0.19 (both lossless), 66 - 80% 0.08 - 0.31 (four lossy recordings)
+constexpr double kHarmonicSmall = 0.45;
+constexpr double kHarmonicLarge = 0.35;
 //! frames of a pan needed for its result
 constexpr long long kMinPanFrames = 30;
 
@@ -614,7 +622,8 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
             if (frequency < kLatticeMinFrequency || frequency > below_half) continue;
             const double rows = strongest_near(sy, ny, frequency, tolerance);
             const double both = std::min(sx[k], rows);
-            const double off_grid = block_grid_distance(frequency);
+            // lossless: no encoder, its grid is like any other frequency
+            const double off_grid = _lossless ? 1.0 : block_grid_distance(frequency);
             if (off_grid <= tolerance)
             {
                 if (both > best_codec)
@@ -659,7 +668,7 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
         {
             const double frequency = static_cast<double>(j) / ny;
             if (frequency < kLatticeMinFrequency || frequency > below_half) continue;
-            if (sy[j] < one_axis_y || block_grid_distance(frequency) <= kOneAxisCodecGap) continue;
+            if (sy[j] < one_axis_y || (!_lossless && block_grid_distance(frequency) <= kOneAxisCodecGap)) continue;
             const double columns = strongest_near(sx, nx, frequency, tolerance);
             if (std::min(sy[j], columns) >= kLatticeMinStrength) continue;        // a peak of both axes, found above
             Summary::Peak peak;
@@ -673,11 +682,14 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
         }
         result.lattice = best >= kLatticeMinStrength;
         result.codec_peak = best_codec >= kLatticeMinStrength;
-        // those of both axes first, the strongest first; what lies next to a peak that was taken belongs to it
+        // those of both axes first, the strongest first; what lies next to a peak that was taken belongs to it. The
+        // rows are taken as the strongest bin near the frequency, so where they are the weaker axis the bins next to
+        // the peak of the columns score the same as it: then the stronger bin of the columns
         std::stable_sort(found.begin(), found.end(), [](const Found & a, const Found & b) {
             const bool a_both = a.peak.axes == Summary::Peak::Both, b_both = b.peak.axes == Summary::Peak::Both;
             if (a_both != b_both) return a_both;
-            return a.score > b.score;
+            if (a.score != b.score) return a.score > b.score;
+            return a.peak.strength_x > b.peak.strength_x;
         });
         for (const Found & candidate : found)
         {
@@ -694,14 +706,30 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
         auto last_bins = [](const std::vector<double> & strength) {
             return strength.size() < 2 ? 0.0 : std::max(strength[strength.size() - 1], strength[strength.size() - 2]);
         };
+        // the second harmonic of each grid, folded back below 0.5
+        for (Summary::Peak & peak : result.peaks)
+        {
+            const double doubled = 2.0 * peak.frequency;
+            peak.harmonic_frequency = doubled > 0.5 ? 1.0 - doubled : doubled;
+            const bool at_half = peak.harmonic_frequency > below_half;
+            const double grid_x = strongest_near(sx, nx, peak.frequency, tolerance), grid_y = strongest_near(sy, ny, peak.frequency, tolerance);
+            const double harmonic_x = at_half ? last_bins(sx) : strongest_near(sx, nx, peak.harmonic_frequency, tolerance);
+            const double harmonic_y = at_half ? last_bins(sy) : strongest_near(sy, ny, peak.harmonic_frequency, tolerance);
+            peak.harmonic_share_x = grid_x > 0.0 ? harmonic_x / grid_x : 0.0;
+            peak.harmonic_share_y = grid_y > 0.0 ? harmonic_y / grid_y : 0.0;
+        }
         result.half_strength_x = last_bins(sx);
         result.half_strength_y = last_bins(sy);
         result.quarter_strength_x = strongest_near(sx, nx, 0.25, tolerance);
         result.quarter_strength_y = strongest_near(sy, ny, 0.25, tolerance);
         result.half_present = result.half_strength_x >= kLatticeMinStrength && result.half_strength_y >= kLatticeMinStrength;
-        result.half_peak = result.half_present && result.half_strength_x >= kHalfPeakShare * result.quarter_strength_x
-                        && result.half_strength_y >= kHalfPeakShare * result.quarter_strength_y;
+        // lossless: nothing at 0.25 is the encoder's; a grid there (25% or 75%) has its harmonic at 0.5
+        result.half_peak = _lossless
+                         ? result.half_present && std::min(result.quarter_strength_x, result.quarter_strength_y) < kLatticeMinStrength
+                         : result.half_present && result.half_strength_x >= kHalfPeakShare * result.quarter_strength_x
+                           && result.half_strength_y >= kHalfPeakShare * result.quarter_strength_y;
     }
+    result.lossless = _lossless;
 
     // ---- picture entering at the edge of a pan
     result.pan_frames_right = _pan_frames[0];
@@ -827,6 +855,14 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
             a = to_smaller < to_larger ? smaller : 1.0 - smaller;
             b = 1.0 - a;
         }
+        // recorded lossless: the second harmonic, if it lies apart from the grid (at 1 / 3 it falls on it)
+        bool harmonic = false;
+        if (_lossless && !picked && !stepped && peak.axes == Summary::Peak::Both && std::abs(peak.harmonic_frequency - peak.frequency) >= kPeakApart)
+        {
+            if (std::min(peak.harmonic_share_x, peak.harmonic_share_y) >= kHarmonicSmall) { a = smaller; harmonic = true; }
+            else if (std::max(peak.harmonic_share_x, peak.harmonic_share_y) <= kHarmonicLarge) { a = 1.0 - smaller; harmonic = true; }
+            if (harmonic) b = 1.0 - a;
+        }
         const int index = static_cast<int>(i);
         if (peak.axes != Summary::Peak::Both)
         {
@@ -847,6 +883,11 @@ ResolutionAnalyzer::Summary ResolutionAnalyzer::summary() const
         {
             add(a, Candidate::High, Candidate::GridAndStairs, index);
             add(b, Candidate::Low, Candidate::GridAgainstStairs, index);
+        }
+        else if (harmonic)
+        {
+            add(a, Candidate::Medium, Candidate::GridAndHarmonic, index);
+            add(b, Candidate::Low, Candidate::GridAgainstHarmonic, index);
         }
         else if (result.fan_up)
         {
@@ -891,6 +932,7 @@ void ResolutionAnalyzer::write_data(std::ostream & out, const std::string & vide
     out << "# grid_frames: " << _lattice_frames << "\n# grid_rows: " << _layout.lattice_rows << "\n";
     out << "# pieces: " << _chunks << "\n# piece_frames: " << kLatticeChunk << "\n# piece_strength: " << number(kLatticeChunkStrength) << "\n";
     out << "# block_grid: " << number(kCodecGrid) << "\n";
+    out << "# lossless: " << (_lossless ? 1 : 0) << "\n";
     out << "# pan_rows_from: " << number(_layout.rows_from) << "\n# pan_rows_to: " << number(_layout.rows_to) << "\n";
     out << "# pan_frames_right: " << _pan_frames[0] << "\n# pan_frames_left: " << _pan_frames[1] << "\n";
     for (int age = 0; age < kResolutionAges; ++age) out << "# age_" << age << ": " << kResolutionAgeNames[age] << "\n";

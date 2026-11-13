@@ -136,7 +136,7 @@ public:
         int height = 0;
         long long frames = 0;
 
-        //! a peak of the pixel grid, off the block grid of video encoders
+        //! a peak of the pixel grid, off the block grid of video encoders (lossless: on it as well)
         struct Peak {
             //! both axes have it, or only the columns (the horizontal grid) / only the rows
             enum Axes { Both, Columns, Rows } axes = Both;
@@ -149,6 +149,12 @@ public:
             //! the columns / rows (-1: the video is too short for that). A grid is there whatever the picture shows
             double share_x = -1.0;
             double share_y = -1.0;
+            //! its second harmonic: at twice the frequency, folded back below 0.5, and its strength as a share of
+            //! the grid's (both the strongest bin near them) in the columns / rows. A small scale shows it about as
+            //! strongly as the grid, a large one hardly (see kHarmonicSmall)
+            double harmonic_frequency = 0.0;
+            double harmonic_share_x = 0.0;
+            double harmonic_share_y = 0.0;
         };
         //! the peaks that count, at most kResolutionPeaks: those of both axes first, the strongest first
         std::vector<Peak> peaks;
@@ -162,9 +168,11 @@ public:
         double codec_strength = 0.0;
         //! ... and it is strong enough to hide a grid there
         bool codec_peak = false;
+        //! the recording was taken as lossless (set_lossless): no block grid of an encoder, the peaks on it count
+        bool lossless = false;
         //! the peak at 0.5 cycles per pixel (a render scale of 50%; 25% and 75% as their second harmonic) and the
         //! encoder's at 0.25, in the columns / rows. half_peak: it counts - both axes have it, and it is not small
-        //! against the one at 0.25
+        //! against the one at 0.25 (lossless: there is no grid at 0.25 whose harmonic it is)
         double half_strength_x = 0.0;
         double half_strength_y = 0.0;
         double quarter_strength_x = 0.0;
@@ -222,14 +230,15 @@ public:
             //! how much speaks for it. These are levels of a rule, not probabilities:
             //! High: a grid in both axes, and the pan picks this one of its two scales (the other one is 1.2 times
             //! further from what the pan reads) or the stair steps of the entering picture fit it
-            //! Medium: a grid in both axes; nothing tells its two scales apart, or the fan is an upward one and this
-            //! is the larger scale (the true one in the recordings tried). The peak at 0.5 with stair steps of 2
-            //! Low: the scale of a grid the pan or the stair steps speak against, the smaller scale of a grid with
-            //! an upward fan, a second grid, a grid in one axis only, the peak at 0.5, the stair steps or the pan
-            //! alone
+            //! Medium: a grid in both axes; nothing tells its two scales apart, or (lossless) its second harmonic
+            //! picks this one, or the fan is an upward one and this is the larger scale (the true one in the
+            //! recordings tried). The peak at 0.5 with stair steps of 2
+            //! Low: the scale of a grid the pan, the stair steps or the harmonic speak against, the smaller scale of
+            //! a grid with an upward fan, a second grid, a grid in one axis only, the peak at 0.5, the stair steps
+            //! or the pan alone
             enum Confidence { Low, Medium, High } confidence = Low;
-            enum Evidence { Grid, GridAndPan, GridOtherScale, GridAndStairs, GridAgainstStairs, GridAndFan, GridAgainstFan, GridOneAxis,
-                            HalfPeak, HalfAndStairs, Stairs, Pan } evidence = Grid;
+            enum Evidence { Grid, GridAndPan, GridOtherScale, GridAndStairs, GridAgainstStairs, GridAndHarmonic, GridAgainstHarmonic,
+                            GridAndFan, GridAgainstFan, GridOneAxis, HalfPeak, HalfAndStairs, Stairs, Pan } evidence = Grid;
             //! index into peaks (-1: none)
             int peak = -1;
         };
@@ -237,6 +246,9 @@ public:
         std::vector<Candidate> candidates;
     };
 
+    //! the recording is lossless and was never coded lossy before (--lossless): the peaks on the block grid of
+    //! encoders (multiples of 1 / 32, among them 0.25: 25% and 75%) are taken as a pixel grid like any other
+    void set_lossless(bool lossless) { _lossless = lossless; }
     //! next frame: what was measured of it (nullptr: nothing) and its motion
     void push(const ResolutionFrame * frame, const MotionField & field);
     Summary summary() const;
@@ -263,6 +275,7 @@ private:
     double _share(const LatticeAxis & axis, double bin) const;
 
     ResolutionLayout _layout;
+    bool _lossless = false;
     long long _frames = 0;
     LatticeAxis _grid_x;
     LatticeAxis _grid_y;

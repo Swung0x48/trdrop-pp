@@ -33,6 +33,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
 | `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) of an upscaled picture |
 | `--resolution-rows <a-b>` | `--resolution`, and the part of the height (percent, from the top) whose edge columns are measured in a pan (default `9-74`) |
+| `--lossless` | the videos were recorded lossless and never coded lossy before, whatever the codec: a duplicate frame is [identical](#lossy-recordings) (`--pixel-diff 0 --tolerance-pct 0`), and `--resolution` [reads the peaks on the block grid of encoders](#render-resolution---resolution) (25% and 75%) as a pixel grid |
 | `--resolution-data <file>` | `--resolution`, and write [what the estimate is made of](#judging-a-recording-yourself---resolution-data) as CSV (one file per input video, comma separated) |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
@@ -155,11 +156,21 @@ Without the option the codec decides (printed in the `vN:` line):
   (`tools/make_ball_videos.py`: 20 fps in 60, the ball changes 0.2% of the picture) reads 20 fps after its
   first half second, and 0 fps with 0.5% throughout.
 
-H.264 / HEVC / AV1 are always treated as lossy, also if they were encoded in a lossless mode
-(pass `--tolerance-pct 0 --pixel-diff 0` then). The automatic values are heuristics: after fast motion
-small real changes may count as duplicates for up to 2 seconds (1 second where the minimum is lower), a
-picture without any duplicates around it (recorded at the framerate) keeps the 0.5%, and tears can't be
-detected reliably in lossy recordings.
+H.264 / HEVC / AV1 are always treated as lossy, also if they were encoded in a lossless mode: pass
+`--lossless` then (the same as `--tolerance-pct 0 --pixel-diff 0`, and it tells `--resolution` too). The
+automatic values are heuristics: after fast motion small real changes may count as duplicates for up to 2
+seconds (1 second where the minimum is lower), a picture without any duplicates around it (recorded at the
+framerate) keeps the 0.5%, and tears can't be detected reliably in lossy recordings.
+
+What that costs was seen on three HEVC lossless recordings of a game at 60 frames per second (two games,
+29 - 35 seconds each) read with the automatic values: 436, 499 and 203 frames counted as duplicates that
+are not identical to the frame before - 44 - 53 fps instead of 56 - 57. They are where the camera holds
+still: the game still draws a new picture every refresh, and it changes 0.1 - 0.5% of the pixels by more
+than 4 (up to 3.8% in the other game, under the 5% of what new frames changed). With `--lossless` the
+duplicates are exactly the frames identical to the one before (22, 24 and 15). These recordings showed the
+Windows taskbar at the bottom (72 rows), which was redrawn only every other frame while the camera held
+still: with `--lossless` that reads as a tear (85 - 99 frames, each counted as 0.03 of a new frame), while
+the motion analysis counted 59.3 - 59.9 new frames per second. Record without the taskbar or other overlays.
 
 ## Motion analysis (`--motion`)
 
@@ -483,8 +494,8 @@ few to count one:
 | confidence | what was found |
 | --- | --- |
 | high | a pixel grid in the columns and in the rows, and one of its two scales is picked: by the pan (the other one is at least 1.2 times further, as a ratio, from what the pan reads) or by the stair steps of the entering picture (their height fits it) |
-| medium | a pixel grid in the columns and in the rows. Nothing tells its two scales apart: they share a line (`1280x720 (33.3% of 3840x2160) or 2560x1440 (66.7%)`). Or the pan shows an upward fan (below): the larger scale. Without a grid: the peak at 0.5 cycles per pixel together with stair steps of 2 pixels |
-| low | the scale of a grid the pan or the stair steps speak against; the smaller scale of a grid with an upward fan; a second, weaker grid; a grid that only the columns or only the rows have; the peak at 0.5 cycles per pixel (50%); the stair steps alone; the pan alone |
+| medium | a pixel grid in the columns and in the rows. Nothing tells its two scales apart: they share a line (`1280x720 (33.3% of 3840x2160) or 2560x1440 (66.7%)`). With `--lossless`: the scale its second harmonic picks (below). Or the pan shows an upward fan (below): the larger scale. Without a grid: the peak at 0.5 cycles per pixel together with stair steps of 2 pixels |
+| low | the scale of a grid the pan, the stair steps or the harmonic speak against; the smaller scale of a grid with an upward fan; a second, weaker grid; a grid that only the columns or only the rows have; the peak at 0.5 cycles per pixel (50%); the stair steps alone; the pan alone |
 
 `no candidate` means that no trace was found, not that the picture is native: see the limits.
 
@@ -507,6 +518,17 @@ few to count one:
    75% their second harmonic. It counts, as a weak trace, if both axes have it 3 times above the background
    and at least 0.4 times as strong as the encoder's peak at 0.25: encoders alone left 0.15 - 0.4 of that peak
    at 0.5, recordings at 50% 0.54 and more.
+   With `--lossless` there is no encoder: the recording says so, the program can't tell (a lossless file of a
+   recording that was once coded lossy still has the blocks). Then the peaks on the block grid count like any
+   other - 25% and 75% at 0.25 -, and the peak at 0.5 counts if there is no grid at 0.25 whose harmonic it
+   is. Of a grid's two scales its second harmonic, at twice the frequency folded below 0.5, picks one: a
+   picture enlarged by a whole factor (25%: 4) is straight between the rendered pixels and bends at them, the
+   mean second difference is a row of spikes and its harmonic as strong as the grid; above 50% the rendered
+   pixels are less than 2 output pixels apart and it is near a sine. At 0.45 of the grid's strength or more in
+   both axes the smaller scale goes first, at 0.35 or less in both the larger one, with medium confidence -
+   measured: 25% 0.56 / 1.00 (columns / rows), 75% 0.12 / 0.19, both lossless; 66 - 80% 0.08 - 0.31 (four lossy
+   recordings). It is not used where the harmonic falls on the grid itself (33% and 67%: 2 / 3 folds to 1 / 3)
+   and ranks after the pan and the stair steps, before the upward fan.
 2. The picture that enters at the edge of a pan. A temporal upscaler has no earlier frames for the picture that
    enters at one edge while the camera pans: it is what a single rendered frame holds, nothing finer than the
    render resolution. The vertical spectrum (the motion blur of a horizontal pan is horizontal) of up to 256
@@ -635,8 +657,24 @@ which would read 48% - but not the 60% that count. Such a mix of 1 and 2 pixels 
 by itself (FSR 3 at 66%: 29% of 99 steps). Read by eye before the setting was known, this recording was
 taken for about 67%: wrong.
 
+A fifth round, TSR in the same game, again recorded lossless and analyzed before the settings were known; the
+first run is the program of the fourth round, `--lossless` was added after the answers, to these three.
+
+| setting | 0.25 (columns / rows); its harmonic at 0.5 | other encoder lines | stair steps | then | with `--lossless` |
+| --- | --- | --- | --- | --- | --- |
+| 75% | 24.7x / 10.6x in 100% / 94% of the video; 0.12 / 0.19 of it | 1.0 - 1.6x | 203: 22% / 11% | none - missed | 2880x1620 medium, 960x540 low - right |
+| 25% | 10.0x / 4.5x in 93%; 0.56 / 1.00 of it | 0.9 - 1.4x | 2 | 1920x1080, low - wrong | 960x540 medium, 2880x1620 low - right |
+| set to 25% | 1.1x / 0.9x; at 0.5 9.8x / 7.9x | 1.1 - 1.5x | 84: 82% / 29% (too few) | 1920x1080, low | the same |
+
+In a lossy recording the encoder's peak at 0.25 comes with its peaks at 1/8 and 3/8 (the stronger of them 1.9 -
+13x in the earlier rounds); in these the other multiples of 1/16 stay at 1.6x and below while 0.25 stands at 10x and more - a
+render grid. The recording set to 25% has no grid at 0.25 but a peak at 0.5 and steps of 2 pixels: rendered
+at 50%, like the earlier ones set below 50% in this game. The one at 25% did render at 25% - why one setting
+took and the other didn't is not known.
+
 Where a grid was found, in all rounds, it was at the true scale. Of its two scales the larger one was the
-true one in six recordings, the smaller one in four: the two of DLSS and the two of XeSS at 33%.
+true one in seven recordings, the smaller one in five: the two of DLSS and the two of XeSS at 33%, and TSR at
+25%.
 
 Speed: the 4K60 recording runs at 111 frames per second on the GPU with and without the option, at 52 instead
 of 58 on the CPU.
@@ -664,8 +702,9 @@ Recording for it:
   6.5x, 6.2x / 4.7x, 4.2x / 3.2x, one half at 0.170 / 0.188 / 0.201, 1280x720 first in all three, and neither
   a peak of one axis nor one at 0.5.)
 
-  Or lossless: the four recordings of the fourth round have no block grid of the encoder left (0.9 - 1.5x
-  at 0.25), so a peak at 0.25 would be the render scale's. They are large - 3 to 8 GB for 25 - 45 seconds.
+  Or lossless, and say so with `--lossless`: the recordings of the fourth and fifth round have no block grid
+  of the encoder left, so a peak at 0.25 is the render scale's - 25% or 75%, which a lossy recording hides.
+  They are large - 3 to 8 GB for 25 - 45 seconds.
 * in the game: stand still and turn the camera sideways at an even speed, a full turn in about 10 seconds
   (20 - 30 pixels per frame at 4K), in both directions; motion blur, depth of field, film grain, sharpening
   and frame generation off; a scene with fine, irregular texture in every direction around (foliage, bushes,
@@ -675,8 +714,9 @@ Recording for it:
 
 Limits:
 
-* It was checked against 29 recordings with a known setting (the tables above). Only the four of the fourth
-  round are a test of the rules as they are now - three right, one missed, all at 50%: the rule for a peak
+* It was checked against 32 recordings with a known setting (the tables above). Only the four of the fourth
+  round are a test of the rules as they are now - three right, one missed, all at 50%; `--lossless` and its
+  harmonic were made from the fifth round and four earlier grids: the rule for a peak
   of one axis was made from the seven of the second round, those for the peak at 0.5 and for the upward fan
   from the second and the third, the threshold of 10 spreads so that the short recordings of a still scene
   stay silent, the rule for the skirt of an encoder's peak from two of those, and the numbers of the stair
@@ -684,8 +724,10 @@ Limits:
   the recording at 50% was missed. Read the lines with
   the measurements, the candidates are their interpretation - and
   [look at the data](#judging-a-recording-yourself---resolution-data) when the program finds nothing.
-* 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: no
-  recording that was surely rendered at one of them has been tried. 50% is only found if its peak at 0.5 is
+* 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: they are
+  only found in a lossless recording with `--lossless` - one of each so far, and which of the two it is rests
+  on the harmonic of those two and on four lossy grids above 60%. A lossless file of a recording that was once
+  coded lossy keeps the encoder's blocks; with `--lossless` they are taken for 25% or 75%. 50% is only found if its peak at 0.5 is
   not small against the encoder's at 0.25 - five of the twelve recordings at 50%; six that were missed are
   short, strongly compressed recordings of DLSS, the seventh is DLSS 4.5, which left 1.8x / 2.7x there even
   recorded lossless. A game
@@ -731,8 +773,8 @@ python scripts/resolution.py capture.res.csv --around 0.42 -o grid.png     # the
 ```
 
 * the pixel grid of the columns and of the rows: how many times the background every frequency is, with the
-  encoder's frequencies marked and the strongest peaks off them labelled - frequency, strength, both scales
-  and their sizes, and the share of the video that has the peak. A grid is a narrow peak (1 - 3 bins of 1920)
+  encoder's frequencies marked and the strongest peaks off them labelled (with `--lossless` on them too) -
+  frequency, strength, both scales and their sizes, and the share of the video that has the peak. A grid is a narrow peak (1 - 3 bins of 1920)
   at the same place in both charts or, weaker, in one; `--min-strength` and `--peaks` label more of them.
 * the contrast of the picture entering in a pan against the one that leaves, one curve per age, and the two
   spectra the newest and the oldest curve are the ratio of. `--direction right` / `left` shows the frames of
@@ -740,7 +782,7 @@ python scripts/resolution.py capture.res.csv --around 0.42 -o grid.png     # the
 * the stair steps by their height, as shares, in the entering and in the leaving picture: a tall bar at 3
   pixels in the entering picture and at 1 pixel in the leaving one is a render scale of 33%.
 
-The file starts with lines `# key: value` (video, width, height, frames, the pan frames, the ages), then
+The file starts with lines `# key: value` (video, width, height, frames, the pan frames, the ages, `lossless`), then
 `curve,direction,age,frequency,value`:
 
 | curve | value, per frequency in cycles per pixel |

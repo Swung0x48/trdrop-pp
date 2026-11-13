@@ -60,6 +60,10 @@ struct VideoOptions {
     //! Where a HUD touches the left or the right edge differs from game to game
     double resolution_rows_from = 9.0;
     double resolution_rows_to = 74.0;
+    //! --lossless: the video was recorded lossless (and never coded lossy before), whatever its codec: a duplicate
+    //! frame is identical (no tolerance for compression noise), and the resolution estimate has no block grid of
+    //! an encoder to keep apart
+    bool lossless = false;
 };
 
 struct Options {

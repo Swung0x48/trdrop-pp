@@ -139,13 +139,13 @@ number came from when several were analyzed.
 | H.264 / HEVC / AV1 recording (OBS, capture software) | nothing: lossy codecs are detected and compared with a tolerance. The log says `tolerance-pct auto` |
 | Lossless capture (FFV1, MagicYUV, Ut Video, raw) | nothing: every different pixel counts |
 | A lossy recording reports far more new frames than plausible | compression noise is counted as change: raise `--tolerance-pct` (start with 2) or `--pixel-diff` (start with 8) step by step and watch the duplicate count |
-| Small real changes are missed in a mostly static picture (a static camera, a menu) | the automatic tolerance allows for them only where the recording has duplicates that change little (recorded above the framerate, a good bitrate). Otherwise lower it: `--tolerance-pct 0.1`, or `--tolerance-pct 0 --pixel-diff 0` for a lossless source in a lossy container |
+| Small real changes are missed in a mostly static picture (a static camera, a menu) | the automatic tolerance allows for them only where the recording has duplicates that change little (recorded above the framerate, a good bitrate). Otherwise lower it: `--tolerance-pct 0.1`, or `--lossless` for a recording encoded lossless (HEVC lossless): a duplicate is then an identical frame. On three such recordings of a 60 fps game the automatic tolerance counted 200 - 500 new frames of a still camera as duplicates (44 - 53 instead of 56 - 57 fps). A desktop overlay in the picture (the taskbar) that is redrawn at another rate reads as a tear with `--lossless` |
 | The container's framerate is wrong | `--source-fps <fps>` |
 | The capture was not in step with the game's output (variable refresh rate output, or recorded with a capture program like OBS) and the summary shows a `note:` about animation errors of one whole interval | `--async-capture` instead of `--motion`, see below |
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |
 | No GPU, a GPU error, or results must not depend on the GPU | `--no-vk` (CPU only), or `--decode ffmpeg` |
 | Several GPUs | `--list-vkdevices`, then `--vkdevice <n>` |
-| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan may tell which - and `candidate N:` lines, each a render resolution (or the two of a grid) with a confidence (high / medium / low: levels of the rules, not probabilities). Report all candidates with their confidence, not only the first. With `--resolution-data <name>.res.csv` it also writes the spectra behind them; `python <scripts>/resolution.py <name>.res.csv -o <name>_resolution.png` draws them (add `--around <frequency>` to look at one peak) - do that when there is no candidate or only low ones, and look for a narrow peak at the same frequency in the columns and the rows. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera. If a HUD touches the left or right edge between 9% and 74% of the height, move the measured part with `--resolution-rows <from>-<to>` (percent of the height) |
+| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan may tell which - and `candidate N:` lines, each a render resolution (or the two of a grid) with a confidence (high / medium / low: levels of the rules, not probabilities). Report all candidates with their confidence, not only the first. With `--resolution-data <name>.res.csv` it also writes the spectra behind them; `python <scripts>/resolution.py <name>.res.csv -o <name>_resolution.png` draws them (add `--around <frequency>` to look at one peak) - do that when there is no candidate or only low ones, and look for a narrow peak at the same frequency in the columns and the rows. Needs a recording at the game's output resolution with a constant quality; if the user says it was recorded lossless (e.g. HEVC lossless) and never re-encoded lossy, add `--lossless`: only then can 25% and 75% be found (it also makes a duplicate frame an identical one, as for lossless codecs). The best material is a slow, even sideways pan of the camera. If a HUD touches the left or right edge between 9% and 74% of the height, move the measured part with `--resolution-rows <from>-<to>` (percent of the height) |
 | Timings look wrong | another program is using the GPU; the results are unaffected, only the speed |
 
 ## Captures that are not in step with the game
@@ -183,8 +183,10 @@ Knowing these keeps the report honest:
   because such frames count as torn. The motion line is the better source then.
 - It measures the recording. Whether unevenness comes from the game or from the capture can not be told from
   the file alone; `--async-capture` is an assumption about the capture, not a measurement of it.
-- `--resolution` was checked against 29 recordings with a known setting; the last four, at 50% and recorded
-  lossless, were the first test of the current rules: three right, DLSS 4.5 missed. Where it found a pixel grid the
+- `--resolution` was checked against 32 recordings with a known setting; four at 50% and recorded lossless
+  were the first test of the current rules: three right, DLSS 4.5 missed. `--lossless` was made from three
+  more (TSR at 25% and 75% found, each with medium confidence from the second harmonic of the grid at 0.25 -
+  one recording each). Where it found a pixel grid the
   scale was right. Which of the two scales (r or 1 - r) the pan told for DLSS at 33% and the stair steps of
   the entering picture for XeSS at 33% (the `stair steps` line: it needs straight, nearly level edges in the
   picture and a pan); with an "upward fan" (the summary says so) the larger scale goes first, which was right
@@ -192,6 +194,6 @@ Knowing these keeps the report honest:
   showed an upward one). It missed TSR at 25% and most recordings at 50%, and it reports what the game rendered, not
   what was set (FSR 3 set to 25% and 33% looked exactly like 50%). Report its measurements and call the
   resolutions candidates. "No candidate" does not mean native resolution: 25% and 75% hide behind the
-  encoder's own grid, 50% shows only if its peak is not small against it, and a strongly compressed
+  encoder's own grid (without `--lossless`), 50% shows only if its peak is not small against it, and a strongly compressed
   recording loses the trace. A pixel grid also appears when the
   console or the capture program scaled the picture, and a grid in one axis only can be a HUD or a pattern.

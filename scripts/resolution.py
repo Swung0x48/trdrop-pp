@@ -103,7 +103,8 @@ def plot_grid(axis, name, strength, share, args, meta):
 
     width, height = float(meta.get("width", 0) or 0), float(meta.get("height", 0) or 0)
     inside = [(f, v) for f, v in strength if low <= f <= high]
-    for value, frequency in find_peaks(inside, args.peaks, args.min_strength):
+    lossless = meta.get("lossless") == "1"                  # --lossless: no encoder, its grid counts like the rest
+    for value, frequency in find_peaks(inside, args.peaks, args.min_strength, gap=-1.0 if lossless else 0.0012):
         label = f"{frequency:.4f}: {value:.1f}x\n{100 * frequency:.1f}% or {100 * (1 - frequency):.1f}%"
         if width and height:
             label += "\n" + " / ".join(f"{2 * round(s * width / 2)}x{2 * round(s * height / 2)}" for s in (frequency, 1 - frequency))
@@ -113,7 +114,8 @@ def plot_grid(axis, name, strength, share, args, meta):
         axis.annotate(label, (frequency, value), xytext=(6, 4), textcoords="offset points", ha="left", va="bottom",
                       fontsize=8, color=INK, zorder=4)
     half, quarter = value_near(strength, 0.5), value_near(strength, 0.25)
-    axis.annotate(f"at 0.5: {half:.1f}x   at 0.25 (encoder): {quarter:.1f}x   |   grey line: 3x, a peak both axes have counts from there",
+    encoder = " (recorded lossless)" if lossless else " (encoder)"
+    axis.annotate(f"at 0.5: {half:.1f}x   at 0.25{encoder}: {quarter:.1f}x   |   grey line: 3x, a peak both axes have counts from there",
                   (0.01, 0.95), xycoords="axes fraction", ha="left", va="top", fontsize=9, color=INK)
     axis.set_xlim(low, high + (0.004 if not args.around else 0.0))      # room for the peak at 0.5
     axis.set_ylim(0, top * 1.35)

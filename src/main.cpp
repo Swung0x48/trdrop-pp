@@ -67,6 +67,11 @@ analysis (single value for all videos, or comma separated per video, e.g. 0,5,0)
       --dismiss-tear-pct <%>   tears smaller than this percentage of the frame height are
                                dismissed (default: 10)
       --source-fps <fps>       override the recorded framerate of the container
+      --lossless               the videos were recorded lossless (e.g. HEVC lossless) and never
+                               coded lossy before, whatever the codec could do: a duplicate
+                               frame is identical (pixel-diff and tolerance-pct 0, as for
+                               lossless codecs), and --resolution reads the peaks on the block
+                               grid of encoders, 25% and 75% at 0.25, as a pixel grid
       --max-frames <n>         stop after n frames
 
 motion (smoothness of the animation, needs coherent motion like a moving camera):
@@ -107,7 +112,8 @@ resolution (render resolution of an upscaled picture):
                                the pixel grid - a scaled picture repeats with the source sampling
                                rate: a peak at r cycles per pixel for a render scale of r or
                                1 - r (25% and 75% fall on the block grid of video encoders and
-                               can't be told from it; 50% leaves a peak at 0.5);
+                               can't be told from it, except with --lossless; 50% leaves a
+                               peak at 0.5);
                                the picture that enters at the edge of a horizontal pan - a
                                temporal upscaler has no earlier frames for it. With DLSS at
                                33% it showed what a single rendered frame resolves and picked
@@ -121,14 +127,14 @@ resolution (render resolution of an upscaled picture):
                                The summary lists the render resolutions that fit, each with a
                                confidence - a level of the rules, not a probability: high (a
                                grid in both axes and the pan or the stair steps pick the
-                               scale), medium (a grid
-                               in both axes; with an upward fan - the entering picture has
-                               more contrast than the settled one - its larger scale), low (a
-                               grid in one axis, the peak at 0.5, the pan alone, the scale
-                               the pan or the fan speaks against).
+                               scale), medium (a grid in both axes; with --lossless the scale
+                               its second harmonic picks; with an upward fan - the entering
+                               picture has more contrast than the settled one - its larger
+                               scale), low (a grid in one axis, the peak at 0.5, the pan
+                               alone, the scale the pan or the fan speaks against).
                                The recording has to have the resolution the game put out and a
-                               constant quality (QP 16 or better). Checked against 25
-                               recordings with a known setting; a scale that changes is not
+                               constant quality (QP 16 or better) or none lost. Checked against
+                               32 recordings with a known setting; a scale that changes is not
                                handled. On the GPU with Vulkan Video decoding, otherwise on
                                the CPU
       --resolution-data <file> --resolution, and write what the summary is made of as CSV: the
@@ -257,6 +263,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
     PerVideoValue tolerance  { "--tolerance-pct", {} };
     PerVideoValue source_fps { "--source-fps", {} };
     PerVideoValue resolution_rows { "--resolution-rows", {} };
+    bool lossless = false;
 
     bool only_inputs = false;
     for (int i = 1; i < argc; ++i)
@@ -285,6 +292,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         else if (arg == "--motion") { options.motion = true; }
         else if (arg == "--async-capture") { options.motion = true; options.async_capture = true; }
         else if (arg == "--resolution") { options.motion = true; options.resolution = true; }
+        else if (arg == "--lossless") { lossless = true; }
         else if (arg == "--resolution-rows")
         {
             options.motion = true;
@@ -370,6 +378,7 @@ bool parse_arguments(int argc, char ** argv, Options & options)
         throw std::invalid_argument("at most " + std::to_string(kMaxVideoCount) + " videos can be compared");
     }
     options.videos.assign(options.inputs.size(), VideoOptions());
+    for (VideoOptions & v : options.videos) v.lossless = lossless;
     if (options.motion_videos.size() > options.inputs.size())
     {
         throw std::invalid_argument("--motion-video: more files than videos");
@@ -476,8 +485,14 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
             if (peak.axes == Summary::Peak::Both)
             {
                 const std::string pieces = peak.share_x < 0.0 ? "" : format(", in %.0f%% / %.0f%% of the video", 100.0 * peak.share_x, 100.0 * peak.share_y);
-                std::fprintf(stderr, "%spixel grid at %.4f %s (%.1fx / %.1fx the background in the columns / rows%s): rendered at %.1f%% or %.1f%% of the output\n"
-                           , prefix.c_str(), peak.frequency, unit, peak.strength_x, peak.strength_y, pieces.c_str(), low, high);
+                std::string harmonic;
+                if (r.lossless && std::abs(peak.harmonic_frequency - peak.frequency) >= 0.006)
+                {
+                    harmonic = format("; its second harmonic at %.4f is %.2f", peak.harmonic_frequency, peak.harmonic_share_x)
+                             + format(" / %.2f of it (strong: the smaller scale, weak: the larger)", peak.harmonic_share_y, 0.0);
+                }
+                std::fprintf(stderr, "%spixel grid at %.4f %s (%.1fx / %.1fx the background in the columns / rows%s): rendered at %.1f%% or %.1f%% of the output%s\n"
+                           , prefix.c_str(), peak.frequency, unit, peak.strength_x, peak.strength_y, pieces.c_str(), low, high, harmonic.c_str());
             }
             else
             {
@@ -489,7 +504,14 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
             }
         }
     }
-    if (r.half_present)
+    if (r.half_present && r.lossless)
+    {
+        std::fprintf(stderr, "%speak at 0.5 %s (%.1fx / %.1fx the background in the columns / rows; at 0.25: %.1fx / %.1fx): %s\n"
+                   , prefix.c_str(), unit, r.half_strength_x, r.half_strength_y, r.quarter_strength_x, r.quarter_strength_y
+                   , r.half_peak ? "a render scale of 50% leaves one there (25% and 75% would leave a peak at 0.25 as well, there is none)"
+                                 : "the second harmonic of the pixel grid at 0.25");
+    }
+    else if (r.half_present)
     {
         std::fprintf(stderr, "%speak at 0.5 %s (%.1fx / %.1fx the background in the columns / rows; the encoder's at 0.25: %.1fx / %.1fx): %s\n"
                    , prefix.c_str(), unit, r.half_strength_x, r.half_strength_y, r.quarter_strength_x, r.quarter_strength_y
@@ -559,6 +581,11 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
     auto size = [&r](double scale) {
         return std::to_string(2 * std::llround(scale * r.width / 2.0)) + "x" + std::to_string(2 * std::llround(scale * r.height / 2.0));
     };
+    if (r.candidates.empty() && r.lossless)
+    {
+        std::fprintf(stderr, "%sno candidate: no trace of upscaling found (native resolution or an upscaler that leaves no trace)\n", prefix.c_str());
+        return;
+    }
     if (r.candidates.empty())
     {
         std::fprintf(stderr, "%sno candidate: no trace of upscaling found (native resolution, a render scale on the block grid of the encoder such as 25%% or 75%%,"
@@ -588,6 +615,12 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
         case Summary::Candidate::GridOtherScale: why = "the other scale of that pixel grid, the pan speaks against it"; break;
         case Summary::Candidate::GridAndStairs: why = "the scale of the pixel grid that fits the stair steps of the entering picture"; break;
         case Summary::Candidate::GridAgainstStairs: why = "the other scale of that pixel grid, the stair steps speak against it"; break;
+        case Summary::Candidate::GridAndHarmonic:
+            why = candidate.scale < 0.5
+                ? "the smaller scale of the pixel grid: its second harmonic is strong, as a picture enlarged by a whole factor has it (recorded lossless)"
+                : "the larger scale of the pixel grid: its second harmonic is weak (recorded lossless)";
+            break;
+        case Summary::Candidate::GridAgainstHarmonic: why = "the other scale of that pixel grid, its second harmonic speaks against it"; break;
         case Summary::Candidate::HalfAndStairs: why = "the peak at 0.5 cycles/pixel, and stair steps of 2 pixels in the entering picture"; break;
         case Summary::Candidate::Stairs: why = "the stair steps of the entering picture alone, without a pixel grid: rough"; break;
         case Summary::Candidate::GridAndFan: why = "the larger scale of the pixel grid, the true one in the recordings with an upward fan"; break;
@@ -600,7 +633,10 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
         case Summary::Candidate::GridOneAxis:
             why = std::string("pixel grid in the ") + (r.peaks[static_cast<size_t>(candidate.peak)].axes == Summary::Peak::Columns ? "columns" : "rows") + " only";
             break;
-        case Summary::Candidate::HalfPeak: why = "the peak at 0.5 cycles/pixel (25% or 75% leave one there too)"; break;
+        case Summary::Candidate::HalfPeak:
+            why = r.lossless ? "the peak at 0.5 cycles/pixel, without a grid at 0.25 (recorded lossless)"
+                             : "the peak at 0.5 cycles/pixel (25% or 75% leave one there too)";
+            break;
         case Summary::Candidate::Pan: why = "the pan alone, without a pixel grid to confirm it: rough"; break;
         }
         std::fprintf(stderr, "%scandidate %d: %s - %s confidence: %s\n", prefix.c_str(), ++number, what.c_str(), levels[candidate.confidence], why.c_str());
@@ -769,7 +805,8 @@ int run(const Options & options)
     for (size_t i = 0; i < video_count; ++i)
     {
         VideoOptions & v = video_options[i];
-        const bool lossy = sources.lossy_codec(i);
+        // --lossless: a duplicate is identical, whatever the codec could do
+        const bool lossy = sources.lossy_codec(i) && !v.lossless;
         if (lossy && !v.pixel_difference_set)
         {
             v.pixel_difference = kLossyPixelDifference;
@@ -782,6 +819,7 @@ int run(const Options & options)
             if (lossy) automatic[i] += automatic[i].empty() ? "tolerance-pct" : " and tolerance-pct";
         }
         if (!automatic[i].empty()) automatic[i] = ", " + automatic[i] + " set for the lossy codec";
+        if (v.lossless && sources.lossy_codec(i)) automatic[i] += ", taken as lossless (--lossless)";
     }
 
     if (!options.quiet)
@@ -878,6 +916,7 @@ int run(const Options & options)
         }
     }
     std::vector<ResolutionAnalyzer> resolution_analyzers(options.resolution ? video_count : 0);
+    for (size_t i = 0; i < resolution_analyzers.size(); ++i) resolution_analyzers[i].set_lossless(video_options[i].lossless);
     auto write_ready_rows = [&]() {
         while (!pending_rows.empty())
         {
