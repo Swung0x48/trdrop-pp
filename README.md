@@ -1,10 +1,20 @@
 # trdrop++
 
-Analyzes captured game video. It estimates the *real* framerate and frametime of a capture, detects frame
-tears and, from the motion between the frames, measures how evenly the animation advances
-([perceived smoothness](#motion-analysis---motion)). The per frame data is written as CSV.
-With `--resolution` it also estimates the resolution an upscaled picture was
-[rendered at](#render-resolution---resolution).
+Analyzes captured game video:
+
+* the *real* framerate and frametime of a capture, and frame tears;
+* from the motion between the frames, how evenly the animation advances
+  ([perceived smoothness](#motion-analysis---motion), `--motion`);
+* the [render resolution](#render-resolution---resolution) behind *temporal* upscaling (`--resolution`):
+  from a video clip of a game upscaled by DLSS, FSR 2 and later, XeSS, TSR or PSSR, the resolution it
+  rendered at before the upscaler, e.g. 1280x720 in a 4K recording. A temporal upscaler builds each output
+  frame from many rendered frames, so no single frame shows the render resolution and it is not read from
+  one: it is read from the whole clip - the pixel grid summed over the frames, the picture that enters at the
+  edge of a pan before the upscaler has earlier frames of it, and the stair steps of edges. A plain
+  (spatial) scaler is found the same way. Each candidate comes with a confidence and the traces it was read
+  from (not every upscaler leaves them, see the limits under [render resolution](#render-resolution---resolution)).
+
+The per frame data is written as CSV.
 The program and the repository are called `trdrop-pp`, `pp` being the `++` that file names and URLs don't like.
 
 The only required dependency is OpenCV (`core`, `imgproc`, `videoio`, `video`).
@@ -31,7 +41,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--motion-video <file>` | `--motion`, and write a [copy of the video with the motion drawn on it](#motion-video---motion-video) (`.mp4`, `.mkv`, `.mov`; one file per input video, comma separated) |
 | `--arrow-scale <x>` | draw the arrows of the motion video x times longer (default `1`) |
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
-| `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) of an upscaled picture |
+| `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) behind temporally upscaled video (DLSS, FSR, XeSS, TSR, PSSR), from the frames of the clip |
 | `--resolution-rows <a-b>` | `--resolution`, and the part of the height (percent, from the top) whose edge columns are measured in a pan (default `9-74`) |
 | `--lossless` | the videos were recorded lossless and never coded lossy before, whatever the codec: a duplicate frame is [identical](#lossy-recordings) (`--pixel-diff 0 --tolerance-pct 0`), and `--resolution` [reads the peaks on the block grid of encoders](#render-resolution---resolution) (25% and 75%) as a pixel grid |
 | `--resolution-data <file>` | `--resolution`, and write [what the estimate is made of](#judging-a-recording-yourself---resolution-data) as CSV (one file per input video, comma separated) |
