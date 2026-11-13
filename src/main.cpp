@@ -103,19 +103,38 @@ motion (smoothness of the animation, needs coherent motion like a moving camera)
 
 resolution (render resolution of an upscaled picture):
       --resolution             --motion, and estimate the resolution the picture was rendered at
-                               before it was scaled up, from two traces:
+                               before it was scaled up, from three traces:
                                the pixel grid - a scaled picture repeats with the source sampling
                                rate: a peak at r cycles per pixel for a render scale of r or
-                               1 - r (exactly 50% leaves none; 25% and 75% fall on the block
-                               grid of video encoders and can't be told from it);
+                               1 - r (25% and 75% fall on the block grid of video encoders and
+                               can't be told from it; 50% leaves a peak at 0.5);
                                the picture that enters at the edge of a horizontal pan - a
-                               temporal upscaler (DLSS, FSR 2+, XeSS, TSR) has no earlier frames
-                               for it, so it shows what a single rendered frame resolves. That
-                               needs a steady pan of 4 - 64 pixels per frame.
+                               temporal upscaler has no earlier frames for it. With DLSS at
+                               33% it showed what a single rendered frame resolves and picked
+                               the right scale of the two; with TSR, FSR 3 and others it said
+                               nothing. That needs a steady pan of 4 - 64 pixels per frame;
+                               the stair steps of that entering picture - an upscaler that
+                               shows new pixels as they were rendered (XeSS, FSR 3, TSR) shows
+                               nearly level edges climbing one rendered pixel at a time: steps
+                               of 3 output pixels are a render scale of 33%. Needs straight
+                               edges in the picture, and says nothing above about 60%.
+                               The summary lists the render resolutions that fit, each with a
+                               confidence - a level of the rules, not a probability: high (a
+                               grid in both axes and the pan or the stair steps pick the
+                               scale), medium (a grid
+                               in both axes; with an upward fan - the entering picture has
+                               more contrast than the settled one - its larger scale), low (a
+                               grid in one axis, the peak at 0.5, the pan alone, the scale
+                               the pan or the fan speaks against).
                                The recording has to have the resolution the game put out and a
-                               constant quality (QP 16 or better). Checked against one known
-                               answer only (DLSS at 33%); a scale that changes is not handled.
-                               On the GPU with Vulkan Video decoding, otherwise on the CPU
+                               constant quality (QP 16 or better). Checked against 25
+                               recordings with a known setting; a scale that changes is not
+                               handled. On the GPU with Vulkan Video decoding, otherwise on
+                               the CPU
+      --resolution-data <file> --resolution, and write what the summary is made of as CSV: the
+                               spectra of the pixel grid and of the picture entering / leaving
+                               in a pan (comma separated list, one file per video; plot it
+                               with scripts/resolution.py to judge a recording yourself)
       --resolution-rows <a-b>  --resolution, and the part of the height, in percent from the top,
                                whose edge columns are measured in a pan (default: 9-74; one
                                value for all videos or comma separated per video). It should
@@ -273,6 +292,12 @@ bool parse_arguments(int argc, char ** argv, Options & options)
             resolution_rows.values = split(next(), ',');
         }
         else if (arg == "--motion-video") { options.motion = true; options.motion_videos = split(next(), ','); }
+        else if (arg == "--resolution-data")
+        {
+            options.motion = true;
+            options.resolution = true;
+            options.resolution_data = split(next(), ',');
+        }
         else if (arg == "--arrow-scale")
         {
             options.arrow_scale = parse_double(next(), arg);
@@ -349,6 +374,10 @@ bool parse_arguments(int argc, char ** argv, Options & options)
     {
         throw std::invalid_argument("--motion-video: more files than videos");
     }
+    if (options.resolution_data.size() > options.inputs.size())
+    {
+        throw std::invalid_argument("--resolution-data: more files than videos");
+    }
 
     apply_per_video(pixel_diff, options.videos, [](VideoOptions & v, const std::string & text) {
         const long long value = parse_integer(text, "--pixel-diff");
@@ -408,9 +437,10 @@ struct VideoStats {
     double frametime_max = 0.0;
 };
 
-//! --resolution: what was measured, then the estimate
+//! --resolution: what was measured, then the render resolutions it fits
 void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
 {
+    typedef ResolutionAnalyzer::Summary Summary;
     const char * const unit = "cycles/pixel";
     const std::string prefix = "v" + std::to_string(index + 1) + " resolution: ";
     if (r.width == 0)
@@ -418,24 +448,56 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
         std::fprintf(stderr, "%snot measured (the frames are too small)\n", prefix.c_str());
         return;
     }
-    if (r.lattice)
-    {
-        std::fprintf(stderr, "%spixel grid at %.4f %s (%.1fx / %.1fx the background in the columns / rows): rendered at %.1f%% or %.1f%% of the output\n"
-                   , prefix.c_str(), r.lattice_frequency, unit, r.lattice_strength_x, r.lattice_strength_y
-                   , 100.0 * r.lattice_frequency, 100.0 * (1.0 - r.lattice_frequency));
-    }
-    else
-    {
-        std::fprintf(stderr, "%sno pixel grid (strongest peak %.1fx the background at %.4f %s; a render scale of exactly 50%% leaves none)"
+    auto format = [](const char * pattern, double a, double b) {
+        char text[96];
+        std::snprintf(text, sizeof(text), pattern, a, b);
+        return std::string(text);
+    };
+
+    // ---- pixel grid
+    auto print_no_grid = [&]() {
+        std::fprintf(stderr, "%sno pixel grid in both axes (strongest peak %.1fx the background at %.4f %s)"
                    , prefix.c_str(), std::min(r.lattice_strength_x, r.lattice_strength_y), r.lattice_frequency, unit);
-        if (r.lattice_on_codec_grid)
+        if (r.codec_peak)
         {
             std::fprintf(stderr, ". The peak at %.4f %s (%.1fx) lies on the block grid of video encoders: a render scale of %.1f%% or %.1f%% can't be told from it"
                        , r.codec_frequency, unit, r.codec_strength, 100.0 * r.codec_frequency, 100.0 * (1.0 - r.codec_frequency));
         }
         std::fprintf(stderr, "\n");
+    };
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        // what both axes have (or that there is nothing) first, then what only one axis has
+        if (pass == 1 && !r.lattice) print_no_grid();
+        for (const Summary::Peak & peak : r.peaks)
+        {
+            if ((peak.axes == Summary::Peak::Both) != (pass == 0)) continue;
+            const double low = 100.0 * peak.frequency, high = 100.0 * (1.0 - peak.frequency);
+            if (peak.axes == Summary::Peak::Both)
+            {
+                const std::string pieces = peak.share_x < 0.0 ? "" : format(", in %.0f%% / %.0f%% of the video", 100.0 * peak.share_x, 100.0 * peak.share_y);
+                std::fprintf(stderr, "%spixel grid at %.4f %s (%.1fx / %.1fx the background in the columns / rows%s): rendered at %.1f%% or %.1f%% of the output\n"
+                           , prefix.c_str(), peak.frequency, unit, peak.strength_x, peak.strength_y, pieces.c_str(), low, high);
+            }
+            else
+            {
+                const bool columns = peak.axes == Summary::Peak::Columns;
+                std::fprintf(stderr, "%spixel grid in the %s only, at %.4f %s (%.1fx the background in %.0f%% of the video, %.1fx in the %s): %.1f%% or %.1f%% of the output."
+                                     " Weak: a regular pattern in the picture (a fence, a HUD) leaves such a peak too\n"
+                           , prefix.c_str(), columns ? "columns" : "rows", peak.frequency, unit, columns ? peak.strength_x : peak.strength_y
+                           , 100.0 * (columns ? peak.share_x : peak.share_y), columns ? peak.strength_y : peak.strength_x, columns ? "rows" : "columns", low, high);
+            }
+        }
+    }
+    if (r.half_present)
+    {
+        std::fprintf(stderr, "%speak at 0.5 %s (%.1fx / %.1fx the background in the columns / rows; the encoder's at 0.25: %.1fx / %.1fx): %s\n"
+                   , prefix.c_str(), unit, r.half_strength_x, r.half_strength_y, r.quarter_strength_x, r.quarter_strength_y
+                   , r.half_peak ? "a render scale of 50% leaves one there, 25% or 75% as well"
+                                 : "small against the encoder's, it may be the encoder's");
     }
 
+    // ---- pan
     const long long pan_frames = r.pan_frames_right + r.pan_frames_left;
     if (r.contrast[0].empty())
     {
@@ -448,41 +510,100 @@ void print_resolution(size_t index, const ResolutionAnalyzer::Summary & r)
                    , prefix.c_str(), r.pan_frames_right, r.pan_frames_left, format_number(r.rows_from).c_str(), format_number(r.rows_to).c_str()
                    , r.lowest_contrast, r.lowest_contrast_frequency, unit);
         if (r.half_contrast_frequency > 0.0) std::fprintf(stderr, ", one half at %.3f %s", r.half_contrast_frequency, unit);
+        if (r.highest_contrast >= 1.25) std::fprintf(stderr, ", up to %.2f (at %.3f %s)", r.highest_contrast, r.highest_contrast_frequency, unit);
         if (r.recovered_age > 0) std::fprintf(stderr, "; %.2f for what entered %s", r.recovered_contrast, kResolutionAgeNames[r.recovered_age]);
         if (r.half_contrast_frequency > 0.0)
         {
             std::fprintf(stderr, ": a single frame resolves about %.0f%% of the output, the rest builds up over the frames (temporal upscaling)\n"
                        , 100.0 * std::min(1.0, 2.0 * r.half_contrast_frequency));
         }
+        else if (r.fan_up)
+        {
+            std::fprintf(stderr, ": the entering picture has more contrast than the settled one and loses it with its age (an upward fan) -"
+                                 " a temporal upscaler that shows new pixels as they were rendered. Of the two scales of a pixel grid the larger"
+                                 " one was the true one in the recordings with such a fan\n");
+        }
         else
         {
-            std::fprintf(stderr, ": the entering picture keeps more than half of its contrast, that tells nothing about the render scale\n");
+            std::fprintf(stderr, ": the entering picture keeps more than half of its contrast, the pan tells nothing about the render scale\n");
         }
     }
 
-    // render resolutions are even
+    // ---- stair steps
+    if (!r.contrast[0].empty() && (r.stair_steps_entering > 0 || r.stair_steps_leaving > 0))
+    {
+        std::fprintf(stderr, "%sstair steps of nearly level edges: %lld in the entering picture, %.0f%% of them 2 pixels or higher; %lld in the leaving picture, %.0f%%: "
+                   , prefix.c_str(), r.stair_steps_entering, 100.0 * r.stair_high_entering, r.stair_steps_leaving, 100.0 * r.stair_high_leaving);
+        if (r.stairs)
+        {
+            std::fprintf(stderr, "what is new is shown as it was rendered, a rendered pixel is about %.1f output pixels high - a render scale of about %.0f%%%s\n"
+                       , r.stair_height, 100.0 * r.stair_scale
+                       , r.stair_height < 2.4 ? " (steps are whole pixels: anything from 50% to about 60% reads like this)" : "");
+        }
+        else if (r.stair_steps_entering < 100)
+        {
+            std::fprintf(stderr, "too few to tell (100 are needed; the picture needs straight edges that are nearly level)\n");
+        }
+        else if (r.stair_high_entering < 0.6)
+        {
+            std::fprintf(stderr, "too few of them are high to tell (60%% are needed): steps of 1 pixel say nothing, a smoothed picture has them and so has"
+                                 " a render scale above about 60%%\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "the leaving picture has high steps as well (or too few to compare): the picture itself is stepped, not only what is new\n");
+        }
+    }
+
+    // ---- the candidates. Render resolutions are even
     auto size = [&r](double scale) {
         return std::to_string(2 * std::llround(scale * r.width / 2.0)) + "x" + std::to_string(2 * std::llround(scale * r.height / 2.0));
     };
-    switch (r.source)
+    if (r.candidates.empty())
     {
-    case ResolutionAnalyzer::Summary::LatticeAndPan:
-        std::fprintf(stderr, "%sestimate %s (%.1f%% of %dx%d): the scale of the pixel grid that fits the pan, not %s (%.1f%%)\n"
-                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height, size(r.other_scale).c_str(), 100.0 * r.other_scale);
-        break;
-    case ResolutionAnalyzer::Summary::Lattice:
-        std::fprintf(stderr, "%sestimate %s (%.1f%% of %dx%d) or %s (%.1f%%): the pixel grid alone can't tell which%s\n"
-                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height, size(r.other_scale).c_str(), 100.0 * r.other_scale
-                   , r.contrast[0].empty() ? ", a pan would" : ", and the picture entering in the pan lost too little contrast to");
-        break;
-    case ResolutionAnalyzer::Summary::Pan:
-        std::fprintf(stderr, "%sestimate about %s (%.0f%% of %dx%d), from the pan alone: rough, and without a pixel grid to confirm it\n"
-                   , prefix.c_str(), size(r.scale).c_str(), 100.0 * r.scale, r.width, r.height);
-        break;
-    case ResolutionAnalyzer::Summary::None:
-        std::fprintf(stderr, "%sno estimate: no trace of upscaling found (native resolution, a render scale of 50%%, an upscaler that leaves neither trace,"
-                             " or a recording too compressed to keep one)\n", prefix.c_str());
-        break;
+        std::fprintf(stderr, "%sno candidate: no trace of upscaling found (native resolution, a render scale on the block grid of the encoder such as 25%% or 75%%,"
+                             " an upscaler that leaves no trace, or a recording too compressed to keep one)\n", prefix.c_str());
+        return;
+    }
+    static const char * const levels[] = { "low", "medium", "high" };
+    int number = 0;
+    for (size_t i = 0; i < r.candidates.size(); ++i)
+    {
+        const Summary::Candidate & candidate = r.candidates[i];
+        std::string what = size(candidate.scale) + format(" (%.1f%% of %.0f", 100.0 * candidate.scale, static_cast<double>(r.width)) + "x" + std::to_string(r.height) + ")";
+        // the two scales of a grid that nothing tells apart share a line
+        if (i + 1 < r.candidates.size())
+        {
+            const Summary::Candidate & next = r.candidates[i + 1];
+            if (candidate.peak >= 0 && next.peak == candidate.peak && next.evidence == candidate.evidence && next.confidence == candidate.confidence)
+            {
+                what += " or " + size(next.scale) + format(" (%.1f%%)", 100.0 * next.scale, 0.0);
+                ++i;
+            }
+        }
+        std::string why;
+        switch (candidate.evidence)
+        {
+        case Summary::Candidate::GridAndPan: why = "the scale of the pixel grid that fits the pan"; break;
+        case Summary::Candidate::GridOtherScale: why = "the other scale of that pixel grid, the pan speaks against it"; break;
+        case Summary::Candidate::GridAndStairs: why = "the scale of the pixel grid that fits the stair steps of the entering picture"; break;
+        case Summary::Candidate::GridAgainstStairs: why = "the other scale of that pixel grid, the stair steps speak against it"; break;
+        case Summary::Candidate::HalfAndStairs: why = "the peak at 0.5 cycles/pixel, and stair steps of 2 pixels in the entering picture"; break;
+        case Summary::Candidate::Stairs: why = "the stair steps of the entering picture alone, without a pixel grid: rough"; break;
+        case Summary::Candidate::GridAndFan: why = "the larger scale of the pixel grid, the true one in the recordings with an upward fan"; break;
+        case Summary::Candidate::GridAgainstFan: why = "the smaller scale of that pixel grid"; break;
+        case Summary::Candidate::Grid:
+            why = candidate.confidence == Summary::Candidate::Medium
+                ? std::string("pixel grid in both axes, nothing tells its two scales apart") + (r.contrast[0].empty() ? " (a pan might)" : "")
+                : std::string("a second, weaker pixel grid");
+            break;
+        case Summary::Candidate::GridOneAxis:
+            why = std::string("pixel grid in the ") + (r.peaks[static_cast<size_t>(candidate.peak)].axes == Summary::Peak::Columns ? "columns" : "rows") + " only";
+            break;
+        case Summary::Candidate::HalfPeak: why = "the peak at 0.5 cycles/pixel (25% or 75% leave one there too)"; break;
+        case Summary::Candidate::Pan: why = "the pan alone, without a pixel grid to confirm it: rough"; break;
+        }
+        std::fprintf(stderr, "%scandidate %d: %s - %s confidence: %s\n", prefix.c_str(), ++number, what.c_str(), levels[candidate.confidence], why.c_str());
     }
 }
 
@@ -912,6 +1033,17 @@ int run(const Options & options)
     progress.finish();
     output->flush();
     if (!*output) throw std::runtime_error("failed writing the output");
+    for (size_t i = 0; i < options.resolution_data.size() && i < resolution_analyzers.size(); ++i)
+    {
+        const std::string & path = options.resolution_data[i];
+        if (path.empty()) continue;
+        std::ofstream data(path, std::ios::out | std::ios::trunc);
+        if (!data) throw std::runtime_error("could not open '" + path + "' for writing");
+        resolution_analyzers[i].write_data(data, options.inputs[i]);
+        data.flush();
+        if (!data) throw std::runtime_error("failed writing '" + path + "'");
+        if (options.print_summary) std::fprintf(stderr, "v%zu resolution data: %s\n", i + 1, path.c_str());
+    }
 
     const double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start_time).count();
     // decoding and comparison may run fused on the GPU, then only the total is meaningful

@@ -89,6 +89,8 @@ struct Options {
     bool async_capture = false;
     //! estimate the render resolution of an upscaled picture (ResolutionAnalyzer), needs the motion
     bool resolution = false;
+    //! per input video: file for the data the resolution estimate is made of, as CSV (empty: none)
+    std::vector<std::string> resolution_data;
     //! per input video: file for a copy of the video with its motion drawn on it (empty: none)
     std::vector<std::string> motion_videos;
     //! the arrows of the motion video are drawn this many times longer than the motion

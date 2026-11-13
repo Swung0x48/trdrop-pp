@@ -139,10 +139,12 @@ if(USE_FFMPEG)
         trdrop_shader(overlay_draw _overlay_draw_shader_inc)
         trdrop_shader(resolution_lattice _resolution_lattice_shader_inc)
         trdrop_shader(resolution_edge _resolution_edge_shader_inc)
+        trdrop_shader(resolution_stairs _resolution_stairs_shader_inc)
         target_sources(trdrop-pp PRIVATE src/vulkan/vk_video_pipeline.cpp "${_yuv_shader_inc}" "${_pyramid_shader_inc}" "${_lk_shader_inc}"
                                          "${_select_shader_inc}" "${_texture_shader_inc}"
                                          "${_overlay_base_shader_inc}" "${_overlay_draw_shader_inc}"
-                                         "${_resolution_lattice_shader_inc}" "${_resolution_edge_shader_inc}")
+                                         "${_resolution_lattice_shader_inc}" "${_resolution_edge_shader_inc}"
+                                         "${_resolution_stairs_shader_inc}")
         message(STATUS "trdrop++: FFmpeg decoding enabled (with Vulkan Video)")
     else()
         message(STATUS "trdrop++: FFmpeg decoding enabled (CPU only, Vulkan Video needs USE_VULKAN)")
@@ -243,6 +245,7 @@ endif()
 install(FILES
         scripts/framerate.py
         scripts/frametime_histogram.py
+        scripts/resolution.py
         scripts/smoothness.py
         scripts/trdrop_csv.py
         scripts/requirements.txt

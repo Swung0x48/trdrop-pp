@@ -33,6 +33,7 @@ trdrop-pp [options] <video> [<video> [<video>]]
 | `--async-capture` | `--motion` for a [capture that didn't run in step with the game's output](#captures-that-are-not-in-step---async-capture): pictures recorded an interval late don't count as animation error, pictures the capture lost are counted in |
 | `--resolution` | `--motion`, and estimate the [render resolution](#render-resolution---resolution) of an upscaled picture |
 | `--resolution-rows <a-b>` | `--resolution`, and the part of the height (percent, from the top) whose edge columns are measured in a pan (default `9-74`) |
+| `--resolution-data <file>` | `--resolution`, and write [what the estimate is made of](#judging-a-recording-yourself---resolution-data) as CSV (one file per input video, comma separated) |
 | `--no-summary` | don't print the summary to stderr |
 | `-q, --quiet` | no progress / input info on stderr |
 | `--vkdevice <n>` | Vulkan device to use (default: the first discrete GPU, otherwise device `0`). Vulkan builds only |
@@ -459,19 +460,33 @@ The other values are the same with `--async-capture`, no picture counts as lost 
 
 Games render fewer pixels than they put out and scale the picture up - with a plain filter, or with a temporal
 upscaler (DLSS, FSR 2 and later, XeSS, TSR, PSSR) that builds its detail from many frames. `--resolution`
-(it implies `--motion`) looks for two traces of that and prints what it found:
+(it implies `--motion`) looks for three traces of that, prints what it found and the render resolutions that
+fit it, each with a confidence:
 
 ```
 trdrop-pp capture.mkv --resolution -o capture.csv
 ```
 
 ```
-v1 resolution: pixel grid at 0.3333 cycles/pixel (13.1x / 8.6x the background in the columns / rows): rendered at 33.3% or 66.7% of the output
+v1 resolution: pixel grid at 0.3333 cycles/pixel (13.1x / 8.6x the background in the columns / rows, in 98% / 98% of the video): rendered at 33.3% or 66.7% of the output
 v1 resolution: picture entering at the edge of a pan, 1401 + 786 frames (moving right + left), rows 9 - 74% of the height: contrast against the picture that leaves down to 0.31 (at 0.266 cycles/pixel), one half at 0.165 cycles/pixel; 1.13 for what entered 8 - 15 frames ago: a single frame resolves about 33% of the output, the rest builds up over the frames (temporal upscaling)
-v1 resolution: estimate 1280x720 (33.3% of 3840x2160): the scale of the pixel grid that fits the pan, not 2560x1440 (66.7%)
+v1 resolution: stair steps of nearly level edges: 463 in the entering picture, 49% of them 2 pixels or higher; 805 in the leaving picture, 22%: too few of them are high to tell (60% are needed): steps of 1 pixel say nothing, a smoothed picture has them and so has a render scale above about 60%
+v1 resolution: candidate 1: 1280x720 (33.3% of 3840x2160) - high confidence: the scale of the pixel grid that fits the pan
+v1 resolution: candidate 2: 2560x1440 (66.7% of 3840x2160) - low confidence: the other scale of that pixel grid, the pan speaks against it
 ```
 
 The CSV is the same with and without the option.
+
+The confidence is a level of the rules below, not a probability - 25 recordings with a known setting are too
+few to count one:
+
+| confidence | what was found |
+| --- | --- |
+| high | a pixel grid in the columns and in the rows, and one of its two scales is picked: by the pan (the other one is at least 1.2 times further, as a ratio, from what the pan reads) or by the stair steps of the entering picture (their height fits it) |
+| medium | a pixel grid in the columns and in the rows. Nothing tells its two scales apart: they share a line (`1280x720 (33.3% of 3840x2160) or 2560x1440 (66.7%)`). Or the pan shows an upward fan (below): the larger scale. Without a grid: the peak at 0.5 cycles per pixel together with stair steps of 2 pixels |
+| low | the scale of a grid the pan or the stair steps speak against; the smaller scale of a grid with an upward fan; a second, weaker grid; a grid that only the columns or only the rows have; the peak at 0.5 cycles per pixel (50%); the stair steps alone; the pan alone |
+
+`no candidate` means that no trace was found, not that the picture is native: see the limits.
 
 1. Pixel grid. In a picture that was scaled up, how much a pixel differs from its neighbours depends on where it
    lies between two source pixels, and that repeats with the source sampling rate. Per frame the mean
@@ -481,6 +496,17 @@ The CSV is the same with and without the option.
    pixel, folded into 0 - 0.5: 33% and 67% both give 0.333, 59% and 41% give 0.41. It counts if the columns
    and the rows both have it 3 times above the background around it. The position is sharp - 1 / 3840 of a
    cycle for a 4K picture - so a scale of 67% (0.33) is told from one of two thirds (0.3333).
+   Video encoders leave peaks of their own at multiples of 1/32 cycles per pixel (the strongest at 0.25); a
+   peak there, or next to a stronger one of theirs, is not counted.
+   A peak that only one axis has counts as a weak trace (DLSS 4 left one in the rows only, 2.5x and 3.1x) if it
+   is 2 times the background, stands 10 times the spread of that axis' spectrum above it - a short video has
+   a restless spectrum - and is there in at least half of the video, cut into pieces of 60 frames: a pixel grid
+   is there whatever the picture shows, a fence or a staircase only while it is in view. (A pattern that never
+   leaves the picture, a HUD or a camera that stands still, passes that test.)
+   The peak at 0.5 cycles per pixel is looked at by itself: a render scale of 50% puts its grid there, 25% and
+   75% their second harmonic. It counts, as a weak trace, if both axes have it 3 times above the background
+   and at least 0.4 times as strong as the encoder's peak at 0.25: encoders alone left 0.15 - 0.4 of that peak
+   at 0.5, recordings at 50% 0.54 and more.
 2. The picture that enters at the edge of a pan. A temporal upscaler has no earlier frames for the picture that
    enters at one edge while the camera pans: it is what a single rendered frame holds, nothing finer than the
    render resolution. The vertical spectrum (the motion blur of a horizontal pan is horizontal) of up to 256
@@ -491,29 +517,103 @@ The CSV is the same with and without the option.
    with the coarsest detail (0.047 cycles per pixel) as 1. Where the contrast of the newest columns (the outer
    half of what entered with the frame) is down to one half is read as what a single frame resolves: half its
    sampling rate, so twice that frequency is the render scale. Of the two scales the pixel grid allows, the one
-   nearer to it is the estimate.
+   nearer to it gets the high confidence. That held for DLSS at 33%, which smooths what has no history.
+   TSR, FSR 3 and "NXSR" show it as it was rendered, aliased: there the newest columns have more contrast than
+   the leaving picture (1.3 to 2.4 times) and lose it as they age - an upward fan. It counts if the newest
+   columns reach 1.25 at some frequency, the oldest columns measured (2 - 3 frames old at least) are back to
+   half of that excess there, and both directions of the pan have frames. Its shape doesn't give the scale -
+   where it peaks follows the scale within recordings of one place (0.40 times the scale in one, 0.60 in
+   another) - but in all four recordings with such a fan and a pixel grid the larger scale of the grid was
+   the true one, so that one goes first, with medium confidence.
    A frame counts if the picture moves by 4 - 64 pixels (where it enters; a camera that turns moves the edges
    up to twice as fast as the middle) with little vertical motion, and if no frame of the last 20 moved the
    other way and 15 of them moved this way - then what leaves at the other edge has been on the screen for a
    while. 30 such frames are needed.
+3. The stair steps of that entering picture. An edge that is nearly level climbs one pixel at a time when it
+   is rendered. An upscaler that shows what has no history as it was rendered (XeSS, FSR 3, TSR, "NXSR") shows
+   those steps, one rendered pixel high: 1 / r output pixels, 3 at a render scale of 33%, 2 at 50%. A few
+   frames later they are smoothed away. In the columns that entered within about 3 frames (at least 32) and in
+   as many columns of the leaving edge, the row of the strongest step from one row to the next is taken per
+   column, in bands of 48 rows every 24 rows of the part of the height that the pan uses. Where those rows form
+   one edge that stays inside the band (a median step of 10 grey levels, neighbouring columns at most 3 rows
+   apart), runs of 5 and more columns on one row are plateaus, and the height between two neighbouring
+   plateaus is counted. Steps of 1 pixel say nothing: a smooth edge has them, and so has a render scale above
+   about 60%. The steps count with 100 of them in the entering picture, 60% of them 2 pixels or higher, and at
+   most 30% in the leaving picture - a picture that is stepped everywhere is something else. Then one over
+   the mean height of the steps of 2 pixels and more is the render scale. Steps are whole pixels, so this
+   reads 33% and 50% well and nothing above 50%: anything from 50% to about 60% reads 50%. Of the two scales
+   of a pixel grid it picks the one that is clearly nearer (the other one 1.2 times further, as for the pan)
+   and fits (within a factor of 1.4), with high confidence - 33% of 33% / 67%, but neither of 42% / 58%.
+   Without a grid it is a candidate by itself. The encoder has no part in it, so it should also reach 25%
+   and 50%, where the grid is hidden; of those only 50% has been seen (steps of 2 pixels).
 
-Where it is computed follows the decoder, like the motion: with Vulkan Video decoding two compute shaders
-(`src/vulkan/resolution_lattice.comp`, `resolution_edge.comp`) read the luma on the GPU and 80 kB per frame
-come back; otherwise the CPU does the same. The sums of the pixel grid are integers and identical on both
-(checked on 1561 frames), the spectra agree to 0.001%.
+Where it is computed follows the decoder, like the motion: with Vulkan Video decoding three compute shaders
+(`src/vulkan/resolution_lattice.comp`, `resolution_edge.comp`, `resolution_stairs.comp`) read the luma on
+the GPU and 200 kB per frame come back; otherwise the CPU does the same. The sums of the pixel grid are
+integers and identical on both (checked on 1561 frames), the spectra agree to 0.001%, the rows and sizes of
+the steps are identical (1318 frames).
 
 Measured (4K recordings; RTX 4070 SUPER / i7-14700KF):
 
-| recording | pixel grid | pan | estimate |
+| recording | pixel grid | pan | candidates |
 | --- | --- | --- | --- |
-| DLSS at 33% (ultra performance), 4K60 HEVC with a constant QP of 1, 80 seconds with gamepad pans | 0.3333, 13.1x / 8.6x | 1401 + 786 frames, one half at 0.165 | 1280x720 - right |
-| the same, 26 seconds of it: GPU / CPU (`--decode ffmpeg`) | 0.3333, 16.5x / 13.8x on both | 824 + 336 frames, 0.162 / 756 + 336 frames, 0.161 | 1280x720 on both |
-| DLSS at 33%, another recording of 46 seconds with a slow pan | 0.3333, 9.6x / 6.6x | 349 frames, one half at 0.165 | 1280x720 - right |
-| DLSS at 50% (performance), three H.264 recordings at 40 - 80 Mbit/s | none (2.1x - 2.2x) | 5 - 7 frames: none | none - as expected, see below |
-| DLSS at 33%, two H.264 recordings of a still scene at 2 - 5 Mbit/s | none (2.5x at 0.3333; 2.3x elsewhere) | none | none - missed |
-| console game, 4K120 recording whose picture was scaled from 1440p (the game, the console or the capture) | 0.3333, 6.4x / 5.6x | no pan in it | 1280x720 or 2560x1440 |
-| the same game, a replay with trackside cameras | 0.3333, 4.1x / 5.9x | 75 frames, the contrast stays above 0.81 | 1280x720 or 2560x1440: the pan doesn't tell |
+| DLSS at 33% (ultra performance), 4K60 HEVC with a constant QP of 1, 80 seconds with gamepad pans | 0.3333, 13.1x / 8.6x | 1401 + 786 frames, one half at 0.165 | 1280x720 high, 2560x1440 low - right |
+| the same, 26 seconds of it: GPU / CPU (`--decode ffmpeg`) | 0.3333, 16.5x / 13.8x on both | 824 + 336 frames, 0.162 / 756 + 336 frames, 0.161 | 1280x720 high on both |
+| DLSS at 33%, another recording of 46 seconds with a slow pan | 0.3333, 9.6x / 6.6x | 349 frames, one half at 0.165 | 1280x720 high, 2560x1440 low - right |
+| DLSS at 50% (performance), six H.264 recordings at 6 - 54 Mbit/s with little camera motion | none (1.3x - 2.2x); the encoder's peak at 0.25 is 9x - 25x, one has a peak at 0.5 below it | none | none - missed |
+| DLSS at 33%, two H.264 recordings of a still scene at 2 - 5 Mbit/s | none (2.5x at 0.3333 in one, in the columns 3.4x: 7 times the spread, 10 are needed) | none | none - missed |
+| console game, 4K120 recording whose picture was scaled from 1440p (the game, the console or the capture) | 0.3333, 6.4x / 5.6x | no pan in it | 1280x720 or 2560x1440, medium |
+| the same game, a replay with trackside cameras | 0.3333, 4.1x / 5.9x | 75 frames, the contrast stays above 0.81 | 1280x720 or 2560x1440, medium: the pan doesn't tell |
 | the same game recorded at 1080p | none (1.1x) | | none: the console scales its picture down |
+
+A second round of seven 4K60 recordings (HEVC, 290 - 430 Mbit/s) was analyzed before their settings were
+known. The program as it was then - a peak had to be in both axes, the peak at 0.5 counted as the encoder's -
+gave a result for one of the seven. The two rules for a peak of one axis and for the peak at 0.5 were added
+after the answers were known, to these recordings: the last column is not a test of them.
+
+| recording (as the settings were given) | pixel grid | pan: contrast of the entering picture | before | now |
+| --- | --- | --- | --- | --- |
+| TSR at 72% | 0.2792, 24.2x / 24.3x | up to 2.41 (at 0.44), never below 1: an upward fan | 1072x602 or 2768x1558 | 2768x1558 medium, 1072x602 low - right |
+| DLSS 4 balanced (58%), driving | rows only: 0.4199, 2.5x in 71% of the video; columns 1.1x | not usable: 130 frames of a turn, a HUD in the edge columns | none | 1612x906 or 2228x1254, low - holds the answer |
+| DLSS 4 quality (67%), driving | rows only: 0.3333, 3.1x in 92% of the video; columns 1.3x | none | none | 1280x720 or 2560x1440, low - holds the answer |
+| FSR 3 native AA (100%), driving | none (1.3x) | not usable: 206 frames of a turn, a HUD in the edge columns | none | none - right, but that is what a miss looks like too |
+| "NXSR" at 50% | none (1.5x); at 0.5: 9.8x / 7.2x, the encoder's at 0.25: 4.0x / 2.6x | up to 2.44 (at 0.30), never below 1 | none | 1920x1080, low - right |
+| TSR set to 25% | none (1.2x); at 0.25 3.8x / 2.8x like everywhere; a peak of the columns at 0.2667 (3.0x) in 31% of the video | 0.87 - 1.04 | none | none - missed; its stair steps are 2 pixels high, not 4 (see the limits) |
+| FSR 3 at "31%?" | none (1.5x; 1.5x around 0.31); at 0.5: 3.9x / 5.5x, at 0.25: 4.3x / 2.4x | up to 1.41 (at 0.23), 0.72 at 0.47 | none | 1920x1080, low - see the third round |
+
+A third round of six recordings of one place (FSR 3, 4K60 HEVC, about 30 seconds each), again analyzed before
+the settings were known. "Then" is the program of the second round; the rule for the peak at 0.5 was
+loosened and the one for the upward fan added after the answers.
+
+| setting | pixel grid | peak at 0.5 / encoder's at 0.25 (columns, rows) | upward fan peaks at | then | now |
+| --- | --- | --- | --- | --- | --- |
+| 80% | 0.2000, 8.7x / 6.1x | 0.9 / 6.1, 1.1 / 2.9 | 0.319 | 768x432 or 3072x1728, medium | 3072x1728 medium, 768x432 low - right |
+| 72% | 0.2792, 10.4x / 6.6x | 0.9 / 5.9, 1.1 / 3.0 | 0.291 | 1072x602 or 2768x1558, medium | 2768x1558 medium, 1072x602 low - right |
+| 66% | 0.3396, 7.5x / 5.0x | 0.8 / 6.4, 1.1 / 3.2 | 0.267 | 1304x734 or 2536x1426, medium | 2536x1426 medium, 1304x734 low - right |
+| 50% | none (1.5x) | 3.8 / 6.8, 4.1 / 3.2 | 0.203 | none - missed | 1920x1080, low - right |
+| 33% | none (1.5x; nothing at 0.333) | 4.1 / 6.6, 3.7 / 3.1 | 0.206 | none | 1920x1080, low - wrong, or see below |
+| 25% | none (1.5x) | 3.4 / 6.3, 3.3 / 2.9 | 0.205 | none | 1920x1080, medium (stair steps of 2.1 pixels as well) - wrong, or see below |
+
+The recordings at 25%, 33% and 50% are the same in everything that was measured: the spectrum of the settled
+picture (at 0.20 cycles per pixel, relative to 0.047: 0.0302, 0.0302, 0.0308 - against 0.0443, 0.0483 and
+0.0559 for 66%, 72% and 80%), that of the entering picture, the fan and the peak at 0.5; and the one at 33%
+has no grid at one third. A picture rendered with a quarter of the pixels can't have the spectrum of the one at
+50%, so the game probably didn't render below 50% with FSR 3 - not verified; all six ran at the 60 frames per
+second they were capped to. The stair steps of the recording at "25%" say the same: 114 of them, 74% two
+pixels or higher, 2.1 pixels on average - 4 would be 25%. (The other five have fewer than 100 steps: the
+place has few straight edges.) The FSR 3 recording of the second round looks like these three.
+
+Two recordings of XeSS at 33% (ultra performance), one while driving and one with pans on foot, have the grid
+at 0.3333 in both axes (3.3x / 8.0x and 4.8x / 8.9x): 1280x720 or 2560x1440, medium. The pan of the second
+one is no upward fan - the newest columns stay at 1 up to 0.28 cycles per pixel, drop to 0.64 at 0.33 and rise
+to 1.48 at 0.47 - and here the smaller scale is the true one. The stair steps were measured by hand on this
+recording, before its setting was known, and gave 33%; they were put into the program after that. Now: 9793
+steps in the entering picture, 76% of them 2 pixels or higher (55% are 3 pixels), 3.0 pixels on average;
+20697 in the leaving picture, 89% of them 1 pixel - 1280x720 high, 2560x1440 low. The driving recording has
+no pan and stays at the pair.
+
+Where a grid was found, in all rounds, it was at the true scale. Of its two scales the larger one was the
+true one in six recordings, the smaller one in four: the two of DLSS and the two of XeSS at 33%.
 
 Speed: the 4K60 recording runs at 111 frames per second on the GPU with and without the option, at 52 instead
 of 58 on the CPU.
@@ -535,27 +635,49 @@ Recording for it:
   | 20 | 66 Mbit/s | 4.4x / 4.1x | 0.178 |
   | 24 | 37 Mbit/s | 3.7x / 3.2x | 0.200 |
 
-  The estimate was 1280x720 for all of them, but at QP 20 and above the peak is close to what counts and its
-  position is off by half a bin, and the pan reads higher. QP 12 - 16 is a good choice; QP 1 gives files of
-  800 Mbit/s for nothing.
+  The first candidate was 1280x720 for all of them, but at QP 20 and above the peak is close to what counts
+  and its position is off by half a bin, and the pan reads higher. QP 12 - 16 is a good choice; QP 1 gives
+  files of 800 Mbit/s for nothing. (Another 12 seconds of it at QP 20 / 24 / 28 - 63 / 34 / 18 Mbit/s: 8.0x /
+  6.5x, 6.2x / 4.7x, 4.2x / 3.2x, one half at 0.170 / 0.188 / 0.201, 1280x720 first in all three, and neither
+  a peak of one axis nor one at 0.5.)
 * in the game: stand still and turn the camera sideways at an even speed, a full turn in about 10 seconds
   (20 - 30 pixels per frame at 4K), in both directions; motion blur, depth of field, film grain, sharpening
-  and frame generation off; a scene with fine horizontal structure (roof tiles, brickwork, steps).
+  and frame generation off; a scene with fine, irregular texture in every direction around (foliage, bushes,
+  rubble, rock, grass). The pixel grid needs detail across and along the picture, the pan only detail along the
+  height (lines and edges that lie flat); a regular pattern - a fence, a grille, planks, neat brickwork - puts
+  peaks of its own into the spectra of the pixel grid.
 
 Limits:
 
-* It was checked against one known answer - DLSS at 33%, two recordings of the same place. Whether the pan
-  measurement follows the render scale, and what FSR, XeSS or an engine's own upscaler leave, is not known
-  yet: read the lines with the measurements, the estimate is their interpretation.
-* A render scale of exactly 50% leaves no pixel grid (both pixel positions between two source pixels are
-  alike). 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: the
-  summary says so instead of guessing. Native resolution leaves none either, so "no pixel grid" says little.
-* The pixel grid can't tell r from 1 - r. The pan can if the two are far apart, but not above a render scale
-  of about 70%: a single frame then resolves detail that the picture hardly has.
-* A pan in which the entering picture keeps its contrast doesn't rule out a temporal upscaler. In three
-  recordings of DLSS at 50% (H.264 at 40 - 80 Mbit/s) an earlier version of the measurement found no loss at
-  any frequency in 34 - 122 pan frames; with the rules above only 5 - 7 of their frames count, so the program
-  reports no pan for them. Whether that is the recordings or the method is open.
+* It was checked against 25 recordings with a known setting (the tables above), and none of them is a test
+  of the rules as they are now: the rule for a peak of one axis was made from the seven of the second round,
+  those for the peak at 0.5 and for the upward fan from the second and the third, the threshold of 10 spreads
+  so that the short recordings of a still scene stay silent, the rule for the skirt of an encoder's peak
+  from two of those, and the numbers of the stair steps from one recording of XeSS. The third round was a
+  test of the rules before it: the grids were right, the recording at 50% was missed. Read the lines with
+  the measurements, the candidates are their interpretation - and
+  [look at the data](#judging-a-recording-yourself---resolution-data) when the program finds nothing.
+* 25% and 75% fall on the block grid of video encoders, which every lossy recording has at 0.25: no
+  recording that was surely rendered at one of them has been tried. 50% is only found if its peak at 0.5 is not small against the encoder's at 0.25 - two of the
+  eight recordings at 50%; the six that were missed are short, strongly compressed recordings of DLSS. A game
+  that doesn't take a setting gives the candidate of what it rendered (the third round). Native resolution
+  leaves no trace either, so "no candidate" says little.
+* The stair steps need straight edges that are nearly level - a road, buildings; a courtyard with trees gave
+  35 to 114 steps in 30 seconds where a street gave 9793 - and an upscaler that shows new pixels unsmoothed:
+  DLSS at 33% had 49% of high steps and stayed below what counts, where the pan tells. They say nothing above
+  a render scale of about 60%. Two recordings fell short of the 60% that count: 47% high steps for "NXSR" at
+  50% and 42% for the one set to TSR at 25% - whose high steps are 2 pixels (2.1 on average of 628 steps), not
+  4, so it looks rendered at 50% like the FSR 3 recordings set below 50%. One recording was decided with the
+  steps, one more agrees.
+* A grid that only one axis has is a weak trace. Why DLSS 4 left none in the columns of those two recordings
+  is not known (they are driving scenes; motion blur along the motion is a guess). A HUD or a pattern that
+  stays in the picture gives such a peak too.
+* The pixel grid can't tell r from 1 - r. The pan did for DLSS at 33% (ultra performance), where the entering
+  picture loses detail. With TSR at 72%, "NXSR" at 50% and FSR 3 the entering picture had up to 2.4 times
+  the contrast of the leaving one - aliased, not blurred: the upward fan, which puts the larger scale first
+  because it was the true one four times out of four, not because of a reason that is understood. With XeSS
+  at 33% the newest columns were neither, and in the recording set to TSR at 25% the two were alike. So a pan
+  that says nothing doesn't rule out a temporal upscaler.
 * A pixel grid says that the picture was scaled, not by whom: the game, the console's output or the capture
   (a capture program that scales its source to a larger canvas) all leave the same one.
 * One scale for the whole video: a render scale that changes with the load smears the peak.
@@ -566,9 +688,42 @@ Limits:
 * The pan needs a horizontal pan the motion analysis can follow; ages are counted in recorded frames, so a
   game that runs faster than the recording has more than one of its frames in the newest columns.
 
+### Judging a recording yourself (`--resolution-data`)
+
+The rules are mechanical and miss what the eye finds. `--resolution-data <file>` (one file per video; it is
+written with `--no-summary` too) writes what the summary is made of, and `scripts/resolution.py` draws it:
+
+```
+trdrop-pp capture.mkv --resolution-data capture.res.csv -o capture.csv
+python scripts/resolution.py capture.res.csv -o capture.png
+python scripts/resolution.py capture.res.csv --around 0.42 -o grid.png     # the grid from 0.40 to 0.44
+```
+
+* the pixel grid of the columns and of the rows: how many times the background every frequency is, with the
+  encoder's frequencies marked and the strongest peaks off them labelled - frequency, strength, both scales
+  and their sizes, and the share of the video that has the peak. A grid is a narrow peak (1 - 3 bins of 1920)
+  at the same place in both charts or, weaker, in one; `--min-strength` and `--peaks` label more of them.
+* the contrast of the picture entering in a pan against the one that leaves, one curve per age, and the two
+  spectra the newest and the oldest curve are the ratio of. `--direction right` / `left` shows the frames of
+  one direction: a pan in one direction only compares two different parts of the scene.
+* the stair steps by their height, as shares, in the entering and in the leaving picture: a tall bar at 3
+  pixels in the entering picture and at 1 pixel in the leaving one is a render scale of 33%.
+
+The file starts with lines `# key: value` (video, width, height, frames, the pan frames, the ages), then
+`curve,direction,age,frequency,value`:
+
+| curve | value, per frequency in cycles per pixel |
+| --- | --- |
+| `grid_columns_spectrum`, `grid_rows_spectrum` | mean magnitude of the spectrum of a frame's profile |
+| `grid_columns_strength`, `grid_rows_strength` | that, divided by the median of the 40 bins to both sides: what the rules use |
+| `grid_columns_share`, `grid_rows_share` | share of the pieces of 60 frames whose own spectrum has a peak (2 times its background) at the bin or next to it; missing for videos of less than 240 frames |
+| `pan_entering`, `pan_leaving` | mean power of a column of the entering / leaving edge, per `direction` (`right`, `left`, `both`: where the picture moves) and `age` (0 - 5, the newest first) |
+| `pan_contrast` | root of entering / leaving, 1 at the first frequency |
+| `stairs_entering`, `stairs_leaving` | number of stair steps; the `frequency` column holds their height in pixels, 1 - 8 (8: or more) |
+
 ## Plotting
 
-`scripts/` contains two matplotlib scripts that read the per frame CSV, either from a file or
+`scripts/` contains matplotlib scripts that read the per frame CSV, either from a file or
 piped from trdrop-pp via stdin:
 
 ```
@@ -583,6 +738,7 @@ trdrop-pp a.avi b.avi | python scripts/frametime_histogram.py --labels PS5,XSX -
 | --- | --- |
 | `framerate.py` | framerate of all videos over time in one chart, legend with avg / min |
 | `frametime_histogram.py` | one frametime histogram per video (stacked, shared x axis): how long each new frame stayed on screen, with n / avg / p99 / max |
+| `resolution.py` | not the per frame CSV but the file of `--resolution-data`: [pixel grid and pan](#judging-a-recording-yourself---resolution-data) |
 | `smoothness.py` | for `--motion` CSVs: framerate and perceived smoothness, animation error over time (with `--fps`: the spread of the votes as a band) and as histogram. With `--fps` and an `--async-capture` CSV the framerate includes the pictures the capture lost |
 
 The histogram counts every new frame once (the `vN_frametime_ms` value at rows with `vN_diff > 0`).

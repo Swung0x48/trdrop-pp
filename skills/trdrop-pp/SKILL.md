@@ -145,7 +145,7 @@ number came from when several were analyzed.
 | Many tears reported on a picture with black bars or a static HUD | expected: a boundary between unchanged and changed rows counts as a tear. `--dismiss-tear-pct` raises the size a tear must have |
 | No GPU, a GPU error, or results must not depend on the GPU | `--no-vk` (CPU only), or `--decode ffmpeg` |
 | Several GPUs | `--list-vkdevices`, then `--vkdevice <n>` |
-| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan tells which - and an estimate. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera. If a HUD touches the left or right edge between 9% and 74% of the height, move the measured part with `--resolution-rows <from>-<to>` (percent of the height) |
+| The user asks for the render resolution / whether the picture is upscaled (DLSS, FSR, a console's dynamic resolution) | `--resolution` (implies `--motion`). It prints what it measured - a pixel grid at r cycles per pixel means a render scale of r or 1 - r, the picture entering at the edge of a camera pan may tell which - and `candidate N:` lines, each a render resolution (or the two of a grid) with a confidence (high / medium / low: levels of the rules, not probabilities). Report all candidates with their confidence, not only the first. With `--resolution-data <name>.res.csv` it also writes the spectra behind them; `python <scripts>/resolution.py <name>.res.csv -o <name>_resolution.png` draws them (add `--around <frequency>` to look at one peak) - do that when there is no candidate or only low ones, and look for a narrow peak at the same frequency in the columns and the rows. Needs a recording at the game's output resolution with a constant quality; the best material is a slow, even sideways pan of the camera. If a HUD touches the left or right edge between 9% and 74% of the height, move the measured part with `--resolution-rows <from>-<to>` (percent of the height) |
 | Timings look wrong | another program is using the GPU; the results are unaffected, only the speed |
 
 ## Captures that are not in step with the game
@@ -183,7 +183,13 @@ Knowing these keeps the report honest:
   because such frames count as torn. The motion line is the better source then.
 - It measures the recording. Whether unevenness comes from the game or from the capture can not be told from
   the file alone; `--async-capture` is an assumption about the capture, not a measurement of it.
-- `--resolution` was checked against one known answer only (DLSS at 33% of 4K). Report its measurements and
-  call the resolution an estimate. "No pixel grid" does not mean native resolution: a render scale of exactly
-  50% leaves none, 25% and 75% hide behind the encoder's own grid, and a strongly compressed recording loses
-  it. A pixel grid also appears when the console or the capture program scaled the picture.
+- `--resolution` was checked against 25 recordings with a known setting. Where it found a pixel grid the
+  scale was right. Which of the two scales (r or 1 - r) the pan told for DLSS at 33% and the stair steps of
+  the entering picture for XeSS at 33% (the `stair steps` line: it needs straight, nearly level edges in the
+  picture and a pan); with an "upward fan" (the summary says so) the larger scale goes first, which was right
+  four times out of four but is not understood. It missed TSR at 25% and most recordings at 50%, and it reports what the game rendered, not
+  what was set (FSR 3 set to 25% and 33% looked exactly like 50%). Report its measurements and call the
+  resolutions candidates. "No candidate" does not mean native resolution: 25% and 75% hide behind the
+  encoder's own grid, 50% shows only if its peak is not small against it, and a strongly compressed
+  recording loses the trace. A pixel grid also appears when the
+  console or the capture program scaled the picture, and a grid in one axis only can be a HUD or a pattern.

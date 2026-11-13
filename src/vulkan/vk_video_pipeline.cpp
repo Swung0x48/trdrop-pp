@@ -80,6 +80,10 @@ const uint32_t kResolutionEdgeSpirv[] = {
 #include "resolution_edge.spv.inc"
 };
 
+const uint32_t kResolutionStairsSpirv[] = {
+#include "resolution_stairs.spv.inc"
+};
+
 //! must match resolution_lattice.comp
 struct LatticePush {
     uint32_t width;
@@ -95,6 +99,15 @@ struct EdgePush {
     uint32_t luma_row_words;
     uint32_t row0;
     uint32_t segments;
+    uint32_t edge;
+};
+
+//! must match resolution_stairs.comp
+struct StairsPush {
+    uint32_t width;
+    uint32_t luma_row_words;
+    uint32_t row0;
+    uint32_t bands;
     uint32_t edge;
 };
 
@@ -167,6 +180,7 @@ public:
             _overlay_draw = _create_compute(kOverlayDrawSpirv, sizeof(kOverlayDrawSpirv), 5, sizeof(OverlayDrawPush));
             _lattice = _create_compute(kResolutionLatticeSpirv, sizeof(kResolutionLatticeSpirv), 2, sizeof(LatticePush));
             _edge = _create_compute(kResolutionEdgeSpirv, sizeof(kResolutionEdgeSpirv), 2, sizeof(EdgePush));
+            _stairs = _create_compute(kResolutionStairsSpirv, sizeof(kResolutionStairsSpirv), 2, sizeof(StairsPush));
             _gpu_videos.resize(paths.size());
             _create_slots();
             for (size_t i = 0; i < paths.size(); ++i)
@@ -519,10 +533,12 @@ public:
                 slot_video.resolution = layout;
                 if (layout.width > 0)
                 {
-                    // read back: the sums per column and per row, the spectra of the edge columns
+                    // read back: the sums per column and per row, the spectra and the stair steps of the edge columns
                     const VkDeviceSize sums_bytes = static_cast<VkDeviceSize>(layout.width + layout.lattice_rows) * sizeof(uint32_t);
                     const VkDeviceSize power_bytes = static_cast<VkDeviceSize>(2 * layout.edge) * kResolutionBins * sizeof(float);
-                    const std::pair<Buffer *, VkDeviceSize> read_back[2] = { { &slot_video.lattice_sums, sums_bytes }, { &slot_video.edge_power, power_bytes } };
+                    const VkDeviceSize stairs_bytes = static_cast<VkDeviceSize>(2 * layout.edge) * static_cast<VkDeviceSize>(std::max(1, layout.stair_bands)) * sizeof(uint32_t);
+                    const std::pair<Buffer *, VkDeviceSize> read_back[3] = { { &slot_video.lattice_sums, sums_bytes }, { &slot_video.edge_power, power_bytes },
+                                                                             { &slot_video.edge_stairs, stairs_bytes } };
                     for (const auto & [buffer, bytes] : read_back)
                     {
                         if (buffer->size >= bytes) continue;
@@ -534,17 +550,19 @@ public:
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                         });
                     }
-                    const VkDescriptorBufferInfo resolution_buffers[4] = {
+                    const VkDescriptorBufferInfo resolution_buffers[6] = {
                         { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
                         { slot_video.lattice_sums.buffer, 0, VK_WHOLE_SIZE },
                         { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
                         { slot_video.edge_power.buffer, 0, VK_WHOLE_SIZE },
+                        { video.luma[video.current].buffer, 0, VK_WHOLE_SIZE },
+                        { slot_video.edge_stairs.buffer, 0, VK_WHOLE_SIZE },
                     };
-                    std::array<VkWriteDescriptorSet, 4> resolution_writes {};
-                    for (uint32_t b = 0; b < 4; ++b)
+                    std::array<VkWriteDescriptorSet, 6> resolution_writes {};
+                    for (uint32_t b = 0; b < 6; ++b)
                     {
                         resolution_writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                        resolution_writes[b].dstSet = b < 2 ? slot_video.lattice_set : slot_video.edge_set;
+                        resolution_writes[b].dstSet = b < 2 ? slot_video.lattice_set : b < 4 ? slot_video.edge_set : slot_video.stairs_set;
                         resolution_writes[b].dstBinding = b % 2;
                         resolution_writes[b].descriptorCount = 1;
                         resolution_writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -853,8 +871,10 @@ private:
         // resolution: the sums of the pixel grid and the spectra of the edge columns are read back
         Buffer lattice_sums;
         Buffer edge_power;
+        Buffer edge_stairs;
         VkDescriptorSet lattice_set = VK_NULL_HANDLE;
         VkDescriptorSet edge_set = VK_NULL_HANDLE;
+        VkDescriptorSet stairs_set = VK_NULL_HANDLE;
         ResolutionLayout resolution;
         bool motion_estimated = false;
         //! the dispatches for sparse motion were recorded
@@ -1005,6 +1025,21 @@ private:
             _fn.vkCmdPushConstants(slot.command_buffer, _edge.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
             _fn.vkCmdDispatch(slot.command_buffer, 2 * push.edge, 1, 1);
         }
+        _fn.vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _stairs.pipeline);
+        for (const SlotVideo & slot_video : slot.videos)
+        {
+            const ResolutionLayout & layout = slot_video.resolution;
+            if (layout.width == 0 || layout.segments < 1 || layout.stair_bands < 1) continue;
+            StairsPush push {};
+            push.width = static_cast<uint32_t>(layout.width);
+            push.luma_row_words = slot_video.plan.luma_row_words;
+            push.row0 = static_cast<uint32_t>(layout.row0);
+            push.bands = static_cast<uint32_t>(layout.stair_bands);
+            push.edge = static_cast<uint32_t>(layout.edge);
+            _fn.vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, _stairs.layout, 0, 1, &slot_video.stairs_set, 0, nullptr);
+            _fn.vkCmdPushConstants(slot.command_buffer, _stairs.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            _fn.vkCmdDispatch(slot.command_buffer, 2 * push.edge, 1, 1);
+        }
     }
 
     //! what --resolution measured of the frame of a slot
@@ -1013,7 +1048,7 @@ private:
         const ResolutionLayout & layout = slot_video.resolution;
         std::shared_ptr<ResolutionFrame> frame = std::make_shared<ResolutionFrame>();
         frame->layout = layout;
-        for (const Buffer * buffer : { &slot_video.lattice_sums, &slot_video.edge_power })
+        for (const Buffer * buffer : { &slot_video.lattice_sums, &slot_video.edge_power, &slot_video.edge_stairs })
         {
             if (buffer->coherent) continue;
             VkMappedMemoryRange range { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
@@ -1028,6 +1063,10 @@ private:
         {
             const float * power = static_cast<const float *>(slot_video.edge_power.mapped);
             frame->edge_power.assign(power, power + static_cast<size_t>(2 * layout.edge) * kResolutionBins);
+            const uint32_t * stairs = static_cast<const uint32_t *>(slot_video.edge_stairs.mapped);
+            const size_t stair_count = static_cast<size_t>(2 * layout.edge) * static_cast<size_t>(layout.stair_bands);
+            frame->edge_stairs.resize(stair_count);
+            for (size_t k = 0; k < stair_count; ++k) frame->edge_stairs[k] = static_cast<uint16_t>(stairs[k]);
             frame->edges = true;
         }
         return frame;
@@ -1663,10 +1702,10 @@ private:
         const uint32_t set_count = static_cast<uint32_t>(kSlots * _videos.size());
         // ... and the picture of the motion video; a set per motion video frame being drawn
         // ... and for sparse motion what the grid found and the texture
-        // ... and for the resolution the pixel grid and the edge columns
-        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 4 + 3 + 3 + 4 + 2 + 2) * set_count + 5 * static_cast<uint32_t>(kDrawSlots) };
+        // ... and for the resolution the pixel grid, the edge columns and their stair steps
+        VkDescriptorPoolSize pool_size { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kBindings + 2 + 4 + 3 + 3 + 4 + 2 + 2 + 2) * set_count + 5 * static_cast<uint32_t>(kDrawSlots) };
         VkDescriptorPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pool_info.maxSets = 8 * set_count + static_cast<uint32_t>(kDrawSlots);
+        pool_info.maxSets = 9 * set_count + static_cast<uint32_t>(kDrawSlots);
         pool_info.poolSizeCount = 1;
         pool_info.pPoolSizes = &pool_size;
         check(_fn.vkCreateDescriptorPool(_device, &pool_info, nullptr, &_descriptor_pool), "vkCreateDescriptorPool");
@@ -1709,6 +1748,8 @@ private:
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.lattice_set), "vkAllocateDescriptorSets");
                 set_info.pSetLayouts = &_edge.set_layout;
                 check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.edge_set), "vkAllocateDescriptorSets");
+                set_info.pSetLayouts = &_stairs.set_layout;
+                check(_fn.vkAllocateDescriptorSets(_device, &set_info, &video.stairs_set), "vkAllocateDescriptorSets");
             }
         }
         for (DrawSlot & slot : _draw_slots)
@@ -1820,6 +1861,7 @@ private:
                     _destroy_buffer(video.picture_chroma);
                     _destroy_buffer(video.lattice_sums);
                     _destroy_buffer(video.edge_power);
+                    _destroy_buffer(video.edge_stairs);
                 }
                 if (slot.fence) _fn.vkDestroyFence(_device, slot.fence, nullptr);
                 slot.fence = VK_NULL_HANDLE;
@@ -1838,6 +1880,7 @@ private:
             _destroy_compute(_texture);
             _destroy_compute(_lattice);
             _destroy_compute(_edge);
+            _destroy_compute(_stairs);
             if (_command_pool) _fn.vkDestroyCommandPool(_device, _command_pool, nullptr);
             if (_descriptor_pool) _fn.vkDestroyDescriptorPool(_device, _descriptor_pool, nullptr);
             if (_pipeline) _fn.vkDestroyPipeline(_device, _pipeline, nullptr);
@@ -1901,6 +1944,7 @@ private:
     bool _resolution = false;
     Compute _lattice;
     Compute _edge;
+    Compute _stairs;
 
     VkDescriptorSetLayout _set_layout = VK_NULL_HANDLE;
     VkPipelineLayout _pipeline_layout = VK_NULL_HANDLE;

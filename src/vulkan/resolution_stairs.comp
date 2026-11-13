@@ -1,0 +1,58 @@
+#version 450
+// --resolution, stair steps of the picture entering at the edge of a pan (resolution.h): where the columns next to
+// the left and the right edge have their strongest step from one row to the next, per band of 48 rows (every 24
+// rows, starting at row0). One workgroup per column: the columns 0 ... edge - 1 from the left edge, then those
+// from the right edge, the outermost first. Per column and band (row of the step in the band << 8) | its size.
+// The same numbers as measure_resolution() on the CPU.
+//
+// luma: 4 pixels per word, luma_row_words words per row
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Luma   { uint luma[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Stairs { uint stairs[]; };
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint luma_row_words;
+    uint row0;
+    uint bands;
+    uint edge;
+} params;
+
+const uint kBand = 48u;
+const uint kHop = 24u;
+
+uint pixel(uint x, uint y)
+{
+    return (luma[y * params.luma_row_words + (x >> 2u)] >> ((x & 3u) * 8u)) & 0xFFu;
+}
+
+void main()
+{
+    const uint column = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint x = column < params.edge ? column : params.width - 1u - (column - params.edge);
+
+    // the lanes share the bands
+    for (uint band = lane; band < params.bands; band += gl_WorkGroupSize.x)
+    {
+        const uint y0 = params.row0 + band * kHop;
+        uint strongest = 0u;
+        uint row = 0u;
+        uint above = pixel(x, y0);
+        for (uint n = 0u; n < kBand; ++n)
+        {
+            const uint below = pixel(x, y0 + n + 1u);
+            const uint size = above > below ? above - below : below - above;
+            // the first of equal steps
+            if (size > strongest)
+            {
+                strongest = size;
+                row = n;
+            }
+            above = below;
+        }
+        stairs[column * params.bands + band] = (row << 8u) | strongest;
+    }
+}
